@@ -1,8 +1,7 @@
 /* swov — a fast window/workspace overview for Sway (SDL3)
  *
  * Build:
- *   cc -std=c11 -O2 -Wall -Wextra -o swov swov.c \
- *      $(pkg-config --cflags --libs sdl3 sdl3-image sdl3-ttf)
+cc -std=c11 -O2 -Wall -Wextra -o swov swov.c $(pkg-config --cflags --libs sdl3 sdl3-image sdl3-ttf)
  *
  * Runtime deps: a running Sway session ($SWAYSOCK). No jq, no shell-outs:
  * the program talks to the Sway IPC socket directly. fontconfig (fc-match)
@@ -1528,6 +1527,8 @@ typedef struct {
 
     int   ws;                  /* index into WSS */
     SDL_FRect card;            /* where it is drawn (render pixels) */
+    SDL_FRect hit;             /* what the mouse acts on: the whole card, or
+                                * just the name plate of a floating window   */
     int   group;               /* head index of a tabbed/stacked group, or -1 */
 
     int   lay_mode;            /* how the card contents are arranged */
@@ -2017,6 +2018,34 @@ static void compute_card_layout(Win *w)
     w->lay_icon = SDL_min(availw, availh);                       /* icon only */
 }
 
+/* Floating and fullscreen windows are drawn as see-through frames with a name
+ * plate at the top. The plate is the only part that takes the mouse, so the
+ * windows underneath stay clickable. */
+static bool card_is_overlay(const Win *w) { return w->floating || w->fullscreen; }
+
+static bool overlay_plate(const Win *w, SDL_FRect r, SDL_FRect *plate, float *icon_w)
+{
+    if (!w->label.t) return false;
+
+    float ip = 6.0f * SC;
+    float ih = SDL_min(22.0f * SC, (float)C.icon_px * SC * 0.6f);
+    bool  has_icon = C.icons && w->icon && w->lay_icon >= 10.0f * SC && ih >= 10.0f * SC;
+    float iw = has_icon ? ih + 5.0f * SC : 0.0f;
+    float pw = iw + (float)w->label.w + 2.0f * ip;
+    float ph = SDL_max((float)w->label.h, ih) + ip;
+
+    if (pw > r.w - 4.0f * SC) {                 /* tight: drop the icon first */
+        iw = 0.0f;
+        pw = (float)w->label.w + 2.0f * ip;
+        ph = (float)w->label.h + ip;
+    }
+    if (pw > r.w - 4.0f * SC || ph > r.h * 0.6f) return false;
+
+    *plate = (SDL_FRect){ r.x + (r.w - pw) * 0.5f, r.y + 7.0f * SC, pw, ph };
+    if (icon_w) *icon_w = iw;
+    return true;
+}
+
 static float card_text_width(const Win *w)
 {
     float pad = 7.0f * SC;
@@ -2091,6 +2120,8 @@ static void build_texts(void)
         Win *w = &WINS[i];
         tex_free(&w->label);
         tex_free(&w->subtitle);
+        w->hit = w->card;                    /* the whole card, unless a plate
+                                              * takes over below */
 
         compute_card_layout(w);
         int maxw = (int)card_text_width(w);
@@ -2100,6 +2131,10 @@ static void build_texts(void)
         w->label = text_make_fit(F_LABEL, name, maxw);
         if (w->lay_sub && strcmp(name, w->title) != 0)
             w->subtitle = text_make_fit(F_TITLE, w->title, maxw);
+
+        SDL_FRect plate;
+        if (card_is_overlay(w) && overlay_plate(w, w->card, &plate, NULL))
+            w->hit = plate;
     }
 }
 
@@ -2425,7 +2460,7 @@ static int hit_test(float mx, float my, int *out_ws)
         *out_ws = i;
         for (int j = ws->count - 1; j >= 0; --j) {      /* floats are last = on top */
             Win *w = &WINS[ws->first + j];
-            SDL_FRect r = w->card;
+            SDL_FRect r = (w->hit.w > 0.0f) ? w->hit : w->card;
             if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h)
                 return ws->first + j;
         }
@@ -2764,8 +2799,8 @@ static void rebuild_chrome(void)
         if (same_band && T_HEADER.t) avail -= T_HEADER.w + (int)(C.margin * SC);
 
         T_HINTS = text_make_fit(F_HINT,
-            "\xe2\x86\xb5 focus    drag to move    tab workspace    0-9 move    "
-            "ctrl+0-9 go to    space mark    x close    / filter    esc quit", avail);
+            "\xe2\x86\xb5 focus    drag to move    tab workspace    0-9 go to    "
+            "ctrl+0-9 move    space mark    x close    / filter    esc quit", avail);
     }
 
     if (filtering) {
@@ -2888,37 +2923,27 @@ static void draw_card(Win *w, bool tile_selected, bool is_hovered)
     bool has_icon = C.icons && w->icon && w->lay_icon >= 10.0f * SC;
     if (has_icon) SDL_SetTextureAlphaModFloat(w->icon, a);
 
-    if (as_overlay && w->label.t) {
+    SDL_FRect plate;
+    float plate_iw = 0.0f;
+    if (as_overlay && overlay_plate(w, r, &plate, &plate_iw)) {
         /* Centre would land on top of the cards showing through, so the name
-         * rides in a small plate at the top edge instead. */
+         * rides in a small plate at the top edge instead. That plate is also
+         * the only part of this window the mouse can grab. */
         float ip = 6.0f * SC;
-        float ih = SDL_min(22.0f * SC, (float)C.icon_px * SC * 0.6f);
-        float iw = (has_icon && ih >= 10.0f * SC) ? ih + 5.0f * SC : 0.0f;
-        float pw = iw + (float)w->label.w + 2.0f * ip;
-        float phh = SDL_max((float)w->label.h, ih) + ip;
+        fill_round_rect(plate, plate.h * 0.32f, with_alpha(mix(C.card, C.bg, 0.25f), 0.94f));
+        stroke_round_rect(plate, plate.h * 0.32f, SDL_max(1.0f, 1.4f * SC),
+                          is_hovered ? C.accent : with_alpha(C.accent, 0.55f));
 
-        if (pw > r.w - 4.0f * SC) {            /* tight: drop the icon first */
-            iw = 0.0f;
-            pw = (float)w->label.w + 2.0f * ip;
-            phh = (float)w->label.h + ip;
+        float tx = plate.x + ip;
+        if (plate_iw > 0.0f && has_icon) {
+            float ih = plate_iw - 5.0f * SC;
+            draw_icon(w->icon, tx + ih * 0.5f, plate.y + (plate.h - ih) * 0.5f, ih);
+            tx += plate_iw;
         }
-
-        if (pw <= r.w - 4.0f * SC && phh <= r.h * 0.6f) {
-            SDL_FRect plate = { r.x + (r.w - pw) * 0.5f, r.y + 7.0f * SC, pw, phh };
-            fill_round_rect(plate, phh * 0.32f, with_alpha(mix(C.card, C.bg, 0.25f), 0.94f));
-            stroke_round_rect(plate, phh * 0.32f, SDL_max(1.0f, 1.4f * SC),
-                              with_alpha(C.accent, 0.55f));
-
-            float tx = plate.x + ip;
-            if (iw > 0.0f && has_icon) {
-                draw_icon(w->icon, tx + ih * 0.5f, plate.y + (phh - ih) * 0.5f, ih);
-                tx += iw;
-            }
-            tex_draw(w->label, tx, plate.y + (phh - (float)w->label.h) * 0.5f,
-                     with_alpha(C.text, a));
-            if (has_icon) SDL_SetTextureAlphaModFloat(w->icon, 1.0f);
-            return;
-        }
+        tex_draw(w->label, tx, plate.y + (plate.h - (float)w->label.h) * 0.5f,
+                 with_alpha(C.text, a));
+        if (has_icon) SDL_SetTextureAlphaModFloat(w->icon, 1.0f);
+        return;
     }
 
     float lab_h = w->label.t    ? (float)w->label.h    : 0.0f;
@@ -3471,10 +3496,11 @@ static void usage(void)
 "  space / right click toggle the mark on a window\n"
 "  a                   mark or unmark every window of the workspace\n"
 "  c                   clear all marks\n"
-"  0-9                 move marked or selected windows to that workspace;\n"
+"  0-9                 switch to that workspace and leave\n"
+"  ctrl+0-9            move marked or selected windows to that workspace;\n"
 "                      with a whole workspace selected it moves everything\n"
 "                      there, keeping the container layout intact\n"
-"  ctrl+0-9            switch to that workspace\n"
+
 "  x / delete          close marked (or selected) windows\n"
 "  /                   filter by app id, title or workspace\n"
 "  r                   reload the tree\n"
@@ -3569,8 +3595,11 @@ static void handle_key(const SDL_KeyboardEvent *k)
      * German keyboard shift+7 is "/" — and that has to reach text input. */
     int digit = digit_from_scancode(k->scancode);
     if (digit >= 0 && !shift && !(k->mod & SDL_KMOD_ALT)) {
-        if (k->mod & SDL_KMOD_CTRL) goto_workspace_number(digit);
-        else if (was_active)        act_move_to_workspace(digit);
+        if (k->mod & SDL_KMOD_CTRL) {
+            if (was_active) act_move_to_workspace(digit);   /* ctrl: take it there */
+        } else {
+            goto_workspace_number(digit);                   /* bare: go there */
+        }
         return;
     }
     if (digit >= 0) return;                    /* shifted digit: let text input have it */

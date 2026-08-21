@@ -51,6 +51,9 @@ swov opens with the current workspace selected as a whole, no window picked.
 
 Press, move, release. `Esc` cancels.
 
+A floating or fullscreen window is grabbed by its name plate — the rest of it is
+click-through, so the windows underneath stay selectable.
+
 **A window** onto a tile moves it there. Onto the left or right edge of another
 window it lands beside it, splitting horizontally; top or bottom splits
 vertically. A bar shows the edge before you let go.
@@ -100,3 +103,5 @@ swov --shot /tmp/o.png     # one frame to a PNG, for tuning colours
 - Reordering workspaces renames them, which is all sway offers. Swaps go through
   a temporary name.
 - Scratchpad windows are not shown.
+- Only the name plate of a floating or fullscreen window takes the mouse; clicks
+  on its body go to whatever is beneath it.
