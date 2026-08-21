@@ -1,0 +1,87 @@
+# swov — example configuration
+#
+# Copy to ${XDG_CONFIG_HOME:-~/.config}/swov/config and edit.
+# Every value below is the built-in default, so an empty file behaves the same.
+# Single settings can also be overridden on the command line:
+#     swov ui_scale=1.2 ssaa=1        (or --ui_scale=1.2, or -s ui_scale=1.2)
+
+# --- rendering ---
+ssaa=2             # full-scene supersampling 1..4 (smooths edges *and* text)
+                   # alias: aa.  automatically reduced on very large screens
+icons=1            # show .desktop icons (PNG/SVG/XPM); 0 = text only
+icon_px=40         # icon edge length; shrinks by itself on small cards
+shadow=1           # drop shadows under tiles and floating windows
+shadow_layers=3    # fewer layers = cheaper, harder edged
+anim_ms=160        # how long tiles take to glide when the ghost slots come
+                   # and go, in and out. 0 turns the animation off
+vsync=1
+
+# --- text ---
+ui_scale=1.0       # master text size. 1.3 = bigger, 0.85 = smaller
+                   # aliases: font_scale, text_scale
+ws_px=26           # workspace number in the tile header   (all four are
+label_px=16        # application name on a window card       multiplied by
+title_px=13        # window title, the long text             ui_scale, so
+hint_px=14         # header line and the key hints           tweak one or all)
+
+# By default swayov uses the desktop font (via fontconfig).
+# Set a family name or a .ttf path to override:
+# font=Inter
+# font=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+# font_bold=Inter Semibold      # defaults to the bold cut of `font`
+
+# --- layout ---
+cols=0             # 0 = pick the grid that gives the largest tiles
+rows=0             # set e.g. rows=2 if your workspaces are really 2 rows
+margin=26          # space around the whole grid
+gap=14             # space between tiles
+pad=10             # padding inside a tile
+win_gap=5          # space between two windows inside a workspace
+screen_pad=6       # border kept free between the mini screen and the windows
+badge_top=7        # space above the workspace number in a tile corner
+float_alpha=0.62   # how solid a floating or fullscreen window is drawn. It is
+                   # further reduced the more of the workspace it covers, so a
+                   # fullscreen window stays a frame you can see through.
+                   # 1.0 = as solid as a tiled window
+radius=14          # corner radius
+border=3           # tile border thickness
+show_empty=1       # keep empty workspaces in the grid (keeps numbering stable)
+start_selection=workspace
+                   # what is selected when swov opens:
+                   #   workspace = the visible workspace, no window (default)
+                   #   none      = nothing at all
+                   #   window    = the first window of the visible workspace
+all_outputs=0      # 1 = show every monitor, not just the focused one
+show_header=1      # the "DP-1  16 windows on 9 workspaces" line
+show_hints=1       # the key hints
+header_pos=top-right
+hints_pos=bottom-center
+                   # none | top-left | top-center | top-right |
+                   # bottom-left | bottom-center | bottom-right
+                   # when both share a band the hints step aside and, if it
+                   # is still tight, get shortened with an ellipsis
+quit_on_focus_loss=1
+quit_after_action=0  # 1 = close the overlay after moving windows with 0-9
+
+# --- colors: #rrggbb or #rrggbbaa ---
+# bg alpha < ff => transparent overlay (needs a compositor, sway qualifies)
+bg=0d1117cc        # dims everything behind the overlay, so the workspace you
+                   # are actually on stops competing for attention.
+                   # 0d111700 = fully transparent, 0d1117ff = opaque
+tile=1e2733f2      # workspace tile                        alias: ring
+tile_sel=26313ff2  # selected workspace tile               alias: ring2
+tile_hover=2b3644f2
+mini_bg=11171f9e   # the inset "screen" inside a tile      alias: center
+card=33404ff7      # window card
+card_hover=46566af7 #                                      alias: hover
+card_focus=3b4a5bf7 # card of the window sway has focused
+hl=cb9b00ff        # the orange: selection, badges, marks
+text=e8e8e8ff      # bright text
+subtext=b3c0cdff   # application names
+dim=5a6b7aff       # counters and window titles
+hint=a7b5c4ff      # the header line and the key hints
+accent=89afc4ff    # hover borders, filter box, tab groups
+hltext=141414ff    # text on an orange badge
+urgent=e0533cff    # urgent windows and workspaces
+outline=0a0e1499   # thin outlines
+shadow_color=00000073
