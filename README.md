@@ -14,9 +14,12 @@ Debian trixie and newer:
 
 ```sh
 sudo apt install build-essential pkg-config libsdl3-dev libsdl3-image-dev libsdl3-ttf-dev
-cc -std=c11 -O2 -Wall -Wextra -o swov swov.c $(pkg-config --cflags --libs sdl3 sdl3-image sdl3-ttf)
-install -Dm755 swov ~/.local/bin/swov
+make
+make install          # ~/.local/bin, or PREFIX=/usr/local
+make config           # optional: config.example -> ~/.config/swov/config
 ```
+
+`make debug` builds `swov-debug` with the address and UB sanitizers.
 
 On bookworm the SDL3 packages do not exist yet; build SDL, SDL_image and
 SDL_ttf 3.2+ from source and set `PKG_CONFIG_PATH`.
@@ -34,18 +37,27 @@ for_window [app_id="swov"] floating enable, border none
 | --- | --- |
 | `0`–`9` | switch to that workspace |
 | `ctrl+0`–`9` | move the selection there |
-| arrows, `hjkl` | move the selection, across tiles too |
+| arrows, `hjkl` | move the selection; it walks through tile borders and wraps around the grid |
 | `tab` / `shift+tab` | previous / next workspace |
+| `ctrl+tab` (`+shift`) | one row down / up in the grid |
 | `w` | window selection ⇄ whole-workspace selection |
 | `enter`, click | focus |
-| `space`, right click | mark (marks are what the next action applies to) |
-| `a` / `c` | mark all in the workspace / clear marks |
-| `x`, `del`, middle click | close |
-| `/` | filter by app, title or workspace |
+| `space`, right click | mark or unmark a window (marks are what the next action applies to) |
+| `shift+space`, `a` | mark or unmark the whole workspace |
+| `c` | clear all marks |
+| `x`, `del` | close marked or selected windows, `enter` confirms |
+| middle click | close that window straight away |
+| `s` | search app ids and titles, highlighting the hits |
+| `/` | filter: same search, but hides everything else |
 | `r` | reload |
 | `esc` | cancel a drag, else quit |
 
+Mouse and keyboard share one cursor: pointing at a window selects it, so
+`space`, `x`, `ctrl`+digit and the rest act on whatever is under the pointer.
 swov opens with the current workspace selected as a whole, no window picked.
+Orange is only ever the selection cursor; the workspace sway is showing and the
+window it has focused are marked in teal (`current`), search hits in violet
+(`match`).
 
 ## Drag and drop
 

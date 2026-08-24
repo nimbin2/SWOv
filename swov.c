@@ -1,7 +1,8 @@
 /* swov — a fast window/workspace overview for Sway (SDL3)
  *
  * Build:
-cc -std=c11 -O2 -Wall -Wextra -o swov swov.c $(pkg-config --cflags --libs sdl3 sdl3-image sdl3-ttf)
+ *   cc -std=c11 -O2 -Wall -Wextra -o swov swov.c \
+ *      $(pkg-config --cflags --libs sdl3 sdl3-image sdl3-ttf)
  *
  * Runtime deps: a running Sway session ($SWAYSOCK). No jq, no shell-outs:
  * the program talks to the Sway IPC socket directly. fontconfig (fc-match)
@@ -75,6 +76,7 @@ static char *xstrdup(const char *s)
 
 static char *fmt_alloc(const char *fmt, ...)
 {
+    if (!fmt) return xstrdup("");
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(NULL, 0, fmt, ap);
@@ -215,6 +217,8 @@ typedef struct {
     SDL_FColor bg, tile, tile_sel, tile_hover, mini_bg;
     SDL_FColor card, card_hover, card_focus;
     SDL_FColor hl, text, subtext, dim, accent, hltext, shadow_col, outline, urgent, hint;
+    SDL_FColor current;      /* what sway is showing right now             */
+    SDL_FColor match;        /* windows the search found                   */
 } Cfg;
 
 static Cfg cfg_defaults(void)
@@ -276,6 +280,8 @@ static Cfg cfg_defaults(void)
     c.outline    = rgba(0x0a0e1499);
     c.urgent     = rgba(0xe0533cff);
     c.hint       = rgba(0xa7b5c4ff);  /* header line and the key hints       */
+    c.current    = rgba(0x4fb3a5ff);  /* the live workspace / focused window */
+    c.match      = rgba(0xb58ae0ff);  /* search hits                         */
     return c;
 }
 
@@ -348,6 +354,8 @@ static void cfg_set(Cfg *c, const char *k, const char *v)
     else if (key_is(k,"outline"))     parse_color(v, &c->outline);
     else if (key_is(k,"urgent"))      parse_color(v, &c->urgent);
     else if (key_is(k,"hint"))        parse_color(v, &c->hint);
+    else if (key_is(k,"current"))     parse_color(v, &c->current);
+    else if (key_is(k,"match"))       parse_color(v, &c->match);
     else fprintf(stderr, "swov: unknown config key '%s' (ignored)\n", k);
 }
 
@@ -737,6 +745,7 @@ static JV *sway_query(uint32_t type)
 
 static bool sway_cmd(const char *fmt, ...)
 {
+    if (!fmt) return false;
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(NULL, 0, fmt, ap);
@@ -1833,6 +1842,7 @@ static SDL_FRect rect_shrink(SDL_FRect r, float f)
     return (SDL_FRect){ r.x + (r.w - w) * 0.5f, r.y + (r.h - h) * 0.5f, w, h };
 }
 
+static int   GRID_COLS = 1;       /* columns the tiles are arranged in       */
 static int   RW, RH;              /* size of the render target, in pixels   */
 static float HEADER_H, FOOTER_H;
 
@@ -1859,7 +1869,15 @@ static bool sel_active = true;   /* false: no tile and no window highlighted */
 static int  hov_ws = -1, hov_win = -1;
 static char query[128];
 static int  qlen = 0;
-static bool filtering = false;
+static bool filtering = false;   /* "/" — hides everything that does not match */
+static bool searching = false;   /* "s" — highlights what matches, hides nothing */
+
+static bool query_active(void) { return filtering || searching; }
+
+/* The key press that opens a mode is followed by its own text input event —
+ * "s" would otherwise be the first character of the search. */
+static bool swallow_next_text = false;
+static bool confirm_kill = false;
 
 /* NULL means "the workspace itself is selected, not a window in it" */
 static Win *ws_sel_win(Ws *w)
@@ -2247,6 +2265,7 @@ static void layout(void)
 
     int cols = best_cols, rows = best_rows;
     if (cols * rows < n_tiles) cols = (n_tiles + rows - 1) / rows;
+    GRID_COLS = SDL_max(1, cols);
     float tw = (aw - gap * (float)(cols - 1)) / (float)cols;
     float th = (ah - gap * (float)(rows - 1)) / (float)rows;
     float head_h = (float)C.ws_px * SC * 1.55f;
@@ -2338,7 +2357,15 @@ static void layout(void)
 
 /* ------------------------------------------------------------- navigation */
 
-static bool win_visible(const Win *w) { return w->match; }
+static bool win_visible(const Win *w) { return !filtering || w->match; }
+
+/* first window of the workspace that matches the query, if any */
+static int ws_first_visible_match(const Ws *ws)
+{
+    for (int i = 0; i < ws->count; ++i)
+        if (WINS[ws->first + i].match) return i;
+    return -1;
+}
 
 static int ws_first_visible(const Ws *ws)
 {
@@ -2348,6 +2375,7 @@ static int ws_first_visible(const Ws *ws)
 }
 
 /* select a workspace; keep_window=false drops down to workspace level */
+static void select_ws(int idx, bool keep_window);
 static void select_ws(int idx, bool keep_window)
 {
     if (NWS == 0) return;
@@ -2367,6 +2395,15 @@ static void step_ws(int dir)
         if (qlen == 0 || WSS[cand].count == 0) { select_ws(cand, false); return; }
         if (ws_first_visible(&WSS[cand]) >= 0) { select_ws(cand, false); return; }
     }
+}
+
+/* one row up or down in the grid, wrapping through the list */
+static void step_ws_row(int dir)
+{
+    if (NWS == 0) return;
+    int step = SDL_max(1, GRID_COLS) * dir;
+    int cand = ((sel_ws + step) % NWS + NWS) % NWS;
+    select_ws(cand, false);
 }
 
 static float rect_cx(SDL_FRect r) { return r.x + r.w * 0.5f; }
@@ -2415,6 +2452,21 @@ static void navigate(int dx, int dy)
         float score = along + perp * 3.0f;
         if (score < best_score) { best_score = score; best_ws = i; }
     }
+    if (best_ws < 0) {
+        /* nothing further in that direction: wrap around to the far side,
+         * staying as close to the current row or column as possible */
+        float bs = 1e30f;
+        for (int i = 0; i < NWS; ++i) {
+            if (i == sel_ws) continue;
+            float cx = rect_cx(WSS[i].tile), cy = rect_cy(WSS[i].tile);
+            float along = cx * (float)dx + cy * (float)dy;          /* far side */
+            float perp  = SDL_fabsf((cx - rect_cx(ws->tile)) * (float)dy -
+                                    (cy - rect_cy(ws->tile)) * (float)dx);
+            float score = along + perp * 3.0f;
+            if (score < bs) { bs = score; best_ws = i; }
+        }
+    }
+
     if (best_ws >= 0) {
         select_ws(best_ws, false);
         Ws *nw = &WSS[sel_ws];
@@ -2442,8 +2494,8 @@ static void apply_filter(void)
     }
     if (qlen > 0) {                       /* jump to the first workspace with a hit */
         for (int i = 0; i < NWS; ++i) {
-            int v = ws_first_visible(&WSS[i]);
-            if (v >= 0) { sel_ws = i; WSS[i].sel = v; return; }
+            int v = ws_first_visible_match(&WSS[i]);
+            if (v >= 0) { sel_ws = i; WSS[i].sel = v; sel_active = true; return; }
         }
     } else {
         select_ws(sel_ws, true);
@@ -2800,12 +2852,25 @@ static void rebuild_chrome(void)
 
         T_HINTS = text_make_fit(F_HINT,
             "\xe2\x86\xb5 focus    drag to move    tab workspace    0-9 go to    "
-            "ctrl+0-9 move    space mark    x close    / filter    esc quit", avail);
+            "ctrl+0-9 move    space mark    x close    s search    / filter    "
+            "esc quit", avail);
     }
 
-    if (filtering) {
+    if (confirm_kill) {
+        int n = 0;
+        for (int i = 0; i < NWIN; ++i) if (WINS[i].marked) n++;
+        if (n == 0 && NWS > 0) {
+            Win *w = ws_sel_win(&WSS[sel_ws]);
+            n = w ? 1 : WSS[sel_ws].count;
+        }
         char buf[192];
-        snprintf(buf, sizeof(buf), "filter:  %s\xe2\x96\x8f", query);
+        snprintf(buf, sizeof(buf), "close %d window%s?   enter to confirm",
+                 n, n == 1 ? "" : "s");
+        T_QUERY = text_make(F_HINT, buf);
+    } else if (query_active()) {
+        char buf[192];
+        snprintf(buf, sizeof(buf), "%s  %s\xe2\x96\x8f",
+                 filtering ? "filter:" : "search:", query);
         T_QUERY = text_make(F_HINT, buf);
     }
 }
@@ -2850,17 +2915,21 @@ static void draw_icon(SDL_Texture *icon, float cx, float top, float size)
     SDL_RenderTexture(REN, icon, NULL, &dst);
 }
 
-static void draw_card(Win *w, bool tile_selected, bool is_hovered)
+static void draw_card(Win *w, bool tile_selected)
 {
     SDL_FRect r = xf(w->card);
     if (r.w < 4.0f || r.h < 4.0f) return;
 
     bool selected = tile_selected && sel_active && ws_sel_win(&WSS[w->ws]) == w;
-    bool dimmed   = !w->match;
+    bool is_hovered = selected;          /* pointer and keyboard share a cursor */
+    bool dimmed   = filtering && !w->match;
+    bool is_hit   = searching && qlen > 0 && w->match;
     float rad     = SDL_min(C.radius * SC * 0.62f, SDL_min(r.w, r.h) * 0.32f);
 
     SDL_FColor fill = w->focused ? C.card_focus : C.card;
     if (is_hovered) fill = C.card_hover;
+    if (is_hit)     fill = mix(fill, C.match, 0.22f);
+    if (confirm_kill && (w->marked || selected)) fill = mix(fill, C.urgent, 0.25f);
     if (selected)   fill = mix(fill, C.hl, is_hovered ? 0.16f : 0.10f);
     if (dimmed)     fill = with_alpha(mix(fill, C.tile, 0.6f), fill.a * 0.45f);
 
@@ -2889,7 +2958,10 @@ static void draw_card(Win *w, bool tile_selected, bool is_hovered)
 
     /* border: selection beats hover beats mark beats plain */
     float bw = SDL_max(1.0f, C.border * SC * 0.75f);
-    if (selected)          stroke_round_rect(r, rad, bw * 1.35f, C.hl);
+    if (confirm_kill && (w->marked || selected))
+                           stroke_round_rect(r, rad, bw * 1.35f, C.urgent);
+    else if (selected)     stroke_round_rect(r, rad, bw * 1.35f, C.hl);
+    else if (is_hit)       stroke_round_rect(r, rad, bw * 1.2f, C.match);
     else if (is_hovered)   stroke_round_rect(r, rad, bw, C.accent);
     else if (w->marked)    stroke_round_rect(r, rad, bw, with_alpha(C.hl, 0.85f));
     else if (w->urgent)    stroke_round_rect(r, rad, bw, C.urgent);
@@ -2898,11 +2970,11 @@ static void draw_card(Win *w, bool tile_selected, bool is_hovered)
     else                   stroke_round_rect(r, rad, SDL_max(1.0f, bw * 0.4f),
                                              with_alpha(C.outline, dimmed ? 0.3f : 0.7f));
 
-    /* the window sway has focused gets an accent bar on its left edge */
+    /* the window sway has focused: marked as current, not as selected */
     if (w->focused && !dimmed) {
         SDL_FRect bar = { r.x + bw * 0.6f, r.y + rad * 0.7f,
                           SDL_max(2.0f, 3.0f * SC), r.h - rad * 1.4f };
-        fill_round_rect(bar, bar.w * 0.5f, C.hl);
+        fill_round_rect(bar, bar.w * 0.5f, C.current);
     }
 
     /* multi selection marker */
@@ -2997,7 +3069,7 @@ static void draw_workspace(int idx)
 {
     Ws *ws = &WSS[idx];
     bool selected = sel_active && (idx == sel_ws);
-    bool hovered  = (idx == hov_ws);
+    bool hovered  = false;               /* the selection is the only cursor */
     float rad = C.radius * SC;
 
     float t = anim_phase();
@@ -3019,7 +3091,9 @@ static void draw_workspace(int idx)
     if (selected)          bc = C.hl;
     else if (hovered)      bc = with_alpha(C.accent, 0.9f);
     else if (ws->urgent)   bc = C.urgent;
-    else if (ws->visible)  bc = with_alpha(C.accent, 0.45f);
+    else if (searching && qlen > 0 && ws_first_visible_match(ws) >= 0)
+                           bc = with_alpha(C.match, 0.8f);
+    else if (ws->visible)  bc = with_alpha(C.current, 0.75f);
     else                   bw = SDL_max(1.0f, C.border * SC * 0.45f);
     stroke_round_rect(tile, rad, bw, bc);
 
@@ -3029,7 +3103,7 @@ static void draw_workspace(int idx)
 
     bool live = ws->visible || ws->focused;
     SDL_FColor num_col = selected ? C.hl
-                       : live     ? C.text
+                       : live     ? C.current
                                   : mix(C.subtext, C.tile, 0.25f);
     if (ws->urgent && !selected) num_col = C.urgent;
 
@@ -3078,7 +3152,7 @@ static void draw_workspace(int idx)
 
     for (int i = 0; i < ws->count; ++i) {
         int gi = ws->first + i;
-        draw_card(&WINS[gi], selected, gi == hov_win);
+        draw_card(&WINS[gi], selected);
     }
     xf_off();
 }
@@ -3236,9 +3310,10 @@ static void render(void)
         SDL_FRect box = { (float)RW * 0.5f - ((float)T_QUERY.w * 0.5f + p),
                           (HEADER_H - (float)T_QUERY.h) * 0.55f - p * 0.5f,
                           (float)T_QUERY.w + 2.0f * p, (float)T_QUERY.h + p };
+        SDL_FColor qc = confirm_kill ? C.urgent : (filtering ? C.accent : C.match);
         fill_round_rect(box, box.h * 0.35f, mix(C.tile, C.bg, 0.15f));
-        stroke_round_rect(box, box.h * 0.35f, SDL_max(1.0f, 1.5f * SC), with_alpha(C.accent, 0.8f));
-        tex_draw(T_QUERY, box.x + p, box.y + p * 0.5f, C.accent);
+        stroke_round_rect(box, box.h * 0.35f, SDL_max(1.0f, 1.5f * SC), with_alpha(qc, 0.8f));
+        tex_draw(T_QUERY, box.x + p, box.y + p * 0.5f, qc);
     }
 
     if (T_HINTS.t && !pos_is_none(C.hints_pos)) {
@@ -3356,6 +3431,12 @@ static void act_close(void)
 {
     int ids[MAX_WINDOWS];
     int n = gather_targets(ids, MAX_WINDOWS);
+
+    if (n == 0 && NWS > 0 && WSS[sel_ws].sel < 0) {   /* the whole workspace */
+        Ws *ws = &WSS[sel_ws];
+        for (int i = 0; i < ws->count && n < MAX_WINDOWS; ++i)
+            ids[n++] = WINS[ws->first + i].con_id;
+    }
     for (int i = 0; i < n; ++i) sway_cmd("[con_id=%d] kill", ids[i]);
     for (int i = 0; i < NWIN; ++i) WINS[i].marked = false;
     reload_model();
@@ -3364,6 +3445,15 @@ static void act_close(void)
 static void act_toggle_mark(Win *w)
 {
     if (w) w->marked = !w->marked;
+}
+
+/* mark every window of the workspace, or clear them all if they already are */
+static void toggle_ws_marks(Ws *ws)
+{
+    bool all = ws->count > 0;
+    for (int i = 0; i < ws->count; ++i)
+        if (!WINS[ws->first + i].marked) { all = false; break; }
+    for (int i = 0; i < ws->count; ++i) WINS[ws->first + i].marked = !all;
 }
 
 /* ----------------------------------------------------------------- fonts */
@@ -3490,19 +3580,22 @@ static void usage(void)
 "keys:\n"
 "  enter / click       focus the window under the cursor and leave\n"
 "  click on a tile     switch to that workspace\n"
-"  arrows or hjkl      move the selection, across tiles as well\n"
+"  arrows or hjkl      move the selection; it walks through tile borders\n"
 "  tab / shift+tab     previous / next workspace\n"
+"  ctrl+tab            one row down in the grid, with shift one row up\n"
 "  w                   switch between window and whole-workspace selection\n"
-"  space / right click toggle the mark on a window\n"
-"  a                   mark or unmark every window of the workspace\n"
+"  space / right click mark or unmark the window under the cursor\n"
+"  shift+space, a      mark or unmark every window of the workspace\n"
+
 "  c                   clear all marks\n"
 "  0-9                 switch to that workspace and leave\n"
 "  ctrl+0-9            move marked or selected windows to that workspace;\n"
 "                      with a whole workspace selected it moves everything\n"
 "                      there, keeping the container layout intact\n"
 
-"  x / delete          close marked (or selected) windows\n"
-"  /                   filter by app id, title or workspace\n"
+"  x / delete          close marked or selected windows, enter confirms\n"
+"  s                   search app ids and titles, highlighting the hits\n"
+"  /                   filter: same search, but hides everything else\n"
 "  r                   reload the tree\n"
 "  esc / q             quit\n");
 }
@@ -3558,10 +3651,18 @@ static void handle_key(const SDL_KeyboardEvent *k)
     sel_active = true;
     SDL_Keycode key = k->key;
 
-    if (filtering) {
+    if (confirm_kill) {                            /* enter confirms, anything
+                                                    * else calls it off */
+        confirm_kill = false;
+        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) act_close();
+        rebuild_chrome();
+        return;
+    }
+
+    if (query_active()) {
         switch (key) {
         case SDLK_ESCAPE:
-            filtering = false;
+            filtering = searching = false;
             query[0] = 0;
             qlen = 0;
             apply_filter();
@@ -3581,7 +3682,10 @@ static void handle_key(const SDL_KeyboardEvent *k)
             apply_filter();
             rebuild_chrome();
             return;
-        case SDLK_TAB:   step_ws(shift ? -1 : 1); return;
+        case SDLK_TAB:
+            if (k->mod & SDL_KMOD_CTRL) step_ws_row(shift ? -1 : 1);
+            else                        step_ws(shift ? -1 : 1);
+            return;
         case SDLK_LEFT:  navigate(-1, 0); return;
         case SDLK_RIGHT: navigate( 1, 0); return;
         case SDLK_UP:    navigate(0, -1); return;
@@ -3621,7 +3725,8 @@ static void handle_key(const SDL_KeyboardEvent *k)
         break;
 
     case SDLK_TAB:
-        step_ws(shift ? -1 : 1);
+        if (k->mod & SDL_KMOD_CTRL) step_ws_row(shift ? -1 : 1);
+        else                        step_ws(shift ? -1 : 1);
         break;
 
     case SDLK_W:                                   /* window level <-> workspace */
@@ -3640,20 +3745,14 @@ static void handle_key(const SDL_KeyboardEvent *k)
     case SDLK_SPACE:
         if (NWS > 0) {
             Ws *ws = &WSS[sel_ws];
-            if (ws->sel >= 0) act_toggle_mark(ws_sel_win(ws));
-            else for (int i = 0; i < ws->count; ++i)   /* mark the whole workspace */
-                WINS[ws->first + i].marked = true;
+            if (!shift && ws->sel >= 0) act_toggle_mark(ws_sel_win(ws));
+            else                        toggle_ws_marks(ws);
         }
         break;
 
-    case SDLK_A: {
-        if (NWS == 0) break;
-        Ws *ws = &WSS[sel_ws];
-        bool all = ws->count > 0;
-        for (int i = 0; i < ws->count; ++i) if (!WINS[ws->first + i].marked) all = false;
-        for (int i = 0; i < ws->count; ++i) WINS[ws->first + i].marked = !all;
+    case SDLK_A:
+        if (NWS > 0) toggle_ws_marks(&WSS[sel_ws]);
         break;
-    }
 
     case SDLK_C:
         for (int i = 0; i < NWIN; ++i) WINS[i].marked = false;
@@ -3661,7 +3760,14 @@ static void handle_key(const SDL_KeyboardEvent *k)
 
     case SDLK_X:
     case SDLK_DELETE:
-        act_close();
+        if (NWS > 0) {                             /* ask before killing */
+            int ids[MAX_WINDOWS];
+            if (gather_targets(ids, MAX_WINDOWS) > 0 ||
+                (WSS[sel_ws].sel < 0 && WSS[sel_ws].count > 0)) {
+                confirm_kill = true;
+                rebuild_chrome();
+            }
+        }
         break;
 
     case SDLK_R:
@@ -3670,8 +3776,19 @@ static void handle_key(const SDL_KeyboardEvent *k)
 
     case SDLK_SLASH:
         filtering = true;
+        searching = false;
         query[0] = 0;
         qlen = 0;
+        swallow_next_text = true;
+        rebuild_chrome();
+        break;
+
+    case SDLK_S:                                   /* search, without hiding */
+        searching = true;
+        filtering = false;
+        query[0] = 0;
+        qlen = 0;
+        swallow_next_text = true;
         rebuild_chrome();
         break;
 
@@ -3772,11 +3889,20 @@ static void handle_mouse_motion(const SDL_MouseMotionEvent *mo)
 
     int ws_idx = -1;
     int win_idx = hit_test(mx, my, &ws_idx);
-    if (ws_idx != hov_ws || win_idx != hov_win) {
-        hov_ws = ws_idx;
-        hov_win = win_idx;
-        SDL_SetCursor(ws_idx >= 0 ? CUR_HAND : CUR_ARROW);
-        dirty = true;
+    if (ws_idx == hov_ws && win_idx == hov_win) return;
+
+    hov_ws = ws_idx;
+    hov_win = win_idx;
+    SDL_SetCursor(ws_idx >= 0 ? CUR_HAND : CUR_ARROW);
+    dirty = true;
+
+    /* Pointing at something selects it, so space, x, ctrl+digit and the rest
+     * act on whatever is under the pointer, exactly as they do on whatever
+     * the arrow keys picked. */
+    if (ws_idx >= 0) {
+        sel_active = true;
+        sel_ws = ws_idx;
+        WSS[ws_idx].sel = (win_idx >= 0) ? win_idx - WSS[ws_idx].first : -1;
     }
 }
 
@@ -3796,7 +3922,7 @@ static void handle_event(const SDL_Event *e)
         break;
 
     case SDL_EVENT_TEXT_INPUT:
-        if (!filtering) {
+        if (!query_active()) {
             if (strcmp(e->text.text, "/") == 0) {
                 filtering = true;
                 query[0] = 0;
@@ -3805,7 +3931,8 @@ static void handle_event(const SDL_Event *e)
             }
             break;
         }
-        if (filtering) {
+        if (swallow_next_text) { swallow_next_text = false; break; }
+        if (query_active()) {
             size_t add = strlen(e->text.text);
             if (qlen + (int)add < (int)sizeof(query) - 1) {
                 memcpy(query + qlen, e->text.text, add + 1);
