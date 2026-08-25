@@ -22,6 +22,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <time.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,12 +30,18 @@
 #include <string.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/file.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <limits.h>
 #include <unistd.h>
 
 #define APP_ID          "swov"
+#define SWOV_VERSION    "1.0"
 #define MAX_WINDOWS     512
 #define MAX_WORKSPACES  64
 #define MAX_DESKTOPS    4096
@@ -202,6 +209,10 @@ typedef struct {
     float float_alpha;       /* opacity of floating / fullscreen cards    */
     float screen_pad;        /* border between mini screen and the cards  */
     int   shadow_layers;
+    int   usage_dots;        /* dot scale down the left edge of a tile     */
+    int   track;             /* record how long each workspace is used     */
+    int   dot_count;         /* how many dots the scale has                */
+    float dot_px;            /* dot diameter                               */
     float anim_ms;           /* tile glide duration, 0 disables            */
     int   start_selection;   /* 0 none, 1 workspace, 2 first window       */
     char  header_pos[16];    /* none|top-left|top-center|...|bottom-right */
@@ -245,6 +256,10 @@ static Cfg cfg_defaults(void)
     c.float_alpha = 0.62f;
     c.screen_pad = 6.0f;
     c.shadow_layers = 3;
+    c.usage_dots = 1;
+    c.track      = 1;
+    c.dot_count  = 14;
+    c.dot_px     = 5.0f;
     c.anim_ms = 160.0f;
     c.start_selection = 1;
     snprintf(c.header_pos, sizeof(c.header_pos), "%s", "top-right");
@@ -322,6 +337,11 @@ static void cfg_set(Cfg *c, const char *k, const char *v)
     else if (key_is(k,"float_alpha") || key_is(k,"floating_alpha"))
         c->float_alpha = (float)atof(v);
     else if (key_is(k,"shadow_layers")) c->shadow_layers = atoi(v);
+    else if (key_is(k,"usage_dots") || key_is(k,"usage_bar"))
+        c->usage_dots = atoi(v) != 0;
+    else if (key_is(k,"dot_count"))     c->dot_count = atoi(v);
+    else if (key_is(k,"dot_px"))        c->dot_px = (float)atof(v);
+    else if (key_is(k,"track"))         c->track = atoi(v) != 0;
     else if (key_is(k,"anim_ms") || key_is(k,"animation")) c->anim_ms = (float)atof(v);
     else if (key_is(k,"start_selection")) {
         c->start_selection = key_is(v,"none") ? 0 : key_is(v,"window") ? 2 : 1;
@@ -388,6 +408,9 @@ static bool cfg_load_file(Cfg *c, const char *path)
     fclose(f);
     return true;
 }
+
+static char  CFG_PATH[512];
+static bool  CFG_LOADED;
 
 static char *default_config_path(void)
 {
@@ -836,6 +859,147 @@ static bool sway_events_pending(void)
         any = true;
     }
     return any;
+}
+
+/* ------------------------------------------------------------ usage store
+ * How long the user has had each workspace in front of them. Every workspace
+ * switch goes through swov, so no daemon is needed: on each switch we credit
+ * the workspace we are leaving with the time since the last switch, and write
+ * down where we are going and when. A workspace that falls empty loses its
+ * count — the number describes the workspace as it is now.
+ *
+ * File: one "> <epoch> <name>" line saying where we are, then "<seconds>
+ * <name>" per workspace.
+ */
+
+typedef struct { char name[64]; double secs; } Usage;
+
+static Usage  USAGE[128];
+static int    NUSAGE;
+static double USAGE_MAX = 0.0;    /* the busiest workspace, for the scale */
+static char   USAGE_CUR[64];      /* the workspace we are on              */
+static double USAGE_SINCE;        /* ... since this moment (epoch seconds) */
+
+static double now_secs(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static char *usage_path(void)
+{
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    if (xdg && *xdg) return fmt_alloc("%s/swov/usage", xdg);
+    const char *home = getenv("HOME");
+    return home ? fmt_alloc("%s/.cache/swov/usage", home) : NULL;
+}
+
+static Usage *usage_find(const char *name, bool create)
+{
+    for (int i = 0; i < NUSAGE; ++i)
+        if (strcmp(USAGE[i].name, name) == 0) return &USAGE[i];
+    if (!create || NUSAGE >= (int)SDL_arraysize(USAGE)) return NULL;
+
+    Usage *u = &USAGE[NUSAGE++];
+    snprintf(u->name, sizeof(u->name), "%s", name);
+    u->secs = 0.0;
+    return u;
+}
+
+static void usage_load(void)
+{
+    NUSAGE = 0;
+    char *path = usage_path();
+    if (!path) return;
+
+    FILE *f = fopen(path, "r");
+    free(path);
+    if (!f) return;
+
+    USAGE_CUR[0] = 0;
+    USAGE_SINCE = 0.0;
+
+    char line[256];
+    while (fgets(line, sizeof(line), f) && NUSAGE < (int)SDL_arraysize(USAGE)) {
+        double v = 0.0;
+        char name[64] = {0};
+        if (line[0] == '>') {
+            if (sscanf(line + 1, "%lf %63[^\n]", &v, name) == 2) {
+                USAGE_SINCE = v;
+                snprintf(USAGE_CUR, sizeof(USAGE_CUR), "%s", name);
+            }
+        } else if (sscanf(line, "%lf %63[^\n]", &v, name) == 2 && name[0]) {
+            Usage *u = usage_find(name, true);
+            if (u) u->secs = v;
+        }
+    }
+    fclose(f);
+}
+
+/* time spent on the workspace we are on but not yet written down */
+static double usage_pending(void)
+{
+    if (!USAGE_CUR[0] || USAGE_SINCE <= 0.0) return 0.0;
+    double d = now_secs() - USAGE_SINCE;
+    if (d < 0.0 || d > 12.0 * 3600.0) return 0.0;   /* clock jump, or a nap */
+    return d;
+}
+
+static void usage_save(void)
+{
+    char *path = usage_path();
+    if (!path) return;
+
+    char *slash = strrchr(path, '/');
+    if (slash) {                       /* mkdir -p on the parent, one level */
+        *slash = 0;
+        char *up = strrchr(path, '/');
+        if (up) { *up = 0; mkdir(path, 0755); *up = '/'; }
+        mkdir(path, 0755);
+        *slash = '/';
+    }
+
+    char *tmp = fmt_alloc("%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (f) {
+        if (USAGE_CUR[0]) fprintf(f, "> %.0f %s\n", USAGE_SINCE, USAGE_CUR);
+        for (int i = 0; i < NUSAGE; ++i)
+            if (USAGE[i].secs > 0.0) fprintf(f, "%.0f %s\n", USAGE[i].secs, USAGE[i].name);
+        fclose(f);
+        rename(tmp, path);
+    }
+    free(tmp);
+    free(path);
+}
+
+/* Credit the workspace we are leaving, then note where we are going. This is
+ * the whole of the time tracking: swov performs every switch itself. */
+static void usage_switch(const char *to)
+{
+    if (!to || !*to) return;
+    usage_load();
+
+    double pending = usage_pending();
+    if (pending > 0.0 && USAGE_CUR[0]) {
+        Usage *u = usage_find(USAGE_CUR, true);
+        if (u) u->secs += pending;
+    }
+    snprintf(USAGE_CUR, sizeof(USAGE_CUR), "%s", to);
+    USAGE_SINCE = now_secs();
+    usage_save();
+}
+
+/* the workspace sway is showing at this moment */
+static void focused_workspace(char *out, size_t cap)
+{
+    out[0] = 0;
+    JV *r = sway_query(IPC_GET_WORKSPACES);
+    if (r && r->type == J_ARR)
+        for (int i = 0; i < r->count; ++i)
+            if (jbool(r->items[i], "focused", false))
+                snprintf(out, cap, "%s", jstr(r->items[i], "name", ""));
+    jfree(r);
 }
 
 /* --------------------------------------------------------------- globals */
@@ -1533,6 +1697,9 @@ typedef struct {
     bool  floating, focused, urgent, fullscreen, sticky;
     bool  marked;              /* multi-selection */
     bool  match;               /* passes the current filter */
+    bool  visible;             /* the one on top of its tabbed container */
+    SDL_FRect tab;             /* its slot in the container's tab strip   */
+    bool  has_tab;
 
     int   ws;                  /* index into WSS */
     SDL_FRect card;            /* where it is drawn (render pixels) */
@@ -1549,8 +1716,10 @@ typedef struct {
 } Win;
 
 typedef struct {
-    char  name[64];
+    char  name[64];      /* what sway calls it: "3" or "3:code"           */
+    char  label[64];     /* just the name part, "" when it is only a number */
     char  output[64];
+    double usage;        /* seconds spent here, from the tracker            */
     int   num;
     bool  focused, visible, urgent;
     int   rx, ry, rw, rh;      /* workspace rect */
@@ -1562,8 +1731,9 @@ typedef struct {
     int   ntop;
 
     SDL_FRect tile, screen;    /* layout (render pixels) */
+    SDL_FRect title_box;       /* the clickable name area in the header */
     SDL_FRect tile_from;       /* where this tile animates from */
-    Tex   badge, sub;
+    Tex   badge, sub, title;
 } Ws;
 
 static Win WINS[MAX_WINDOWS];
@@ -1577,7 +1747,11 @@ static char CUR_OUTPUT[64]     = {0};   /* output the tree walk is inside */
 static void model_free(void)
 {
     for (int i = 0; i < NWIN; ++i) { tex_free(&WINS[i].label); tex_free(&WINS[i].subtitle); }
-    for (int i = 0; i < NWS; ++i)  { tex_free(&WSS[i].badge);  tex_free(&WSS[i].sub); }
+    for (int i = 0; i < NWS; ++i)  {
+        tex_free(&WSS[i].badge);
+        tex_free(&WSS[i].sub);
+        tex_free(&WSS[i].title);
+    }
     NWIN = NWS = 0;
 }
 
@@ -1610,6 +1784,7 @@ static void collect_views(const JV *node, Ws *ws, bool floating)
         w->con_id     = jint(node, "id", 0);
         w->pid        = jint(node, "pid", 0);
         w->focused    = jbool(node, "focused", false);
+        w->visible    = jbool(node, "visible", true);
         w->urgent     = jbool(node, "urgent", false);
         w->sticky     = jbool(node, "sticky", false);
         w->floating   = floating;
@@ -1665,6 +1840,10 @@ static void walk_outputs(const JV *node)
         snprintf(ws->name, sizeof(ws->name), "%s", name);
         snprintf(ws->output, sizeof(ws->output), "%s", CUR_OUTPUT);
         ws->num     = jint(node, "num", str_all_digits(name) ? atoi(name) : -1);
+
+        const char *colon = strchr(name, ':');       /* "3:code" -> "code" */
+        if (colon) snprintf(ws->label, sizeof(ws->label), "%s", colon + 1);
+        else if (!str_all_digits(name)) snprintf(ws->label, sizeof(ws->label), "%s", name);
         ws->focused = jbool(node, "focused", false);
         ws->urgent  = jbool(node, "urgent", false);
 
@@ -1774,6 +1953,29 @@ static bool model_reload(void)
     for (int i = 0; i < NWS; ++i)
         for (int j = 0; j < WSS[i].count; ++j) WINS[WSS[i].first + j].ws = i;
 
+    usage_load();
+    double pending = usage_pending();
+    bool   changed = false;
+
+    for (int i = 0; i < NUSAGE; ) {                  /* forget what is gone */
+        bool alive = false;
+        for (int j = 0; j < NWS; ++j)
+            if (strcmp(WSS[j].name, USAGE[i].name) == 0 && WSS[j].count > 0) alive = true;
+        if (alive) { ++i; continue; }
+        USAGE[i] = USAGE[--NUSAGE];                  /* an empty workspace resets */
+        changed = true;
+    }
+    if (changed) usage_save();
+
+    USAGE_MAX = 0.0;
+    for (int i = 0; i < NWS; ++i) {
+        Usage *u = usage_find(WSS[i].name, false);
+        WSS[i].usage = u ? u->secs : 0.0;
+        if (strcmp(WSS[i].name, USAGE_CUR) == 0) WSS[i].usage += pending;
+        if (WSS[i].count == 0) WSS[i].usage = 0.0;   /* empty means start over */
+        if (WSS[i].usage > USAGE_MAX) USAGE_MAX = WSS[i].usage;
+    }
+
     for (int i = 0; i < NWIN; ++i) {
         Win *w = &WINS[i];
         if (app_id_is_useless(w->app_id)) {          /* ask the process instead */
@@ -1879,6 +2081,12 @@ static bool query_active(void) { return filtering || searching; }
 static bool swallow_next_text = false;
 static bool confirm_kill = false;
 
+/* renaming a workspace in place, from a click on its title */
+static bool editing = false;
+static int  edit_ws = -1;
+static char edit_buf[64];
+static int  edit_len = 0;
+
 /* NULL means "the workspace itself is selected, not a window in it" */
 static Win *ws_sel_win(Ws *w)
 {
@@ -1930,7 +2138,10 @@ static void layout_cards(Ws *ws)
      * visible and clickable. */
     bool done[MAX_WINDOWS];
     memset(done, 0, sizeof(bool) * (size_t)ws->count);
-    for (int i = 0; i < ws->count; ++i) WINS[ws->first + i].group = -1;
+    for (int i = 0; i < ws->count; ++i) {
+        WINS[ws->first + i].group = -1;
+        WINS[ws->first + i].has_tab = false;
+    }
 
     for (int i = 0; i < ws->count; ++i) {
         if (done[i]) continue;
@@ -1952,18 +2163,48 @@ static void layout_cards(Ws *ws)
         SDL_FRect base = WINS[ws->first + i].card;
         base.x += ge; base.y += ge; base.w -= 2.0f * ge; base.h -= 2.0f * ge;
         if (base.w < 4.0f || base.h < 4.0f) base = WINS[ws->first + i].card;
-        bool horiz = base.w >= base.h;
         for (int k = 0; k < n; ++k) WINS[ws->first + group[k]].group = i;
+
+        /* Which child is on top: sway marks it visible, otherwise the focused
+         * one, otherwise the first. */
+        int active = 0;
         for (int k = 0; k < n; ++k) {
-            SDL_FRect r = base;
-            if (horiz) {
-                r.w = (base.w - (float)(n - 1) * inset * 2.0f) / (float)n;
-                r.x = base.x + (float)k * (r.w + inset * 2.0f);
-            } else {
-                r.h = (base.h - (float)(n - 1) * inset * 2.0f) / (float)n;
-                r.y = base.y + (float)k * (r.h + inset * 2.0f);
+            Win *cw = &WINS[ws->first + group[k]];
+            if (cw->focused) { active = k; break; }
+            if (cw->visible) active = k;
+        }
+
+        float strip = SDL_min(32.0f * SC, base.h * 0.36f);
+        bool  tabs_fit = strip >= 16.0f * SC && base.w / (float)n >= 26.0f * SC;
+
+        if (tabs_fit) {
+            /* a tab per window across the top, the active one showing its
+             * contents underneath — the same shape sway draws */
+            float tw = base.w / (float)n;
+            for (int k = 0; k < n; ++k) {
+                Win *cw = &WINS[ws->first + group[k]];
+                cw->tab = (SDL_FRect){ base.x + (float)k * tw + inset * 0.5f, base.y,
+                                       tw - inset, strip };
+                cw->has_tab = true;
+                cw->card = (k == active)
+                    ? (SDL_FRect){ base.x, base.y + strip + inset * 0.5f,
+                                   base.w, base.h - strip - inset * 0.5f }
+                    : cw->tab;
             }
-            WINS[ws->first + group[k]].card = r;
+        } else {
+            bool horiz = base.w >= base.h;          /* too small: plain slices */
+            for (int k = 0; k < n; ++k) {
+                SDL_FRect r = base;
+                if (horiz) {
+                    r.w = (base.w - (float)(n - 1) * inset * 2.0f) / (float)n;
+                    r.x = base.x + (float)k * (r.w + inset * 2.0f);
+                } else {
+                    r.h = (base.h - (float)(n - 1) * inset * 2.0f) / (float)n;
+                    r.y = base.y + (float)k * (r.h + inset * 2.0f);
+                }
+                WINS[ws->first + group[k]].card = r;
+                WINS[ws->first + group[k]].has_tab = false;
+            }
         }
     }
 
@@ -1979,13 +2220,19 @@ static void layout_cards(Ws *ws)
     }
 }
 
+/* shallow cards (a tab, say) cannot spare 7px top and bottom */
+static float card_pad(const Win *w)
+{
+    return SDL_min(7.0f * SC, w->card.h * 0.13f);
+}
+
 enum { CL_ICON, CL_STACK, CL_ROW, CL_TEXT };
 
 /* Decide how much fits on a card: icon + app name + title, icon + name,
  * a row (icon left, text right) on wide flat cards, or just an icon. */
 static void compute_card_layout(Win *w)
 {
-    float pad    = 7.0f * SC;
+    float pad    = card_pad(w);
     float availw = w->card.w - 2.0f * pad;
     float availh = w->card.h - 2.0f * pad;
     float lab_h  = (float)TTF_GetFontHeight(F_LABEL);
@@ -2066,7 +2313,7 @@ static bool overlay_plate(const Win *w, SDL_FRect r, SDL_FRect *plate, float *ic
 
 static float card_text_width(const Win *w)
 {
-    float pad = 7.0f * SC;
+    float pad = card_pad(w);
     float availw = w->card.w - 2.0f * pad;
     if (w->lay_mode == CL_ROW && w->lay_icon > 0.0f) availw -= w->lay_icon + 6.0f * SC;
     return availw;
@@ -2120,12 +2367,24 @@ static void build_texts(void)
         tex_free(&ws->badge);
         tex_free(&ws->sub);
 
-        ws->badge = text_make(F_BADGE, ws->name);
+        char num[16];
+        if (ws->num >= 0) snprintf(num, sizeof(num), "%d", ws->num);
+        else              snprintf(num, sizeof(num), "%s", ws->name);
+        ws->badge = text_make(F_BADGE, num);
+        ws->title = ws->label[0] ? text_make(F_LABEL, ws->label) : (Tex){0};
 
         char sub[192];
         if (ws->count == 0)          snprintf(sub, sizeof(sub), "empty");
         else if (ws->count == 1)     snprintf(sub, sizeof(sub), "1 window");
         else                         snprintf(sub, sizeof(sub), "%d windows", ws->count);
+
+        if (C.usage_dots && ws->usage >= 60.0) {   /* say what the dots mean */
+            int mins = (int)(ws->usage / 60.0);
+            char tmp[224];
+            if (mins < 60) snprintf(tmp, sizeof(tmp), "%s \xc2\xb7 %dm", sub, mins);
+            else snprintf(tmp, sizeof(tmp), "%s \xc2\xb7 %dh %dm", sub, mins / 60, mins % 60);
+            snprintf(sub, sizeof(sub), "%.191s", tmp);
+        }
         if (C.all_outputs && ws->output[0]) {
             char tmp[256];
             snprintf(tmp, sizeof(tmp), "%s \xc2\xb7 %s", ws->output, sub);
@@ -2287,9 +2546,10 @@ static void layout(void)
         ws->tile = SLOTS[sidx].tile;
 
         float p = C.pad * SC;
-        SDL_FRect body = { ws->tile.x + p,
+        float gutter = C.usage_dots ? C.dot_px * SC * 2.0f : 0.0f;
+        SDL_FRect body = { ws->tile.x + p + gutter,
                            ws->tile.y + head_h,
-                           ws->tile.w - 2.0f * p,
+                           ws->tile.w - 2.0f * p - gutter,
                            ws->tile.h - head_h - p };
         if (body.h < 8.0f) body.h = 8.0f;
 
@@ -2353,6 +2613,17 @@ static void layout(void)
     laid_out_once = true;
 
     build_texts();
+
+    /* the clickable name area, between the count and the number */
+    for (int i = 0; i < NWS; ++i) {
+        Ws *ws = &WSS[i];
+        float p = C.pad * SC;
+        float head_h = (float)C.ws_px * SC * 1.55f;
+        float left  = ws->tile.x + p + (ws->sub.t ? (float)ws->sub.w : 0.0f) + p;
+        float right = ws->tile.x + ws->tile.w - p -
+                      (ws->badge.t ? (float)ws->badge.w : 0.0f) - p;
+        ws->title_box = (SDL_FRect){ left, ws->tile.y, SDL_max(right - left, 0.0f), head_h };
+    }
 }
 
 /* ------------------------------------------------------------- navigation */
@@ -2852,7 +3123,7 @@ static void rebuild_chrome(void)
 
         T_HINTS = text_make_fit(F_HINT,
             "\xe2\x86\xb5 focus    drag to move    tab workspace    0-9 go to    "
-            "ctrl+0-9 move    space mark    x close    s search    / filter    "
+            "ctrl+0-9 move    space mark    x close    f find    / filter    "
             "esc quit", avail);
     }
 
@@ -2984,7 +3255,7 @@ static void draw_card(Win *w, bool tile_selected)
         fill_round_rect(dot, d * 0.5f, C.hl);
     }
 
-    float pad = 7.0f * SC;
+    float pad = card_pad(w);
     float a   = dimmed ? 0.45f : 1.0f;
     SDL_FColor lab_col = (selected || is_hovered) ? C.text : C.subtext;
     if (w->urgent) lab_col = C.urgent;
@@ -3097,7 +3368,7 @@ static void draw_workspace(int idx)
     else                   bw = SDL_max(1.0f, C.border * SC * 0.45f);
     stroke_round_rect(tile, rad, bw, bc);
 
-    /* ---- tile header: window count left, workspace number right ---- */
+    /* ---- tile header: count left, name centred, number right ---- */
     float p = C.pad * SC;
     float top = tile.y + C.badge_top * SC;
 
@@ -3109,12 +3380,66 @@ static void draw_workspace(int idx)
 
     tex_draw(ws->badge, tile.x + tile.w - p - (float)ws->badge.w, top, num_col);
 
+    float count_right = tile.x + p;
     if (ws->sub.t) {
-        /* the count sits on the same optical line as the number */
         float base = top + ((float)ws->badge.h - (float)ws->sub.h) * 0.62f;
         SDL_FColor col = ws->count ? mix(C.dim, C.text, selected ? 0.45f : 0.25f)
                                    : with_alpha(C.dim, 0.85f);
         tex_draw(ws->sub, tile.x + p, base, col);
+        count_right += (float)ws->sub.w;
+    }
+
+    /* the name sits between the two; clicking it starts a rename */
+    (void)count_right;
+    SDL_FRect tb = xf(ws->title_box);
+    float tb_x = tb.x, tb_w = tb.w;
+
+    bool editing_this = editing && edit_ws == idx;
+    if (editing_this) {
+        SDL_FRect box = { tb_x, top - p * 0.35f, SDL_max(tb_w, 40.0f * SC),
+                          (float)ws->badge.h + p * 0.7f };
+        fill_round_rect(box, box.h * 0.3f, mix(C.tile, C.bg, 0.2f));
+        stroke_round_rect(box, box.h * 0.3f, SDL_max(1.0f, 1.5f * SC), C.hl);
+
+        char buf[80];
+        snprintf(buf, sizeof(buf), "%s\xe2\x96\x8f", edit_buf);
+        Tex t = text_make_fit(F_LABEL, buf[0] ? buf : "\xe2\x96\x8f", (int)(box.w - p));
+        tex_draw(t, box.x + p * 0.5f, box.y + (box.h - (float)t.h) * 0.5f, C.text);
+        tex_free(&t);
+    } else if (ws->title.t && tb_w > 20.0f * SC) {
+        Tex t = ws->title;
+        float x = tb_x + (tb_w - (float)t.w) * 0.5f;
+        if ((float)t.w > tb_w) x = tb_x;
+        SDL_FColor col = selected ? C.text : mix(C.subtext, C.tile, 0.15f);
+        tex_draw(t, x, top + ((float)ws->badge.h - (float)t.h) * 0.55f, col);
+    }
+
+    /* How much this workspace gets used, as a column of dots down the left
+     * edge: the more of them are lit, the more time is spent here. The scale
+     * is relative to the busiest workspace. */
+    if (C.usage_dots && C.dot_count > 0) {
+        float d = C.dot_px * SC;
+        float gap = d * 0.62f;
+
+        SDL_FRect screen_now = xf(ws->screen);
+        int fits = (int)((screen_now.h + gap) / (d + gap));
+        int n = SDL_clamp(SDL_min(C.dot_count, fits), 0, 40);
+        if (n < 2) n = 0;
+        float total = (float)n * d + (float)(n - 1) * gap;
+        float cx = tile.x + C.pad * SC + d * 0.55f;
+        float y0 = screen_now.y + (screen_now.h - total) * 0.5f;
+
+        float frac = (USAGE_MAX > 0.0) ? (float)(ws->usage / USAGE_MAX) : 0.0f;
+        int lit = (ws->usage > 0.0) ? (int)SDL_ceilf(frac * (float)n) : 0;
+        lit = SDL_clamp(lit, 0, n);
+
+        for (int i = 0; i < n; ++i) {
+            /* fills from the bottom like a level gauge */
+            bool on = (n - i) <= lit;
+            SDL_FRect dot = { cx - d * 0.5f, y0 + (float)i * (d + gap), d, d };
+            fill_round_rect(dot, d * 0.5f,
+                            on ? C.current : with_alpha(C.dim, 0.38f));
+        }
     }
 
     /* ---- the mini screen ---- */
@@ -3148,6 +3473,15 @@ static void draw_workspace(int idx)
         SDL_FRect box = { u.x - e, u.y - e, u.w + 2.0f * e, u.h + 2.0f * e };
         stroke_round_rect(box, C.radius * SC * 0.7f, SDL_max(1.0f, 1.6f * SC),
                           with_alpha(C.accent, 0.5f));
+
+        if (WINS[ws->first + i].has_tab) {       /* the strip the tabs sit on */
+            SDL_FRect strip = xf(WINS[ws->first + i].tab);
+            strip.x = box.x;
+            strip.w = box.w;
+            strip.y -= e * 0.5f;
+            strip.h += e;
+            fill_round_rect(strip, C.radius * SC * 0.5f, with_alpha(C.mini_bg, 0.8f));
+        }
     }
 
     for (int i = 0; i < ws->count; ++i) {
@@ -3387,6 +3721,7 @@ static void act_goto_workspace(const Ws *ws)
     char *e = escape_arg(ws->name);
     sway_cmd("workspace --no-auto-back-and-forth \"%s\"", e);
     free(e);
+    if (C.track) usage_switch(ws->name);
     running = false;
 }
 
@@ -3561,6 +3896,10 @@ static void usage(void)
 "swov — window and workspace overview for sway\n"
 "\n"
 "usage: swov [options] [key=value ...]\n"
+"  -g, --go N|NAME     switch to that workspace and exit, without a window\n"
+"  -b, --back          switch to the previously used workspace and exit\n"
+"      --usage         print how long each workspace has been used, and exit\n"
+"      --info          print every path and setting swov is using, and exit\n"
 "  -c, --config PATH   read this config file instead of the default\n"
 "  -n, --no-config     ignore the config file\n"
 "      --shot PATH     render one frame to a PNG and exit (handy for tuning)\n"
@@ -3594,7 +3933,7 @@ static void usage(void)
 "                      there, keeping the container layout intact\n"
 
 "  x / delete          close marked or selected windows, enter confirms\n"
-"  s                   search app ids and titles, highlighting the hits\n"
+"  f                   find windows by app id, title or workspace name\n"
 "  /                   filter: same search, but hides everything else\n"
 "  r                   reload the tree\n"
 "  esc / q             quit\n");
@@ -3633,7 +3972,13 @@ static void goto_workspace_number(int num)
 {
     for (int i = 0; i < NWS; ++i)
         if (WSS[i].num == num) { act_goto_workspace(&WSS[i]); return; }
-    sway_cmd("workspace number %d", num);
+
+    sway_cmd("workspace number %d", num);           /* it does not exist yet */
+    if (C.track) {
+        char name[16];
+        snprintf(name, sizeof(name), "%d", num);
+        usage_switch(name);
+    }
     running = false;
 }
 
@@ -3644,12 +3989,47 @@ static int digit_from_scancode(SDL_Scancode sc)
     return -1;
 }
 
+static void begin_edit(int idx);
+static void end_edit(bool commit);
+
 static void handle_key(const SDL_KeyboardEvent *k)
 {
     bool shift = (k->mod & SDL_KMOD_SHIFT) != 0;
     bool was_active = sel_active;
     sel_active = true;
     SDL_Keycode key = k->key;
+
+    if (editing) {
+        switch (key) {
+        case SDLK_RETURN:
+        case SDLK_KP_ENTER: end_edit(true);  reload_model(); return;
+        case SDLK_ESCAPE:   end_edit(false); return;
+        case SDLK_BACKSPACE:
+            while (edit_len > 0) {
+                unsigned char c = (unsigned char)edit_buf[--edit_len];
+                edit_buf[edit_len] = 0;
+                if ((c & 0xc0) != 0x80) break;
+            }
+            return;
+        default: return;
+        }
+    }
+
+    if (editing) {
+        switch (key) {
+        case SDLK_RETURN:
+        case SDLK_KP_ENTER: end_edit(true);  reload_model(); return;
+        case SDLK_ESCAPE:   end_edit(false); return;
+        case SDLK_BACKSPACE:
+            while (edit_len > 0) {
+                unsigned char c = (unsigned char)edit_buf[--edit_len];
+                edit_buf[edit_len] = 0;
+                if ((c & 0xc0) != 0x80) break;
+            }
+            return;
+        default: return;
+        }
+    }
 
     if (confirm_kill) {                            /* enter confirms, anything
                                                     * else calls it off */
@@ -3783,7 +4163,7 @@ static void handle_key(const SDL_KeyboardEvent *k)
         rebuild_chrome();
         break;
 
-    case SDLK_S:                                   /* search, without hiding */
+    case SDLK_F:                                   /* find, without hiding */
         searching = true;
         filtering = false;
         query[0] = 0;
@@ -3797,11 +4177,50 @@ static void handle_key(const SDL_KeyboardEvent *k)
     }
 }
 
+static void begin_edit(int idx)
+{
+    editing = true;
+    edit_ws = idx;
+    snprintf(edit_buf, sizeof(edit_buf), "%s", WSS[idx].label);
+    edit_len = (int)strlen(edit_buf);
+    swallow_next_text = false;
+}
+
+static void end_edit(bool commit)
+{
+    if (commit && edit_ws >= 0 && edit_ws < NWS) {
+        Ws *ws = &WSS[edit_ws];
+        char *to = edit_buf[0] ? (ws->num >= 0 ? fmt_alloc("%d:%s", ws->num, edit_buf)
+                                               : xstrdup(edit_buf))
+                               : (ws->num >= 0 ? fmt_alloc("%d", ws->num)
+                                               : xstrdup(ws->name));
+        if (strcmp(to, ws->name) != 0) ws_rename(ws, to);
+        free(to);
+    }
+    editing = false;
+    edit_ws = -1;
+    edit_buf[0] = 0;
+    edit_len = 0;
+}
+
 static void handle_mouse_press(const SDL_MouseButtonEvent *b)
 {
     float mx = b->x * MOUSE_SCALE, my = b->y * MOUSE_SCALE;
     int ws_idx = -1;
     int win_idx = hit_test(mx, my, &ws_idx);
+
+    if (editing) end_edit(true);                   /* a click elsewhere commits */
+
+    if (b->button == SDL_BUTTON_LEFT && ws_idx >= 0 && win_idx < 0) {
+        SDL_FRect tb = WSS[ws_idx].title_box;
+        if (mx >= tb.x && mx < tb.x + tb.w && my >= tb.y && my < tb.y + tb.h) {
+            sel_active = true;
+            sel_ws = ws_idx;
+            WSS[ws_idx].sel = -1;
+            begin_edit(ws_idx);
+            return;
+        }
+    }
 
     if (ws_idx < 0) {                       /* the empty background */
         if (b->button == SDL_BUTTON_LEFT) running = false;
@@ -3922,7 +4341,19 @@ static void handle_event(const SDL_Event *e)
         break;
 
     case SDL_EVENT_TEXT_INPUT:
-        if (!query_active()) {
+        /* the key that opened a mode sends its own character right after */
+        if (swallow_next_text) { swallow_next_text = false; break; }
+
+        if (editing) {                             /* renaming a workspace */
+            size_t add = strlen(e->text.text);
+            if (edit_len + (int)add < (int)sizeof(edit_buf) - 1) {
+                memcpy(edit_buf + edit_len, e->text.text, add + 1);
+                edit_len += (int)add;
+            }
+            break;
+        }
+
+        if (!query_active()) {                     /* "/" opens the filter */
             if (strcmp(e->text.text, "/") == 0) {
                 filtering = true;
                 query[0] = 0;
@@ -3931,8 +4362,8 @@ static void handle_event(const SDL_Event *e)
             }
             break;
         }
-        if (swallow_next_text) { swallow_next_text = false; break; }
-        if (query_active()) {
+
+        {
             size_t add = strlen(e->text.text);
             if (qlen + (int)add < (int)sizeof(query) - 1) {
                 memcpy(query + qlen, e->text.text, add + 1);
@@ -4035,12 +4466,20 @@ int main(int argc, char **argv)
 
     char *cfg_path = NULL;
     bool  use_cfg = true;
+    const char *go_name = NULL;
+    bool  go_back = false;
+    bool  show_usage_stats = false;
+    bool  show_info = false;
     const char *sets[64];
     int nsets = 0;
 
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
+        else if ((!strcmp(a, "-g") || !strcmp(a, "--go")) && i + 1 < argc) go_name = argv[++i];
+        else if (!strcmp(a, "-b") || !strcmp(a, "--back")) go_back = true;
+        else if (!strcmp(a, "--usage")) show_usage_stats = true;
+        else if (!strcmp(a, "--info")) show_info = true;
         else if ((!strcmp(a, "-c") || !strcmp(a, "--config")) && i + 1 < argc)
             cfg_path = expand_tilde(argv[++i]);
         else if (!strcmp(a, "-n") || !strcmp(a, "--no-config")) use_cfg = false;
@@ -4061,9 +4500,13 @@ int main(int argc, char **argv)
     }
 
     if (use_cfg) {
+        bool named = cfg_path != NULL;
         if (!cfg_path) cfg_path = default_config_path();
-        if (cfg_path && !cfg_load_file(&C, cfg_path) && argc > 1)
-            fprintf(stderr, "swov: no config at %s (using defaults)\n", cfg_path);
+        if (cfg_path) {
+            snprintf(CFG_PATH, sizeof(CFG_PATH), "%s", cfg_path);
+            CFG_LOADED = cfg_load_file(&C, cfg_path);
+            if (!CFG_LOADED && named) fprintf(stderr, "swov: no config at %s\n", cfg_path);
+        }
     }
     free(cfg_path);
 
@@ -4074,8 +4517,117 @@ int main(int argc, char **argv)
         free(copy);
     }
 
+    if (show_info) {
+        char exe[PATH_MAX] = {0};
+        ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+        if (n > 0) exe[n] = 0;
+
+        char *upath = usage_path();
+        usage_load();
+
+        printf("swov %s\n\n", SWOV_VERSION);
+        printf("binary        %s\n", exe[0] ? exe : "(unknown)");
+        printf("config        %s%s\n", CFG_PATH[0] ? CFG_PATH : "(none)",
+               CFG_PATH[0] ? (CFG_LOADED ? "  [loaded]" : "  [missing, defaults in use]") : "");
+        printf("usage file    %s\n", upath ? upath : "(none)");
+        printf("sway socket   %s\n", getenv("SWAYSOCK") ? getenv("SWAYSOCK") : "(unset)");
+
+        char *theme = icon_theme_name();
+        printf("icon theme    %s\n", theme);
+        free(theme);
+
+        fontconfig_resolve(C.font);
+        printf("font          %s\n", FC_REGULAR ? FC_REGULAR : (C.font[0] ? C.font : "(none)"));
+        printf("font bold     %s\n", FC_BOLD ? FC_BOLD : "(synthetic)");
+        free(FC_REGULAR);
+        free(FC_BOLD);
+        FC_REGULAR = FC_BOLD = NULL;
+
+        printf("\nrecorded usage\n");
+        if (USAGE_CUR[0])
+            printf("  on %s, for %.0fs\n", USAGE_CUR, usage_pending());
+        if (NUSAGE == 0) printf("  (nothing yet)\n");
+        for (int i = 0; i < NUSAGE; ++i) {
+            double secs = USAGE[i].secs +
+                          (strcmp(USAGE[i].name, USAGE_CUR) == 0 ? usage_pending() : 0.0);
+            printf("  %-20s %7.0fs\n", USAGE[i].name, secs);
+        }
+
+        printf("\nsettings\n");
+        printf("  ssaa %d   icons %d   icon_px %d   ui_scale %.2f\n",
+               C.ssaa, C.icons, C.icon_px, (double)C.ui_scale);
+        printf("  ws_px %d   label_px %d   title_px %d   hint_px %d\n",
+               C.ws_px, C.label_px, C.title_px, C.hint_px);
+        printf("  cols %d   rows %d   margin %.0f   gap %.0f   pad %.0f\n",
+               C.cols, C.rows, (double)C.margin, (double)C.gap, (double)C.pad);
+        printf("  win_gap %.0f   screen_pad %.0f   radius %.0f   border %.0f\n",
+               (double)C.win_gap, (double)C.screen_pad, (double)C.radius, (double)C.border);
+        printf("  show_empty %d   all_outputs %d   start_selection %d\n",
+               C.show_empty, C.all_outputs, C.start_selection);
+        printf("  header_pos %s   hints_pos %s\n", C.header_pos, C.hints_pos);
+        printf("  track %d   usage_dots %d   dot_count %d   dot_px %.0f\n",
+               C.track, C.usage_dots, C.dot_count, (double)C.dot_px);
+        printf("  anim_ms %.0f   shadow %d   float_alpha %.2f   vsync %d\n",
+               (double)C.anim_ms, C.shadow, (double)C.float_alpha, C.vsync);
+
+        printf("\ncolours\n");
+        struct { const char *k; SDL_FColor c; } cols[] = {
+            { "bg", C.bg }, { "tile", C.tile }, { "tile_sel", C.tile_sel },
+            { "mini_bg", C.mini_bg }, { "card", C.card }, { "card_hover", C.card_hover },
+            { "card_focus", C.card_focus }, { "hl", C.hl }, { "current", C.current },
+            { "match", C.match }, { "text", C.text }, { "subtext", C.subtext },
+            { "dim", C.dim }, { "accent", C.accent }, { "hint", C.hint },
+            { "hltext", C.hltext }, { "urgent", C.urgent }, { "outline", C.outline }
+        };
+        for (size_t i = 0; i < SDL_arraysize(cols); ++i)
+            printf("  %-12s %02x%02x%02x%02x\n", cols[i].k,
+                   (unsigned)(cols[i].c.r * 255.0f + 0.5f), (unsigned)(cols[i].c.g * 255.0f + 0.5f),
+                   (unsigned)(cols[i].c.b * 255.0f + 0.5f), (unsigned)(cols[i].c.a * 255.0f + 0.5f));
+
+        free(upath);
+        return 0;
+    }
+
+    if (show_usage_stats) {
+        char *path = usage_path();
+        usage_load();
+        printf("usage file: %s\n", path ? path : "(none)");
+        if (USAGE_CUR[0]) printf("on:         %s, for %.0fs\n", USAGE_CUR, usage_pending());
+        else              printf("on:         nothing recorded yet\n");
+        for (int i = 0; i < NUSAGE; ++i) {
+            double secs = USAGE[i].secs +
+                          (strcmp(USAGE[i].name, USAGE_CUR) == 0 ? usage_pending() : 0.0);
+            int mins = (int)(secs / 60.0);
+            printf("  %-20s %6.0fs  (%dh %02dm)\n", USAGE[i].name, secs, mins / 60, mins % 60);
+        }
+        free(path);
+        return 0;
+    }
+
     sway_fd = sway_connect();
     if (sway_fd < 0) die("cannot reach sway (is SWAYSOCK set?)");
+
+    /* Switching does not need a window, a renderer or a font: connect, say it,
+     * leave. This is the path a keybinding should use. */
+    if (go_back || go_name) {
+        bool ok;
+        if (go_back) {
+            ok = sway_cmd("workspace back_and_forth");
+        } else if (str_all_digits(go_name)) {
+            ok = sway_cmd("workspace number %d", atoi(go_name));
+        } else {
+            char *e = escape_arg(go_name);         /* a name, "code" or "3:code" */
+            ok = sway_cmd("workspace --no-auto-back-and-forth \"%s\"", e);
+            free(e);
+        }
+        if (ok && C.track) {                       /* stamp the new workspace */
+            char now[64];
+            focused_workspace(now, sizeof(now));
+            usage_switch(now);
+        }
+        close(sway_fd);
+        return ok ? 0 : 1;
+    }
 
     /* the focused output is needed before the window is created */
     JV *wsr = sway_query(IPC_GET_WORKSPACES);
@@ -4087,7 +4639,7 @@ int main(int argc, char **argv)
     jfree(wsr);
 
     SDL_SetHint(SDL_HINT_APP_ID, APP_ID);
-    SDL_SetAppMetadata("swov", "1.0", "org.swov.overview");
+    SDL_SetAppMetadata("swov", SWOV_VERSION, "org.swov.overview");
 
     if (!SDL_Init(SDL_INIT_VIDEO)) die("SDL_Init: %s", SDL_GetError());
     if (!TTF_Init()) die("TTF_Init: %s", SDL_GetError());

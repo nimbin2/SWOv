@@ -47,13 +47,15 @@ for_window [app_id="swov"] floating enable, border none
 | `c` | clear all marks |
 | `x`, `del` | close marked or selected windows, `enter` confirms |
 | middle click | close that window straight away |
-| `s` | search app ids and titles, highlighting the hits |
+| `f` | find windows by app id, title or workspace name, highlighting the hits |
 | `/` | filter: same search, but hides everything else |
 | `r` | reload |
 | `esc` | cancel a drag, else quit |
 
 Mouse and keyboard share one cursor: pointing at a window selects it, so
 `space`, `x`, `ctrl`+digit and the rest act on whatever is under the pointer.
+Click a workspace name in the header to rename it; `enter` keeps it, `esc`
+drops it. The name is what `f` and `/` search, next to app ids and titles.
 swov opens with the current workspace selected as a whole, no window picked.
 Orange is only ever the selection cursor; the workspace sway is showing and the
 window it has focused are marked in teal (`current`), search hits in violet
@@ -79,6 +81,36 @@ starts, or when a dragged window leaves its own workspace, and the tiles glide
 aside to make room. Drop on one to give a workspace that number, or to create a
 workspace from a single window.
 
+## Without opening the overview
+
+```sh
+swov -g 3        # switch to workspace 3 and exit
+swov -g 3:code   # by name works too
+swov -b          # switch to the workspace you came from
+```
+
+Both talk to the IPC socket and quit — no window, no font, about 5 ms. Good for
+keybindings.
+
+## Workspace usage
+
+Every switch goes through swov, so it stamps the time as it goes: the workspace
+you leave is credited with the seconds since the last switch, and the new one is
+noted in `~/.cache/swov/usage`. No background process.
+
+The overview draws it as a dot scale down the left edge of each tile — fourteen
+dots filling from the bottom, relative to the busiest workspace — and prints the time
+next to the window count. A workspace that falls empty is forgotten and starts
+from zero.
+
+```sh
+swov --usage     # where you are, and how long each workspace has had you
+swov --info      # every path and setting in use: binary, config, usage file,
+                 # sway socket, fonts, icon theme, colours
+```
+
+`track=0` in the config turns the recording off.
+
 ## Config
 
 `${XDG_CONFIG_HOME:-~/.config}/swov/config`, `key=value`, `#` comments. Every
@@ -101,6 +133,7 @@ swov --shot /tmp/o.png     # one frame to a PNG, for tuning colours
 | `win_gap`, `screen_pad` | space between windows, and around them |
 | `header_pos`, `hints_pos` | `none`, or `top`/`bottom` + `left`/`center`/`right` |
 | `anim_ms` | tile glide duration; `0` disables |
+| `track`, `usage_dots`, `dot_count`, `dot_px` | usage recording and its dot scale |
 | `start_selection` | `workspace`, `none` or `window` |
 | `cols`, `rows` | force the grid; default picks the largest tiles |
 
@@ -115,5 +148,7 @@ swov --shot /tmp/o.png     # one frame to a PNG, for tuning colours
 - Reordering workspaces renames them, which is all sway offers. Swaps go through
   a temporary name.
 - Scratchpad windows are not shown.
+- Tabbed and stacked containers are drawn the way sway draws them: a tab strip
+  across the top, the visible window's contents below. Each tab is clickable.
 - Only the name plate of a floating or fullscreen window takes the mouse; clicks
   on its body go to whatever is beneath it.
