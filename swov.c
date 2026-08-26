@@ -41,7 +41,7 @@
 #include <unistd.h>
 
 #define APP_ID          "swov"
-#define SWOV_VERSION    "1.0"
+#define SWOV_VERSION    "1.2"
 #define MAX_WINDOWS     512
 #define MAX_WORKSPACES  64
 #define MAX_DESKTOPS    4096
@@ -94,6 +94,15 @@ static char *fmt_alloc(const char *fmt, ...)
     vsnprintf(buf, (size_t)n + 1, fmt, ap);
     va_end(ap);
     return buf;
+}
+
+/* snprintf(dst, sizeof dst, "%s", src) makes newer gcc warn: it cannot prove
+ * src is shorter than dst, since a char field inside a struct array could in
+ * principle run to the end of that array. The precision settles it. */
+static void str_set(char *dst, size_t cap, const char *src)
+{
+    if (!cap) return;
+    snprintf(dst, cap, "%.*s", (int)cap - 1, src ? src : "");
 }
 
 static bool file_readable(const char *p) { return p && access(p, R_OK) == 0; }
@@ -262,8 +271,8 @@ static Cfg cfg_defaults(void)
     c.dot_px     = 5.0f;
     c.anim_ms = 160.0f;
     c.start_selection = 1;
-    snprintf(c.header_pos, sizeof(c.header_pos), "%s", "top-right");
-    snprintf(c.hints_pos,  sizeof(c.hints_pos),  "%s", "bottom-center");
+    str_set(c.header_pos, sizeof(c.header_pos), "top-right");
+    str_set(c.hints_pos, sizeof(c.hints_pos), "bottom-center");
     c.gap     = 14.0f;
     c.pad     = 10.0f;
     c.radius  = 14.0f;
@@ -320,8 +329,8 @@ static void cfg_set(Cfg *c, const char *k, const char *v)
     else if (key_is(k,"label_px") || key_is(k,"app_px"))    c->label_px = atoi(v);
     else if (key_is(k,"title_px"))                          c->title_px = atoi(v);
     else if (key_is(k,"hint_px") || key_is(k,"count_px"))   c->hint_px = atoi(v);
-    else if (key_is(k,"font"))       snprintf(c->font, sizeof(c->font), "%s", v);
-    else if (key_is(k,"font_bold"))  snprintf(c->font_bold, sizeof(c->font_bold), "%s", v);
+    else if (key_is(k,"font"))       str_set(c->font, sizeof(c->font), v);
+    else if (key_is(k,"font_bold"))  str_set(c->font_bold, sizeof(c->font_bold), v);
 
     /* layout */
     else if (key_is(k,"cols"))          c->cols = atoi(v);
@@ -346,8 +355,8 @@ static void cfg_set(Cfg *c, const char *k, const char *v)
     else if (key_is(k,"start_selection")) {
         c->start_selection = key_is(v,"none") ? 0 : key_is(v,"window") ? 2 : 1;
     }
-    else if (key_is(k,"header_pos")) snprintf(c->header_pos, sizeof(c->header_pos), "%s", v);
-    else if (key_is(k,"hints_pos"))  snprintf(c->hints_pos,  sizeof(c->hints_pos),  "%s", v);
+    else if (key_is(k,"header_pos")) str_set(c->header_pos, sizeof(c->header_pos), v);
+    else if (key_is(k,"hints_pos"))  str_set(c->hints_pos, sizeof(c->hints_pos), v);
     else if (key_is(k,"show_empty"))    c->show_empty = atoi(v) != 0;
     else if (key_is(k,"all_outputs"))   c->all_outputs = atoi(v) != 0;
     else if (key_is(k,"show_header"))   c->show_header = atoi(v) != 0;
@@ -674,6 +683,7 @@ static bool jbool(const JV *o, const char *key, bool def)
 /* -------------------------------------------------------------- sway ipc */
 
 enum {
+    IPC_GET_OUTPUTS    = 3,
     IPC_RUN_COMMAND    = 0,
     IPC_GET_WORKSPACES = 1,
     IPC_GET_TREE       = 4,
@@ -695,7 +705,7 @@ static int sway_connect(void)
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
+    str_set(addr.sun_path, sizeof(addr.sun_path), path);
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         close(fd);
         return -1;
@@ -872,12 +882,19 @@ static bool sway_events_pending(void)
  * <name>" per workspace.
  */
 
-typedef struct { char name[64]; double secs; } Usage;
+typedef struct {
+    char   name[64];
+    char   output[64];    /* which monitor it lives on */
+    int    num;           /* its number, or -1 for a named workspace */
+    double secs;
+    double last;          /* when we were last there (epoch) */
+} Usage;
 
 static Usage  USAGE[128];
 static int    NUSAGE;
 static double USAGE_MAX = 0.0;    /* the busiest workspace, for the scale */
 static char   USAGE_CUR[64];      /* the workspace we are on              */
+static char   USAGE_CUR_OUT[64];  /* ... on this output                   */
 static double USAGE_SINCE;        /* ... since this moment (epoch seconds) */
 
 static double now_secs(void)
@@ -902,8 +919,9 @@ static Usage *usage_find(const char *name, bool create)
     if (!create || NUSAGE >= (int)SDL_arraysize(USAGE)) return NULL;
 
     Usage *u = &USAGE[NUSAGE++];
-    snprintf(u->name, sizeof(u->name), "%s", name);
-    u->secs = 0.0;
+    memset(u, 0, sizeof(*u));
+    u->num = -1;
+    str_set(u->name, sizeof(u->name), name);
     return u;
 }
 
@@ -918,16 +936,41 @@ static void usage_load(void)
     if (!f) return;
 
     USAGE_CUR[0] = 0;
+    USAGE_CUR_OUT[0] = 0;
     USAGE_SINCE = 0.0;
 
-    char line[256];
+    char line[320];
     while (fgets(line, sizeof(line), f) && NUSAGE < (int)SDL_arraysize(USAGE)) {
-        double v = 0.0;
-        char name[64] = {0};
+        double v = 0.0, last = 0.0;
+        char name[64] = {0}, out[64] = {0};
+
         if (line[0] == '>') {
-            if (sscanf(line + 1, "%lf %63[^\n]", &v, name) == 2) {
+            if (sscanf(line + 1, "%lf %63s %63[^\n]", &v, out, name) == 3) {
                 USAGE_SINCE = v;
-                snprintf(USAGE_CUR, sizeof(USAGE_CUR), "%s", name);
+                str_set(USAGE_CUR, sizeof(USAGE_CUR), name);
+                str_set(USAGE_CUR_OUT, sizeof(USAGE_CUR_OUT), out);
+            } else if (sscanf(line + 1, "%lf %63[^\n]", &v, name) == 2) {
+                USAGE_SINCE = v;                     /* a file from before outputs */
+                str_set(USAGE_CUR, sizeof(USAGE_CUR), name);
+            }
+            continue;
+        }
+
+        int num = -1;
+        if (sscanf(line, "%lf %lf %d %63s %63[^\n]", &v, &last, &num, out, name) == 5 && name[0]) {
+            Usage *u = usage_find(name, true);
+            if (u) {
+                u->secs = v;
+                u->last = last;
+                u->num  = num;
+                if (strcmp(out, "-") != 0) str_set(u->output, sizeof(u->output), out);
+            }
+        } else if (sscanf(line, "%lf %lf %63s %63[^\n]", &v, &last, out, name) == 4 && name[0]) {
+            Usage *u = usage_find(name, true);   /* a file from before numbers */
+            if (u) {
+                u->secs = v;
+                u->last = last;
+                if (strcmp(out, "-") != 0) str_set(u->output, sizeof(u->output), out);
             }
         } else if (sscanf(line, "%lf %63[^\n]", &v, name) == 2 && name[0]) {
             Usage *u = usage_find(name, true);
@@ -963,9 +1006,13 @@ static void usage_save(void)
     char *tmp = fmt_alloc("%s.tmp", path);
     FILE *f = fopen(tmp, "w");
     if (f) {
-        if (USAGE_CUR[0]) fprintf(f, "> %.0f %s\n", USAGE_SINCE, USAGE_CUR);
+        if (USAGE_CUR[0])
+            fprintf(f, "> %.0f %s %s\n", USAGE_SINCE,
+                    USAGE_CUR_OUT[0] ? USAGE_CUR_OUT : "-", USAGE_CUR);
         for (int i = 0; i < NUSAGE; ++i)
-            if (USAGE[i].secs > 0.0) fprintf(f, "%.0f %s\n", USAGE[i].secs, USAGE[i].name);
+            if (USAGE[i].secs > 0.0 || USAGE[i].last > 0.0)
+                fprintf(f, "%.0f %.3f %d %s %s\n", USAGE[i].secs, USAGE[i].last, USAGE[i].num,
+                        USAGE[i].output[0] ? USAGE[i].output : "-", USAGE[i].name);
         fclose(f);
         rename(tmp, path);
     }
@@ -975,30 +1022,73 @@ static void usage_save(void)
 
 /* Credit the workspace we are leaving, then note where we are going. This is
  * the whole of the time tracking: swov performs every switch itself. */
-static void usage_switch(const char *to)
+static void usage_switch(const char *to, const char *out, int num)
 {
     if (!to || !*to) return;
     usage_load();
 
+    double now = now_secs();
     double pending = usage_pending();
-    if (pending > 0.0 && USAGE_CUR[0]) {
+    if (USAGE_CUR[0]) {
         Usage *u = usage_find(USAGE_CUR, true);
-        if (u) u->secs += pending;
+        if (u) {
+            if (pending > 0.0) u->secs += pending;
+            u->last = now;                          /* we were just there */
+            if (USAGE_CUR_OUT[0]) str_set(u->output, sizeof(u->output), USAGE_CUR_OUT);
+        }
     }
-    snprintf(USAGE_CUR, sizeof(USAGE_CUR), "%s", to);
-    USAGE_SINCE = now_secs();
+
+    Usage *dst = usage_find(to, true);
+    if (dst) {
+        if (out && *out) str_set(dst->output, sizeof(dst->output), out);
+        dst->num  = num;
+        dst->last = now;      /* arriving counts as a visit, so the entry (and
+                               * with it the number) survives the save filter */
+    }
+
+    str_set(USAGE_CUR, sizeof(USAGE_CUR), to);
+    str_set(USAGE_CUR_OUT, sizeof(USAGE_CUR_OUT), out ? out : "");
+    USAGE_SINCE = now;
     usage_save();
 }
 
-/* the workspace sway is showing at this moment */
-static void focused_workspace(char *out, size_t cap)
+/* The workspace we were on before this one, on this monitor. sway's own
+ * back_and_forth is global: with two screens it happily throws focus onto the
+ * other one, which is never what "go back" means while working on this one. */
+static bool last_workspace_here(const char *output, const char *current,
+                                char *out, size_t cap, int *num)
 {
-    out[0] = 0;
+    usage_load();
+
+    const Usage *best = NULL;
+    for (int i = 0; i < NUSAGE; ++i) {
+        const Usage *u = &USAGE[i];
+        if (u->last <= 0.0) continue;
+        if (current && strcmp(u->name, current) == 0) continue;
+        if (output && *output && u->output[0] && strcmp(u->output, output) != 0) continue;
+        if (!best || u->last > best->last) best = u;
+    }
+    if (!best) return false;
+    str_set(out, cap, best->name);
+    if (num) *num = best->num;
+    return true;
+}
+
+/* the workspace sway is showing at this moment */
+static void focused_workspace(char *name, size_t ncap, char *output, size_t ocap, int *num)
+{
+    name[0] = 0;
+    if (output) output[0] = 0;
+    if (num) *num = -1;
+
     JV *r = sway_query(IPC_GET_WORKSPACES);
     if (r && r->type == J_ARR)
         for (int i = 0; i < r->count; ++i)
-            if (jbool(r->items[i], "focused", false))
-                snprintf(out, cap, "%s", jstr(r->items[i], "name", ""));
+            if (jbool(r->items[i], "focused", false)) {
+                str_set(name, ncap, jstr(r->items[i], "name", ""));
+                if (output) str_set(output, ocap, jstr(r->items[i], "output", ""));
+                if (num) *num = jint(r->items[i], "num", -1);
+            }
     jfree(r);
 }
 
@@ -1389,7 +1479,7 @@ static void proc_app_name(int pid, char *out, size_t cap)
         if (n) {
             const char *arg0 = base_name(buf);
             if (*arg0 && !is_interpreter(arg0)) {
-                snprintf(out, cap, "%.*s", (int)cap - 1, arg0);
+                str_set(out, cap, arg0);
                 return;
             }
             /* an interpreter: the script or the app directory names it */
@@ -1399,7 +1489,7 @@ static void proc_app_name(int pid, char *out, size_t cap)
                 if (*arg != '-') {
                     const char *b = base_name(arg);
                     if (*b && !is_interpreter(b) && !strchr(b, '=')) {
-                        snprintf(out, cap, "%.*s", (int)cap - 1, b);
+                        str_set(out, cap, b);
                         break;
                     }
                 }
@@ -1415,7 +1505,7 @@ static void proc_app_name(int pid, char *out, size_t cap)
     char comm[128] = {0};
     if (fgets(comm, sizeof(comm), f)) {
         str_trim(comm);
-        if (comm[0] && !is_interpreter(comm)) snprintf(out, cap, "%.*s", (int)cap - 1, comm);
+        if (comm[0] && !is_interpreter(comm)) str_set(out, cap, comm);
     }
     fclose(f);
 }
@@ -1650,7 +1740,7 @@ static SDL_Texture *icon_for_app(const char *app_id, int want_px)
     if (!tex) tex = icon_make_letter(key, want_px);
 
     if (g_icon_count < (int)SDL_arraysize(g_icons)) {
-        snprintf(g_icons[g_icon_count].key, sizeof(g_icons[0].key), "%s", key);
+        str_set(g_icons[g_icon_count].key, sizeof(g_icons[0].key), key);
         g_icons[g_icon_count].tex = tex;
         g_icon_count++;
     }
@@ -1775,11 +1865,11 @@ static void collect_views(const JV *node, Ws *ws, bool floating)
             const JV *wp = jget(node, "window_properties");
             app = wp ? jstr(wp, "class", NULL) : NULL;
         }
-        snprintf(w->app_id, sizeof(w->app_id), "%s", app ? app : "unknown");
+        str_set(w->app_id, sizeof(w->app_id), app ? app : "unknown");
         memcpy(w->app_key, w->app_id, sizeof(w->app_key));
-        snprintf(w->title,  sizeof(w->title),  "%s", jstr(node, "name", ""));
-        snprintf(w->ws_name, sizeof(w->ws_name), "%s", ws->name);
-        snprintf(w->output,  sizeof(w->output),  "%s", ws->output);
+        str_set(w->title, sizeof(w->title), jstr(node, "name", ""));
+        str_set(w->ws_name, sizeof(w->ws_name), ws->name);
+        str_set(w->output, sizeof(w->output), ws->output);
 
         w->con_id     = jint(node, "id", 0);
         w->pid        = jint(node, "pid", 0);
@@ -1837,13 +1927,13 @@ static void walk_outputs(const JV *node)
 
         Ws *ws = &WSS[NWS];
         memset(ws, 0, sizeof(*ws));
-        snprintf(ws->name, sizeof(ws->name), "%s", name);
-        snprintf(ws->output, sizeof(ws->output), "%s", CUR_OUTPUT);
+        str_set(ws->name, sizeof(ws->name), name);
+        str_set(ws->output, sizeof(ws->output), CUR_OUTPUT);
         ws->num     = jint(node, "num", str_all_digits(name) ? atoi(name) : -1);
 
         const char *colon = strchr(name, ':');       /* "3:code" -> "code" */
-        if (colon) snprintf(ws->label, sizeof(ws->label), "%s", colon + 1);
-        else if (!str_all_digits(name)) snprintf(ws->label, sizeof(ws->label), "%s", name);
+        if (colon) str_set(ws->label, sizeof(ws->label), colon + 1);
+        else if (!str_all_digits(name)) str_set(ws->label, sizeof(ws->label), name);
         ws->focused = jbool(node, "focused", false);
         ws->urgent  = jbool(node, "urgent", false);
 
@@ -1880,7 +1970,7 @@ static void walk_outputs(const JV *node)
         const char *name = jstr(node, "name", "");
         if (strcmp(name, "__i3") == 0) return;
         if (!C.all_outputs && FOCUSED_OUTPUT[0] && strcmp(name, FOCUSED_OUTPUT) != 0) return;
-        snprintf(CUR_OUTPUT, sizeof(CUR_OUTPUT), "%s", name);
+        str_set(CUR_OUTPUT, sizeof(CUR_OUTPUT), name);
     }
 
     const JV *nodes = jget(node, "nodes");
@@ -1908,12 +1998,12 @@ static bool model_reload(void)
     if (wsr && wsr->type == J_ARR) {
         for (int i = 0; i < wsr->count; ++i)
             if (jbool(wsr->items[i], "focused", false))
-                snprintf(focused, sizeof(focused), "%s", jstr(wsr->items[i], "output", ""));
+                str_set(focused, sizeof(focused), jstr(wsr->items[i], "output", ""));
     }
 
     /* sway reports no focused workspace for a moment after a rename; keeping
      * the previous output beats falling back to "every output" */
-    if (focused[0]) snprintf(FOCUSED_OUTPUT, sizeof(FOCUSED_OUTPUT), "%s", focused);
+    if (focused[0]) str_set(FOCUSED_OUTPUT, sizeof(FOCUSED_OUTPUT), focused);
 
     JV *tree = sway_query(IPC_GET_TREE);
     if (!tree) { jfree(wsr); return false; }
@@ -1927,7 +2017,7 @@ static bool model_reload(void)
             for (int j = 0; j < wsr->count; ++j) {
                 const JV *o = wsr->items[j];
                 if (strcmp(jstr(o, "name", ""), WSS[i].name) != 0) continue;
-                snprintf(WSS[i].output, sizeof(WSS[i].output), "%s", jstr(o, "output", ""));
+                str_set(WSS[i].output, sizeof(WSS[i].output), jstr(o, "output", ""));
                 WSS[i].visible = jbool(o, "visible", false);
                 WSS[i].focused = jbool(o, "focused", WSS[i].focused);
                 WSS[i].urgent  = jbool(o, "urgent",  WSS[i].urgent);
@@ -1981,7 +2071,7 @@ static bool model_reload(void)
         if (app_id_is_useless(w->app_id)) {          /* ask the process instead */
             char nm[128];
             proc_app_name(w->pid, nm, sizeof(nm));
-            if (nm[0]) snprintf(w->app_key, sizeof(w->app_key), "%s", nm);
+            if (nm[0]) str_set(w->app_key, sizeof(w->app_key), nm);
         }
         w->icon = icon_for_app(w->app_key, px((float)C.icon_px * 1.6f));
     }
@@ -2350,7 +2440,7 @@ static const char *card_label_name(const Win *w)
     /* last resort: the executable name, without its extension */
     if (!app_id_is_useless(w->app_key)) {
         static char buf[128];
-        snprintf(buf, sizeof(buf), "%s", w->app_key);
+        str_set(buf, sizeof(buf), w->app_key);
         char *dot = strrchr(buf, '.');
         if (dot && (ci_cmp(dot, ".py") == 0 || ci_cmp(dot, ".sh") == 0 ||
                     ci_cmp(dot, ".js") == 0 || ci_cmp(dot, ".bin") == 0 ||
@@ -2369,27 +2459,26 @@ static void build_texts(void)
 
         char num[16];
         if (ws->num >= 0) snprintf(num, sizeof(num), "%d", ws->num);
-        else              snprintf(num, sizeof(num), "%s", ws->name);
+        else              str_set(num, sizeof(num), ws->name);
         ws->badge = text_make(F_BADGE, num);
         ws->title = ws->label[0] ? text_make(F_LABEL, ws->label) : (Tex){0};
 
-        char sub[192];
-        if (ws->count == 0)          snprintf(sub, sizeof(sub), "empty");
-        else if (ws->count == 1)     snprintf(sub, sizeof(sub), "1 window");
-        else                         snprintf(sub, sizeof(sub), "%d windows", ws->count);
+        /* "DP-1 · 3 windows · 1h 20m", assembled from bounded pieces */
+        char count[32], time[32] = "", out[80] = "";
+        if (ws->count == 0)      snprintf(count, sizeof(count), "empty");
+        else if (ws->count == 1) snprintf(count, sizeof(count), "1 window");
+        else                     snprintf(count, sizeof(count), "%d windows", ws->count);
 
         if (C.usage_dots && ws->usage >= 60.0) {   /* say what the dots mean */
             int mins = (int)(ws->usage / 60.0);
-            char tmp[224];
-            if (mins < 60) snprintf(tmp, sizeof(tmp), "%s \xc2\xb7 %dm", sub, mins);
-            else snprintf(tmp, sizeof(tmp), "%s \xc2\xb7 %dh %dm", sub, mins / 60, mins % 60);
-            snprintf(sub, sizeof(sub), "%.191s", tmp);
+            if (mins < 60) snprintf(time, sizeof(time), " \xc2\xb7 %dm", mins);
+            else snprintf(time, sizeof(time), " \xc2\xb7 %dh %dm", mins / 60, mins % 60);
         }
-        if (C.all_outputs && ws->output[0]) {
-            char tmp[256];
-            snprintf(tmp, sizeof(tmp), "%s \xc2\xb7 %s", ws->output, sub);
-            snprintf(sub, sizeof(sub), "%.191s", tmp);
-        }
+        if (C.all_outputs && ws->output[0])
+            snprintf(out, sizeof(out), "%.63s \xc2\xb7 ", ws->output);
+
+        char sub[192];
+        snprintf(sub, sizeof(sub), "%.79s%.31s%.31s", out, count, time);
         ws->sub = text_make(F_HINT, sub);
     }
 
@@ -2805,6 +2894,25 @@ static char *escape_arg(const char *s)
     return out;
 }
 
+/* Bring the history in line with reality. Workspaces also get switched by
+ * sway keybindings, which swov never sees; without this, "go back" bounces
+ * between the last two workspaces swov itself visited and can never return to
+ * one the user reached another way. */
+static void usage_sync(void)
+{
+    if (!C.track) return;
+
+    char name[64] = {0}, out[64] = {0};
+    int  num = -1;
+    focused_workspace(name, sizeof(name), out, sizeof(out), &num);
+    if (!name[0]) return;
+
+    usage_load();
+    if (strcmp(name, USAGE_CUR) == 0) return;      /* already up to date */
+
+    usage_switch(name, out, num);                  /* credits the old one */
+}
+
 /* ------------------------------------------------------------ drag & drop
  * A press only arms a drag. If the pointer stays put, the release focuses
  * (that is the "press and release on the same thing" rule); if it moves, we
@@ -3108,7 +3216,7 @@ static void rebuild_chrome(void)
 
     if (C.show_header) {
         char buf[256];
-        snprintf(buf, sizeof(buf), "%s   %d window%s on %d workspace%s",
+        snprintf(buf, sizeof(buf), "%.63s   %d window%s on %d workspace%s",
                  FOCUSED_OUTPUT[0] ? FOCUSED_OUTPUT : "sway",
                  NWIN, NWIN == 1 ? "" : "s", NWS, NWS == 1 ? "" : "s");
         T_HEADER = text_make(F_HINT, buf);
@@ -3140,7 +3248,7 @@ static void rebuild_chrome(void)
         T_QUERY = text_make(F_HINT, buf);
     } else if (query_active()) {
         char buf[192];
-        snprintf(buf, sizeof(buf), "%s  %s\xe2\x96\x8f",
+        snprintf(buf, sizeof(buf), "%s  %.127s\xe2\x96\x8f",
                  filtering ? "filter:" : "search:", query);
         T_QUERY = text_make(F_HINT, buf);
     }
@@ -3402,7 +3510,7 @@ static void draw_workspace(int idx)
         stroke_round_rect(box, box.h * 0.3f, SDL_max(1.0f, 1.5f * SC), C.hl);
 
         char buf[80];
-        snprintf(buf, sizeof(buf), "%s\xe2\x96\x8f", edit_buf);
+        snprintf(buf, sizeof(buf), "%.63s\xe2\x96\x8f", edit_buf);
         Tex t = text_make_fit(F_LABEL, buf[0] ? buf : "\xe2\x96\x8f", (int)(box.w - p));
         tex_draw(t, box.x + p * 0.5f, box.y + (box.h - (float)t.h) * 0.5f, C.text);
         tex_free(&t);
@@ -3593,7 +3701,7 @@ static void render(void)
             stroke_round_rect(g, C.radius * SC * 0.8f, SDL_max(1.0f, 2.0f * SC),
                               with_alpha(hot ? C.hl : C.accent, (hot ? 1.0f : 0.35f) * ph));
 
-            char num[8];
+            char num[16];
             snprintf(num, sizeof(num), "%d", SLOTS[i].num);
             Tex t2 = text_make(F_BADGE, num);
             tex_draw_in_box(t2, g, F_BADGE, with_alpha(hot ? C.hl : C.dim, 0.9f * ph));
@@ -3613,7 +3721,7 @@ static void render(void)
             stroke_round_rect(g, C.radius * SC * 0.8f, SDL_max(1.0f, 2.0f * SC),
                               with_alpha(C.accent, 0.35f * a));
 
-            char num[8];
+            char num[16];
             snprintf(num, sizeof(num), "%d", DYING[i].num);
             Tex t2 = text_make(F_BADGE, num);
             tex_draw_in_box(t2, g, F_BADGE, with_alpha(C.dim, 0.9f * a));
@@ -3678,7 +3786,7 @@ static void reload_model(void)
     int keep_con = -1;
     char keep_ws[64] = {0};
     if (NWS > 0) {
-        snprintf(keep_ws, sizeof(keep_ws), "%s", WSS[sel_ws].name);
+        str_set(keep_ws, sizeof(keep_ws), WSS[sel_ws].name);
         Win *w = ws_sel_win(&WSS[sel_ws]);
         if (w) keep_con = w->con_id;
     }
@@ -3721,7 +3829,7 @@ static void act_goto_workspace(const Ws *ws)
     char *e = escape_arg(ws->name);
     sway_cmd("workspace --no-auto-back-and-forth \"%s\"", e);
     free(e);
-    if (C.track) usage_switch(ws->name);
+    if (C.track) usage_switch(ws->name, ws->output, ws->num);
     running = false;
 }
 
@@ -3904,6 +4012,7 @@ static void usage(void)
 "  -n, --no-config     ignore the config file\n"
 "      --shot PATH     render one frame to a PNG and exit (handy for tuning)\n"
 "  -h, --help          this text\n"
+"  -v, --version       print the version and exit\n"
 "\n"
 "Every config key is also a command line option, in three spellings:\n"
 "      swov --ui_scale=1.2 hl=ff8800 -s ssaa=1\n"
@@ -3977,7 +4086,7 @@ static void goto_workspace_number(int num)
     if (C.track) {
         char name[16];
         snprintf(name, sizeof(name), "%d", num);
-        usage_switch(name);
+        usage_switch(name, FOCUSED_OUTPUT, num);
     }
     running = false;
 }
@@ -4181,7 +4290,7 @@ static void begin_edit(int idx)
 {
     editing = true;
     edit_ws = idx;
-    snprintf(edit_buf, sizeof(edit_buf), "%s", WSS[idx].label);
+    str_set(edit_buf, sizeof(edit_buf), WSS[idx].label);
     edit_len = (int)strlen(edit_buf);
     swallow_next_text = false;
 }
@@ -4194,7 +4303,16 @@ static void end_edit(bool commit)
                                                : xstrdup(edit_buf))
                                : (ws->num >= 0 ? fmt_alloc("%d", ws->num)
                                                : xstrdup(ws->name));
-        if (strcmp(to, ws->name) != 0) ws_rename(ws, to);
+        if (strcmp(to, ws->name) != 0) {
+            ws_rename(ws, to);
+            if (C.track) {                         /* keep its history */
+                usage_load();
+                Usage *u = usage_find(ws->name, false);
+                if (u) str_set(u->name, sizeof(u->name), to);
+                if (strcmp(USAGE_CUR, ws->name) == 0) str_set(USAGE_CUR, sizeof(USAGE_CUR), to);
+                usage_save();
+            }
+        }
         free(to);
     }
     editing = false;
@@ -4429,7 +4547,9 @@ static void present(void)
     SDL_RenderPresent(REN);
 }
 
-/* place the overlay on the output sway is using, fall back to the pointer */
+/* Place the overlay on the output sway is using. Matching by name only works
+ * when SDL reports the connector ("DP-1"); on wayland it often reports the
+ * monitor model instead, which is why the geometry is the better key. */
 static void pick_bounds(SDL_Rect *out)
 {
     *out = (SDL_Rect){ 0, 0, 1280, 720 };
@@ -4439,7 +4559,39 @@ static void pick_bounds(SDL_Rect *out)
     if (!ids || count <= 0) { SDL_free(ids); return; }
 
     SDL_DisplayID chosen = 0;
-    if (FOCUSED_OUTPUT[0]) {
+
+    /* what sway says the focused output covers */
+    int ox = 0, oy = 0, ow = 0, oh = 0;
+    JV *outs = sway_query(IPC_GET_OUTPUTS);
+    if (outs && outs->type == J_ARR) {
+        for (int i = 0; i < outs->count; ++i) {
+            const JV *o = outs->items[i];
+            bool is_it = FOCUSED_OUTPUT[0]
+                           ? strcmp(jstr(o, "name", ""), FOCUSED_OUTPUT) == 0
+                           : jbool(o, "focused", false);
+            if (!is_it) continue;
+            const JV *r = jget(o, "rect");
+            ox = jint(r, "x", 0);
+            oy = jint(r, "y", 0);
+            ow = jint(r, "width", 0);
+            oh = jint(r, "height", 0);
+            break;
+        }
+    }
+    jfree(outs);
+
+    if (ow > 0 && oh > 0) {                        /* the display holding it */
+        float cx = (float)ox + (float)ow * 0.5f;
+        float cy = (float)oy + (float)oh * 0.5f;
+        for (int i = 0; i < count; ++i) {
+            SDL_Rect b;
+            if (!SDL_GetDisplayBounds(ids[i], &b)) continue;
+            if (cx >= (float)b.x && cx < (float)(b.x + b.w) &&
+                cy >= (float)b.y && cy < (float)(b.y + b.h)) { chosen = ids[i]; break; }
+        }
+    }
+
+    if (!chosen && FOCUSED_OUTPUT[0]) {
         for (int i = 0; i < count; ++i) {
             const char *n = SDL_GetDisplayName(ids[i]);
             if (n && strcmp(n, FOCUSED_OUTPUT) == 0) { chosen = ids[i]; break; }
@@ -4476,6 +4628,10 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         const char *a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
+        else if (!strcmp(a, "-v") || !strcmp(a, "--version")) {
+            printf("swov %s (built %s)\n", SWOV_VERSION, __DATE__);
+            return 0;
+        }
         else if ((!strcmp(a, "-g") || !strcmp(a, "--go")) && i + 1 < argc) go_name = argv[++i];
         else if (!strcmp(a, "-b") || !strcmp(a, "--back")) go_back = true;
         else if (!strcmp(a, "--usage")) show_usage_stats = true;
@@ -4503,7 +4659,7 @@ int main(int argc, char **argv)
         bool named = cfg_path != NULL;
         if (!cfg_path) cfg_path = default_config_path();
         if (cfg_path) {
-            snprintf(CFG_PATH, sizeof(CFG_PATH), "%s", cfg_path);
+            str_set(CFG_PATH, sizeof(CFG_PATH), cfg_path);
             CFG_LOADED = cfg_load_file(&C, cfg_path);
             if (!CFG_LOADED && named) fprintf(stderr, "swov: no config at %s\n", cfg_path);
         }
@@ -4525,7 +4681,7 @@ int main(int argc, char **argv)
         char *upath = usage_path();
         usage_load();
 
-        printf("swov %s\n\n", SWOV_VERSION);
+        printf("swov %s (built %s)\n\n", SWOV_VERSION, __DATE__);
         printf("binary        %s\n", exe[0] ? exe : "(unknown)");
         printf("config        %s%s\n", CFG_PATH[0] ? CFG_PATH : "(none)",
                CFG_PATH[0] ? (CFG_LOADED ? "  [loaded]" : "  [missing, defaults in use]") : "");
@@ -4545,12 +4701,14 @@ int main(int argc, char **argv)
 
         printf("\nrecorded usage\n");
         if (USAGE_CUR[0])
-            printf("  on %s, for %.0fs\n", USAGE_CUR, usage_pending());
+            printf("  on %s (%s), for %.0fs\n", USAGE_CUR,
+                   USAGE_CUR_OUT[0] ? USAGE_CUR_OUT : "?", usage_pending());
         if (NUSAGE == 0) printf("  (nothing yet)\n");
         for (int i = 0; i < NUSAGE; ++i) {
             double secs = USAGE[i].secs +
                           (strcmp(USAGE[i].name, USAGE_CUR) == 0 ? usage_pending() : 0.0);
-            printf("  %-20s %7.0fs\n", USAGE[i].name, secs);
+            printf("  %-16s %-10s %7.0fs\n", USAGE[i].name,
+                   USAGE[i].output[0] ? USAGE[i].output : "-", secs);
         }
 
         printf("\nsettings\n");
@@ -4592,13 +4750,19 @@ int main(int argc, char **argv)
         char *path = usage_path();
         usage_load();
         printf("usage file: %s\n", path ? path : "(none)");
-        if (USAGE_CUR[0]) printf("on:         %s, for %.0fs\n", USAGE_CUR, usage_pending());
+        if (USAGE_CUR[0])
+            printf("on:         %s on %s, for %.0fs\n", USAGE_CUR,
+                   USAGE_CUR_OUT[0] ? USAGE_CUR_OUT : "?", usage_pending());
         else              printf("on:         nothing recorded yet\n");
         for (int i = 0; i < NUSAGE; ++i) {
             double secs = USAGE[i].secs +
                           (strcmp(USAGE[i].name, USAGE_CUR) == 0 ? usage_pending() : 0.0);
             int mins = (int)(secs / 60.0);
-            printf("  %-20s %6.0fs  (%dh %02dm)\n", USAGE[i].name, secs, mins / 60, mins % 60);
+            double ago = USAGE[i].last > 0.0 ? now_secs() - USAGE[i].last : -1.0;
+            printf("  %-16s %-10s %6.0fs  (%dh %02dm)", USAGE[i].name,
+                   USAGE[i].output[0] ? USAGE[i].output : "-", secs, mins / 60, mins % 60);
+            if (ago >= 0.0) printf("   last seen %.0fs ago", ago);
+            printf("\n");
         }
         free(path);
         return 0;
@@ -4610,9 +4774,30 @@ int main(int argc, char **argv)
     /* Switching does not need a window, a renderer or a font: connect, say it,
      * leave. This is the path a keybinding should use. */
     if (go_back || go_name) {
+        usage_sync();               /* the user may have moved without us */
         bool ok;
         if (go_back) {
-            ok = sway_cmd("workspace back_and_forth");
+            /* the last workspace we used on this monitor, not sway's global
+             * back_and_forth, which would jump to the other screen */
+            char here[64] = {0}, out[64] = {0}, target[64] = {0};
+            int  here_num = -1, target_num = -1;
+            focused_workspace(here, sizeof(here), out, sizeof(out), &here_num);
+
+            if (C.track && last_workspace_here(out, here, target, sizeof(target), &target_num)) {
+                /* By number where there is one: the workspace may have been
+                 * renamed since we saw it, and asking sway for a name that no
+                 * longer exists makes it create a second workspace with the
+                 * same number. */
+                if (target_num >= 0) {
+                    ok = sway_cmd("workspace number %d", target_num);
+                } else {
+                    char *e = escape_arg(target);
+                    ok = sway_cmd("workspace --no-auto-back-and-forth \"%s\"", e);
+                    free(e);
+                }
+            } else {
+                ok = sway_cmd("workspace back_and_forth");
+            }
         } else if (str_all_digits(go_name)) {
             ok = sway_cmd("workspace number %d", atoi(go_name));
         } else {
@@ -4621,9 +4806,10 @@ int main(int argc, char **argv)
             free(e);
         }
         if (ok && C.track) {                       /* stamp the new workspace */
-            char now[64];
-            focused_workspace(now, sizeof(now));
-            usage_switch(now);
+            char now[64], nowout[64];
+            int  nownum = -1;
+            focused_workspace(now, sizeof(now), nowout, sizeof(nowout), &nownum);
+            usage_switch(now, nowout, nownum);
         }
         close(sway_fd);
         return ok ? 0 : 1;
@@ -4634,8 +4820,7 @@ int main(int argc, char **argv)
     if (wsr && wsr->type == J_ARR)
         for (int i = 0; i < wsr->count; ++i)
             if (jbool(wsr->items[i], "focused", false))
-                snprintf(FOCUSED_OUTPUT, sizeof(FOCUSED_OUTPUT), "%s",
-                         jstr(wsr->items[i], "output", ""));
+                str_set(FOCUSED_OUTPUT, sizeof(FOCUSED_OUTPUT), jstr(wsr->items[i], "output", ""));
     jfree(wsr);
 
     SDL_SetHint(SDL_HINT_APP_ID, APP_ID);
@@ -4664,6 +4849,7 @@ int main(int argc, char **argv)
     CUR_ARROW = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
     CUR_HAND  = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
 
+    usage_sync();
     sway_subscribe_events();
     if (!model_reload()) die("could not read the sway tree");
     select_current_workspace();
@@ -4678,6 +4864,9 @@ int main(int argc, char **argv)
         hov_win = hit_test(SHOT_MX * MOUSE_SCALE, SHOT_MY * MOUSE_SCALE, &hov_ws);
     }
 
+    Uint64 last_reload = 0;
+    bool   pending_reload = false;
+
     SDL_StartTextInput(WIN_HANDLE);
     SDL_RaiseWindow(WIN_HANDLE);
     present();
@@ -4685,17 +4874,26 @@ int main(int argc, char **argv)
     while (running) {
         SDL_Event e;
         if (anim_running()) dirty = true;
-        if (SDL_WaitEventTimeout(&e, anim_running() ? 8 : 60)) {
+        if (SDL_WaitEventTimeout(&e, (anim_running() || pending_reload) ? 8 : 60)) {
             handle_event(&e);
             while (running && SDL_PollEvent(&e)) handle_event(&e);   /* coalesce */
         }
 
-        /* sway acknowledges a command before the layout transaction has
+        /* Sway acknowledges a command before the layout transaction has
          * committed, so the tree is only trustworthy once the events for it
-         * have arrived. This also keeps the overview live. */
-        if (running && !drag_active && sway_events_pending()) {
-            reload_model();
-            dirty = true;
+         * have arrived. This also keeps the overview live. A window that
+         * rewrites its title in a loop would otherwise have us rebuilding the
+         * model every few milliseconds, so events are coalesced. */
+        if (running && !drag_active && sway_events_pending()) pending_reload = true;
+
+        if (running && pending_reload) {
+            Uint64 now = SDL_GetTicks();
+            if (now - last_reload >= 120) {
+                pending_reload = false;
+                last_reload = now;
+                reload_model();
+                dirty = true;
+            }
         }
         if (running && dirty) { present(); dirty = false; }
     }

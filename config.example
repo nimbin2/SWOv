@@ -12,9 +12,10 @@ icons=1            # show .desktop icons (PNG/SVG/XPM); 0 = text only
 icon_px=40         # icon edge length; shrinks by itself on small cards
 shadow=1           # drop shadows under tiles and floating windows
 shadow_layers=3    # fewer layers = cheaper, harder edged
-track=1            # remember how long each workspace is used. swov performs
-                   # every switch itself, so it simply stamps the time on each
-                   # one — no background process. 0 = do not record.
+track=1            # remember how long each workspace is used, and which one
+                   # you were on per monitor (that is what -b goes back to).
+                   # swov performs every switch itself, so it stamps the time
+                   # as it goes — no background process. 0 = do not record.
 usage_dots=1       # dot scale down the left edge of a tile: how much that
                    # workspace is used, relative to the busiest one. Fills from
                    # the bottom.                              alias: usage_bar

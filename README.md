@@ -86,11 +86,20 @@ workspace from a single window.
 ```sh
 swov -g 3        # switch to workspace 3 and exit
 swov -g 3:code   # by name works too
-swov -b          # switch to the workspace you came from
+swov -b          # back to the last workspace you used *on this monitor*
 ```
 
 Both talk to the IPC socket and quit — no window, no font, about 5 ms. Good for
 keybindings.
+
+`-b` goes to the workspace activated most recently that is not the current one,
+on the monitor you are on. It switches *by number*, so a workspace renamed since
+is still the same workspace, and every swov run first checks where sway actually
+is — workspaces you reached with a sway keybinding count too. Press it twice and
+you are back where you started.
+
+sway's own `back_and_forth` is only the fallback when there is no history yet:
+it is global, so with two screens it throws focus onto the other monitor.
 
 ## Workspace usage
 
@@ -148,6 +157,9 @@ swov --shot /tmp/o.png     # one frame to a PNG, for tuning colours
 - Reordering workspaces renames them, which is all sway offers. Swaps go through
   a temporary name.
 - Scratchpad windows are not shown.
+- The overlay opens on the focused output, found by matching sway's output
+  geometry against the display list — SDL often reports a monitor model where
+  sway reports the connector, so names alone are not enough.
 - Tabbed and stacked containers are drawn the way sway draws them: a tab strip
   across the top, the visible window's contents below. Each tab is clickable.
 - Only the name plate of a floating or fullscreen window takes the mouse; clicks
