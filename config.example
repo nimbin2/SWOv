@@ -16,12 +16,26 @@ track=1            # remember how long each workspace is used, and which one
                    # you were on per monitor (that is what -b goes back to).
                    # swov performs every switch itself, so it stamps the time
                    # as it goes — no background process. 0 = do not record.
+back=global        # what -b goes back to:
+                   #   global = the workspace used last, anywhere. Step to the
+                   #            other monitor and -b brings you back to it
+                   #   output = the last one on the monitor you are on
+                   #   sway   = sway's own back_and_forth
 usage_dots=1       # dot scale down the left edge of a tile: how much that
                    # workspace is used, relative to the busiest one. Fills from
                    # the bottom.                              alias: usage_bar
 dot_count=14       # how many dots the scale has; fewer are drawn if the tile
                    # is too short for them
 dot_px=5           # dot diameter
+cpu=1              # a dot next to a workspace number showing how busy it is.
+cpu_min=4          # swbr measures this and leaves it in
+cpu_full=60        # $XDG_RUNTIME_DIR/swbr-cpu; without swbr running there is
+                   # nothing to show and nothing is drawn
+
+blur=2             # --backdrop only: how soft the overview is drawn while
+                   # something else has the foreground. 0 = off, 3 = softest.
+                   # It sharpens by itself while an app is being dragged over
+                   # it, so you can read the workspace you are aiming at
 anim_ms=160        # how long tiles take to glide when the ghost slots come
                    # and go, in and out. 0 turns the animation off
 vsync=1

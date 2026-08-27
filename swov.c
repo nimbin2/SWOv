@@ -21,6 +21,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <time.h>
 #include <stdbool.h>
@@ -40,8 +41,13 @@
 #include <limits.h>
 #include <unistd.h>
 
+#include "sw_theme.h"
+
 #define APP_ID          "swov"
 #define SWOV_VERSION    "1.2"
+#ifndef SWOV_BUILD                 /* set by the Makefile: md5 of this file */
+#define SWOV_BUILD "unknown"
+#endif
 #define MAX_WINDOWS     512
 #define MAX_WORKSPACES  64
 #define MAX_DESKTOPS    4096
@@ -220,6 +226,10 @@ typedef struct {
     int   shadow_layers;
     int   usage_dots;        /* dot scale down the left edge of a tile     */
     int   track;             /* record how long each workspace is used     */
+    int   back_scope;        /* -b: 0 global, 1 this monitor, 2 sway's own */
+    int   blur;              /* --backdrop only: 0 off, 1..3 how soft       */
+    int   cpu;               /* the load dot on a tile, measured by swbr    */
+    float cpu_min, cpu_full; /* under min nothing shows; full = fully hot   */
     int   dot_count;         /* how many dots the scale has                */
     float dot_px;            /* dot diameter                               */
     float anim_ms;           /* tile glide duration, 0 disables            */
@@ -267,6 +277,11 @@ static Cfg cfg_defaults(void)
     c.shadow_layers = 3;
     c.usage_dots = 1;
     c.track      = 1;
+    c.back_scope = 0;        /* global: go back to where I just was */
+    c.blur       = 2;
+    c.cpu        = 1;
+    c.cpu_min    = 4.0f;
+    c.cpu_full   = 60.0f;
     c.dot_count  = 14;
     c.dot_px     = 5.0f;
     c.anim_ms = 160.0f;
@@ -351,6 +366,14 @@ static void cfg_set(Cfg *c, const char *k, const char *v)
     else if (key_is(k,"dot_count"))     c->dot_count = atoi(v);
     else if (key_is(k,"dot_px"))        c->dot_px = (float)atof(v);
     else if (key_is(k,"track"))         c->track = atoi(v) != 0;
+    else if (key_is(k,"cpu"))       c->cpu = atoi(v) != 0;
+    else if (key_is(k,"cpu_min"))   c->cpu_min = (float)atof(v);
+    else if (key_is(k,"cpu_full"))  c->cpu_full = (float)atof(v);
+    else if (key_is(k,"blur")) {
+        c->blur = atoi(v); if (c->blur < 0) c->blur = 0; if (c->blur > 3) c->blur = 3;
+    }
+    else if (key_is(k,"back") || key_is(k,"back_scope"))
+        c->back_scope = key_is(v,"output") ? 1 : key_is(v,"sway") ? 2 : 0;
     else if (key_is(k,"anim_ms") || key_is(k,"animation")) c->anim_ms = (float)atof(v);
     else if (key_is(k,"start_selection")) {
         c->start_selection = key_is(v,"none") ? 0 : key_is(v,"window") ? 2 : 1;
@@ -388,6 +411,12 @@ static void cfg_set(Cfg *c, const char *k, const char *v)
     else fprintf(stderr, "swov: unknown config key '%s' (ignored)\n", k);
 }
 
+/* the shared ~/.config/sw/config, translated into swov's own keys */
+static void cfg_set_shared(void *ud, const char *k, const char *v)
+{
+    cfg_set((Cfg *)ud, k, v);
+}
+
 static char *expand_tilde(const char *p)
 {
     if (p && p[0] == '~' && (p[1] == '/' || p[1] == 0)) {
@@ -420,6 +449,7 @@ static bool cfg_load_file(Cfg *c, const char *path)
 
 static char  CFG_PATH[512];
 static bool  CFG_LOADED;
+static bool  SHARED_LOADED;
 
 static char *default_config_path(void)
 {
@@ -1052,9 +1082,10 @@ static void usage_switch(const char *to, const char *out, int num)
     usage_save();
 }
 
-/* The workspace we were on before this one, on this monitor. sway's own
- * back_and_forth is global: with two screens it happily throws focus onto the
- * other one, which is never what "go back" means while working on this one. */
+/* The workspace we were on before this one. With `output` set, only the ones
+ * on that monitor count (back=output); with NULL, the most recent anywhere
+ * wins (back=global, the default), so leaving a monitor and coming back is a
+ * toggle instead of a jump into that monitor's own history. */
 static bool last_workspace_here(const char *output, const char *current,
                                 char *out, size_t cap, int *num)
 {
@@ -1092,9 +1123,332 @@ static void focused_workspace(char *name, size_t ncap, char *output, size_t ocap
     jfree(r);
 }
 
+static bool  node_is_view(const JV *n);
+static char *escape_arg(const char *s);
+
+static bool  ADOPT_LOG;               /* --adopt-debug: say what is happening */
+
+
+
+/* ------------------------------------------------- workspaces / adopt
+ * Two one-shot modes that need no window, no font and no renderer. They are
+ * what a launcher talks to: --workspaces to know where a window could go,
+ * --adopt to put one there once it shows up.
+ */
+
+/* `num  name  output  flags`, tab separated, one workspace per line. */
+static int print_workspaces(void)
+{
+    JV *r = sway_query(IPC_GET_WORKSPACES);
+    if (!r || r->type != J_ARR) { jfree(r); return 1; }
+
+    for (int i = 0; i < r->count; ++i) {
+        const JV *w = r->items[i];
+        char flags[64] = "";
+        if (jbool(w, "focused", false)) strcat(flags, "focused,");
+        if (jbool(w, "visible", false)) strcat(flags, "visible,");
+        if (jbool(w, "urgent",  false)) strcat(flags, "urgent,");
+        size_t n = strlen(flags);
+        if (n) flags[n - 1] = 0; else str_set(flags, sizeof(flags), "-");
+
+        printf("%d\t%s\t%s\t%s\n", jint(w, "num", -1), jstr(w, "name", ""),
+               jstr(w, "output", ""), flags);
+    }
+    jfree(r);
+    return 0;
+}
+
+/* Is `pid` the process we launched, or something it started? A launcher that
+ * goes through a shell, or an app that re-execs itself, would not match on
+ * the pid alone. */
+static bool pid_descends_from(int pid, int ancestor)
+{
+    for (int i = 0; i < 8 && pid > 1; ++i) {
+        if (pid == ancestor) return true;
+
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+        FILE *f = fopen(path, "r");
+        if (!f) return false;
+
+        /* comm can hold spaces and brackets, so start after the last ')' */
+        char buf[512];
+        size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[got] = 0;
+
+        char *close = strrchr(buf, ')');
+        int ppid = 0;
+        if (!close || sscanf(close + 1, " %*c %d", &ppid) != 1) return false;
+        pid = ppid;
+    }
+    return false;
+}
+
+/* the container id of the first view belonging to `pid`, or -1 */
+static int find_view_of_pid(const JV *node, int pid)
+{
+    if (!node || node->type != J_OBJ) return -1;
+
+    if (node_is_view(node)) {
+        int p = jint(node, "pid", -1);
+        if (p > 0 && pid_descends_from(p, pid)) return jint(node, "id", -1);
+    }
+    for (int i = 0; i < node->count; ++i) {
+        const JV *kid = node->items[i];
+        if (!kid) continue;
+        if (kid->type == J_ARR) {
+            for (int j = 0; j < kid->count; ++j) {
+                int id = find_view_of_pid(kid->items[j], pid);
+                if (id >= 0) return id;
+            }
+        } else if (kid->type == J_OBJ) {
+            int id = find_view_of_pid(kid, pid);
+            if (id >= 0) return id;
+        }
+    }
+    return -1;
+}
+
+/* Tell sway where the window this process is about to open belongs, before it
+ * opens. sway consults `assign` in select_workspace(), which runs before the
+ * container is put anywhere, so the window never appears on the workspace you
+ * are looking at and nothing there is rearranged. Without this the window
+ * lands here first, the layout shuffles, and only then does it move.
+ *
+ * The rule stays for the rest of the sway session — there is no unassign —
+ * but it is tied to one pid, so it does nothing after that process is gone. */
+static void assign_pid_to_ws(int pid, const char *ws)
+{
+    if (str_all_digits(ws)) {
+        sway_cmd("assign [pid=%d] workspace number %s", pid, ws);
+    } else {
+        char *e = escape_arg(ws);
+        sway_cmd("assign [pid=%d] workspace \"%s\"", pid, e);
+        free(e);
+    }
+}
+
+/* Every process descending from `root`, so the rule can be put in front of
+ * whichever one ends up owning the window. A launcher, a wrapper script or an
+ * app that forks and lets the parent go leaves the window belonging to a pid
+ * we were never told about, and an assign rule for the pid we started is then
+ * matched by nothing. */
+static int sweep_descendants(int root, int *out, int cap)
+{
+    DIR *d = opendir("/proc");
+    if (!d) return 0;
+
+    int n = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) && n < cap) {
+        if (!str_all_digits(e->d_name)) continue;
+        int pid = atoi(e->d_name);
+        if (pid <= 1 || pid == root) continue;
+        if (pid_descends_from(pid, root)) out[n++] = pid;
+    }
+    closedir(d);
+    return n;
+}
+
+/* every view in the tree, so a window that turns up later can be spotted */
+static void collect_view_ids(const JV *node, int *ids, int *n, int cap)
+{
+    if (!node || node->type != J_OBJ || *n >= cap) return;
+    if (node_is_view(node)) {
+        int id = jint(node, "id", -1);
+        if (id >= 0) ids[(*n)++] = id;
+    }
+    for (int i = 0; i < node->count; ++i) {
+        const JV *kid = node->items[i];
+        if (!kid) continue;
+        if (kid->type == J_ARR)
+            for (int j = 0; j < kid->count; ++j) collect_view_ids(kid->items[j], ids, n, cap);
+        else if (kid->type == J_OBJ)
+            collect_view_ids(kid, ids, n, cap);
+    }
+}
+
+static int find_new_view(const JV *node, const int *known, int nknown)
+{
+    int ids[512], n = 0;
+    collect_view_ids(node, ids, &n, (int)SDL_arraysize(ids));
+    for (int i = 0; i < n; ++i) {
+        bool seen = false;
+        for (int j = 0; j < nknown; ++j) if (known[j] == ids[i]) { seen = true; break; }
+        if (!seen) return ids[i];
+    }
+    return -1;
+}
+
+/* Wait for the window `pid` opens, then put it where it was dropped. sway has
+ * no "run this on workspace N", so this is the only way to land an app
+ * somewhere else without switching there first and switching back.
+ *
+ * The pid is the first thing we look for, but it is not reliable on its own:
+ * a launcher, a wrapper script or an app that re-execs leaves the window
+ * belonging to a process whose parent chain no longer leads back to us. So we
+ * also watch for a view that simply was not there when we started — the one
+ * the drop just asked for. */
+static int adopt_window(int pid, const char *ws, double timeout, bool focus,
+                        int beside, const char *edge, bool no_assign)
+{
+    double deadline = now_secs() + timeout;
+    int    con_id   = -1;
+
+    int assigned[24], nassigned = 0;
+    if (!no_assign) {
+        assign_pid_to_ws(pid, ws);                /* before anything maps */
+        assigned[nassigned++] = pid;
+    }
+
+    int known[512], nknown = 0;
+    JV *first = sway_query(IPC_GET_TREE);
+    if (first) { collect_view_ids(first, known, &nknown, (int)SDL_arraysize(known)); jfree(first); }
+    if (ADOPT_LOG) fprintf(stderr, "swov: adopt pid %d -> ws %s (%d views now)\n",
+                           pid, ws, nknown);
+
+    double started = now_secs();
+    int    ticks = 0;
+
+    while (now_secs() < deadline) {
+        struct timespec ts = { 0, 40 * 1000000L };
+        nanosleep(&ts, NULL);
+        ticks++;
+
+        /* Keep putting the rule in front of anything the app starts, for the
+         * first few seconds. Every one of these is a pid that could be the
+         * one sway ends up seeing. */
+        if (!no_assign && nassigned < (int)SDL_arraysize(assigned) &&
+            now_secs() - started < 4.0) {
+            int kids[64];
+            int nk = sweep_descendants(pid, kids, (int)SDL_arraysize(kids));
+            for (int i = 0; i < nk && nassigned < (int)SDL_arraysize(assigned); ++i) {
+                bool seen = false;
+                for (int j = 0; j < nassigned; ++j)
+                    if (assigned[j] == kids[i]) { seen = true; break; }
+                if (seen) continue;
+                assign_pid_to_ws(kids[i], ws);
+                assigned[nassigned++] = kids[i];
+                if (ADOPT_LOG) fprintf(stderr, "swov: also assigned pid %d\n", kids[i]);
+            }
+        }
+
+        if (ticks % 3) continue;                  /* look at the tree at 8 Hz */
+
+        JV *tree = sway_query(IPC_GET_TREE);
+        if (!tree) continue;
+        con_id = find_view_of_pid(tree, pid);
+        if (con_id < 0) con_id = find_new_view(tree, known, nknown);
+        jfree(tree);
+
+        if (con_id >= 0) break;
+        if (kill(pid, 0) != 0 && errno == ESRCH && now_secs() - started > 3.0) {
+            if (ADOPT_LOG) fprintf(stderr, "swov: adopt gave up, pid %d is gone\n", pid);
+            break;
+        }
+    }
+    if (con_id < 0) {
+        if (ADOPT_LOG) fprintf(stderr, "swov: adopt found no window for pid %d\n", pid);
+        return 1;
+    }
+    if (ADOPT_LOG) fprintf(stderr, "swov: adopt window con_id %d\n", con_id);
+
+    /* If it did land here after all, float it first: a tiled window leaving a
+     * workspace makes everything left behind reflow, and that is the flash
+     * the assign rule is there to avoid. Floating, moving and tiling again
+     * touches only the workspace it ends up on. */
+    bool ok;
+    sway_cmd("[con_id=%d] floating enable", con_id);
+    if (str_all_digits(ws)) {
+        ok = sway_cmd("[con_id=%d] move container to workspace number %s", con_id, ws);
+    } else {
+        char *e = escape_arg(ws);
+        ok = sway_cmd("[con_id=%d] move container to workspace \"%s\"", con_id, e);
+        free(e);
+    }
+    sway_cmd("[con_id=%d] floating disable", con_id);
+
+    /* and then next to the window it was dropped on, splitting the way the
+     * pointer said — the same three commands a drag inside swov uses */
+    if (ok && beside > 0 && edge) {
+        bool horiz = !strcmp(edge, "left") || !strcmp(edge, "right");
+        sway_cmd("[con_id=%d] mark --add _swov_drop", beside);
+        sway_cmd("[con_id=%d] split %s", beside, horiz ? "h" : "v");
+        sway_cmd("[con_id=%d] move container to mark _swov_drop", con_id);
+        if (!strcmp(edge, "left") || !strcmp(edge, "top"))
+            sway_cmd("[con_id=%d] move %s", con_id, horiz ? "left" : "up");
+        sway_cmd("unmark _swov_drop");
+        if (ADOPT_LOG) fprintf(stderr, "swov: placed %s of con_id %d\n", edge, beside);
+    }
+
+    if (ok && focus) {
+        if (str_all_digits(ws)) sway_cmd("workspace number %s", ws);
+        else {
+            char *e = escape_arg(ws);
+            sway_cmd("workspace --no-auto-back-and-forth \"%s\"", e);
+            free(e);
+        }
+    }
+    return ok ? 0 : 1;
+}
+
 /* --------------------------------------------------------------- globals */
 
 static Cfg           C;
+
+/* ------------------------------------------------------- cpu per workspace
+ * swbr measures it — a rate needs two samples seconds apart, and swov is only
+ * on screen for a moment — and leaves the answer here. If swbr is not running
+ * the file is stale or missing and nothing is drawn. */
+typedef struct { char name[64]; float pct; } CpuWs;
+static CpuWs  CPU[64];
+static int    NCPU;
+
+static void cpu_load(void)
+{
+    NCPU = 0;
+    if (!C.cpu) return;
+
+    char path[512];
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (rt && *rt) snprintf(path, sizeof(path), "%s/swbr-cpu", rt);
+    else {
+        const char *home = getenv("HOME");
+        if (!home) return;
+        snprintf(path, sizeof(path), "%s/.cache/swbr-cpu", home);
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0) return;
+    if (time(NULL) - st.st_mtime > 30) return;     /* nobody is measuring */
+
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[256];
+    while (NCPU < (int)SDL_arraysize(CPU) && fgets(line, sizeof(line), f)) {
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = 0;
+        str_set(CPU[NCPU].name, sizeof(CPU[0].name), line);
+        CPU[NCPU].pct = (float)atof(tab + 1);
+        NCPU++;
+    }
+    fclose(f);
+}
+
+/* how busy, 0..1, or -1 when there is nothing worth drawing */
+static float cpu_frac(const char *ws_name)
+{
+    for (int i = 0; i < NCPU; ++i) {
+        if (strcmp(CPU[i].name, ws_name)) continue;
+        if (CPU[i].pct < C.cpu_min) return -1.0f;
+        float span = C.cpu_full - C.cpu_min;
+        float f = span > 0.0f ? (CPU[i].pct - C.cpu_min) / span : 1.0f;
+        return SDL_clamp(f, 0.0f, 1.0f);
+    }
+    return -1.0f;
+}
 static SDL_Renderer *REN;
 static TTF_Font     *F_BADGE;   /* workspace number            */
 static TTF_Font     *F_LABEL;   /* app name on a window card   */
@@ -1821,7 +2175,10 @@ typedef struct {
     int   ntop;
 
     SDL_FRect tile, screen;    /* layout (render pixels) */
-    SDL_FRect title_box;       /* the clickable name area in the header */
+    SDL_FRect title_box;       /* where the name is drawn in the header      */
+    SDL_FRect title_hit;       /* its middle half: clicking there renames.
+                                * The quarter to the left and to the right
+                                * selects the workspace, like the tile. */
     SDL_FRect tile_from;       /* where this tile animates from */
     Tex   badge, sub, title;
 } Ws;
@@ -2711,7 +3068,9 @@ static void layout(void)
         float left  = ws->tile.x + p + (ws->sub.t ? (float)ws->sub.w : 0.0f) + p;
         float right = ws->tile.x + ws->tile.w - p -
                       (ws->badge.t ? (float)ws->badge.w : 0.0f) - p;
-        ws->title_box = (SDL_FRect){ left, ws->tile.y, SDL_max(right - left, 0.0f), head_h };
+        float w = SDL_max(right - left, 0.0f);
+        ws->title_box = (SDL_FRect){ left, ws->tile.y, w, head_h };
+        ws->title_hit = (SDL_FRect){ left + w * 0.25f, ws->tile.y, w * 0.5f, head_h };
     }
 }
 
@@ -2748,12 +3107,21 @@ static void select_ws(int idx, bool keep_window)
     }
 }
 
+/* A workspace is worth stepping to while a query is up if something on it
+ * matched, or if its own name did — an empty workspace called "mail" is a
+ * hit for "mail" even though it has no windows to mark. */
+static bool ws_is_hit(const Ws *ws)
+{
+    if (qlen == 0) return true;
+    if (ci_contains(ws->name, query)) return true;
+    return ws_first_visible_match(ws) >= 0;
+}
+
 static void step_ws(int dir)
 {
     for (int i = 1; i <= NWS; ++i) {
         int cand = (((sel_ws + dir * i) % NWS) + NWS) % NWS;
-        if (qlen == 0 || WSS[cand].count == 0) { select_ws(cand, false); return; }
-        if (ws_first_visible(&WSS[cand]) >= 0) { select_ws(cand, false); return; }
+        if (ws_is_hit(&WSS[cand])) { select_ws(cand, false); return; }
     }
 }
 
@@ -3488,6 +3856,31 @@ static void draw_workspace(int idx)
 
     tex_draw(ws->badge, tile.x + tile.w - p - (float)ws->badge.w, top, num_col);
 
+    /* How busy that workspace is, as a moon filling from the bottom: barely
+     * there when it is idle, whole when something is working. Held back
+     * towards the tile colour, because it is not what the tile is about. */
+    float load = cpu_frac(ws->name);
+    if (load >= 0.0f) {
+        SDL_FColor hot = load < 0.5f ? mix(C.current, C.hl, load * 2.0f)
+                                     : mix(C.hl, C.urgent, (load - 0.5f) * 2.0f);
+        SDL_FColor lc = with_alpha(mix(C.dim, hot, 0.45f + 0.4f * load),
+                                   0.55f + 0.35f * load);
+        float d  = SDL_max(4.0f * SC, (float)ws->badge.h * 0.26f);
+        float dx = tile.x + tile.w - p - (float)ws->badge.w - d - 5.0f * SC;
+        float dy = top + (float)ws->badge.h * 0.5f - d * 0.5f;
+
+        fill_round_rect((SDL_FRect){ dx, dy, d, d }, d * 0.5f,
+                        with_alpha(lc, lc.a * 0.4f));      /* the whole disc */
+
+        float lit = d * (0.15f + 0.85f * load);            /* and how full   */
+        SDL_Rect clip = { (int)dx, (int)(dy + d - lit), (int)(d + 1.0f), (int)(lit + 1.0f) };
+        SDL_Rect prev;
+        bool had = SDL_GetRenderClipRect(REN, &prev) && SDL_RenderClipEnabled(REN);
+        SDL_SetRenderClipRect(REN, &clip);
+        fill_round_rect((SDL_FRect){ dx, dy, d, d }, d * 0.5f, lc);
+        SDL_SetRenderClipRect(REN, had ? &prev : NULL);
+    }
+
     float count_right = tile.x + p;
     if (ws->sub.t) {
         float base = top + ((float)ws->badge.h - (float)ws->sub.h) * 0.62f;
@@ -3779,6 +4172,7 @@ static void render(void)
 
 static bool running = true;
 static bool dirty   = true;      /* a frame is only drawn when this is set */
+static bool BACKDROP;            /* drawn behind another program's window   */
 
 static void reload_model(void)
 {
@@ -3795,7 +4189,13 @@ static void reload_model(void)
     for (int i = 0; i < NWIN && nmarks < MAX_WINDOWS; ++i)
         if (WINS[i].marked) marks[nmarks++] = WINS[i].con_id;
 
-    if (!model_reload()) { running = false; return; }
+    if (!model_reload()) {
+        /* The tree is being read while sway is busy starting something; a
+         * miss is not a reason to disappear. The overlay quits over it, the
+         * backdrop keeps what it had and tries again on the next event. */
+        if (!BACKDROP) running = false;
+        return;
+    }
 
     for (int i = 0; i < NWIN; ++i)
         for (int j = 0; j < nmarks; ++j)
@@ -3810,6 +4210,7 @@ static void reload_model(void)
             if (WINS[WSS[i].first + j].con_id == keep_con) { sel_ws = i; WSS[i].sel = j; }
     }
 
+    cpu_load();                  /* whatever swbr last measured */
     layout();
     apply_filter();
     rebuild_chrome();
@@ -3998,6 +4399,24 @@ static SDL_Texture *TARGET;
 static SDL_Cursor  *CUR_ARROW, *CUR_HAND;
 static float        MOUSE_SCALE = 1.0f;
 
+/* --- backdrop: swov drawn behind another program's window ---------------
+ * No input of its own; a launcher in front sends pointer positions on stdin
+ * and gets back the workspace under them. It fades in so that picking an app
+ * before the tree is even read shows nothing at all, rather than a frame that
+ * flashes into view. */
+static bool  BACKDROP;
+static float BACKDROP_A;              /* what is drawn now, 0..1 */
+static float BACKDROP_WANT = 1.0f;    /* where it is heading      */
+static bool  BACKDROP_LEAVING;
+static bool  BACKDROP_LOG;            /* --backdrop-debug: narrate to stderr */
+static char  RAISE_APP[64];           /* who to put back on top of us */
+static int   RAISE_LEFT;
+static double RAISE_AT;
+static float BLUR_NOW  = 1.0f;        /* 1 = as soft as `blur` says, 0 = sharp */
+static float BLUR_WANT = 1.0f;        /* a drag sharpens it, so you can aim    */
+static SDL_Texture *BLUR_HALF, *BLUR_SMALL;
+static int   BLUR_W, BLUR_H;
+
 static void usage(void)
 {
     printf(
@@ -4006,6 +4425,22 @@ static void usage(void)
 "usage: swov [options] [key=value ...]\n"
 "  -g, --go N|NAME     switch to that workspace and exit, without a window\n"
 "  -b, --back          switch to the previously used workspace and exit\n"
+"      --workspaces    print the workspaces as num/name/output/flags, and exit\n"
+"      --adopt PID WS  wait for the window PID opens, move it to workspace WS\n"
+"                      and exit. It tells sway where that window belongs\n"
+"                      before it opens, so nothing flashes onto the workspace\n"
+"                      you are on; --no-assign leaves that out.\n"
+"                      --beside CON_ID --edge left|right|top|bottom\n"
+"                      puts it next to that window instead of at the end,\n"
+"                      --adopt-debug says what it is doing\n"
+"                      and exit. Runs in the background; --adopt-wait keeps it\n"
+"                      in the foreground, --adopt-focus also switches there,\n"
+"                      --adopt-timeout SECS gives up after that (default 20)\n"
+"      --backdrop-debug  the same, narrating the conversation to stderr\n"
+"      --backdrop      draw the overview behind another window, taking no\n"
+"                      input of its own: it fades in, and reads commands on\n"
+"                      stdin (hover FX FY, drag on|off, fade in|out, quit).\n"
+"                      This is what appwheel puts behind its wheel\n"
 "      --usage         print how long each workspace has been used, and exit\n"
 "      --info          print every path and setting swov is using, and exit\n"
 "  -c, --config PATH   read this config file instead of the default\n"
@@ -4059,7 +4494,7 @@ static bool create_target(void)
     int ssaa = C.ssaa;
     while (ssaa > 1 && (long long)pw * ph * ssaa * ssaa > 34000000LL) ssaa--;
 
-    if (ssaa > 1) {
+    if (ssaa > 1 || BACKDROP) {
         TARGET = SDL_CreateTexture(REN, SDL_PIXELFORMAT_RGBA32,
                                    SDL_TEXTUREACCESS_TARGET, pw * ssaa, ph * ssaa);
         if (TARGET) {
@@ -4159,8 +4594,12 @@ static void handle_key(const SDL_KeyboardEvent *k)
             return;
         case SDLK_RETURN:
         case SDLK_KP_ENTER:
-            if (NWS > 0 && WSS[sel_ws].count > 0) act_focus_window(ws_sel_win(&WSS[sel_ws]));
-            else running = false;
+            /* the same rule as outside a search: a window if one is picked,
+             * otherwise the workspace itself. Tab leaves no window picked,
+             * and enter has to keep working after it. */
+            if (NWS == 0) { running = false; return; }
+            if (ws_sel_win(&WSS[sel_ws])) act_focus_window(ws_sel_win(&WSS[sel_ws]));
+            else                          act_goto_workspace(&WSS[sel_ws]);
             return;
         case SDLK_BACKSPACE:
             while (qlen > 0) {                     /* drop one code point */
@@ -4330,7 +4769,7 @@ static void handle_mouse_press(const SDL_MouseButtonEvent *b)
     if (editing) end_edit(true);                   /* a click elsewhere commits */
 
     if (b->button == SDL_BUTTON_LEFT && ws_idx >= 0 && win_idx < 0) {
-        SDL_FRect tb = WSS[ws_idx].title_box;
+        SDL_FRect tb = WSS[ws_idx].title_hit;
         if (mx >= tb.x && mx < tb.x + tb.w && my >= tb.y && my < tb.y + tb.h) {
             sel_active = true;
             sel_ws = ws_idx;
@@ -4449,6 +4888,23 @@ static void handle_event(const SDL_Event *e)
      * what is under the cursor. Everything else is a real state change. */
     if (e->type != SDL_EVENT_MOUSE_MOTION) dirty = true;
 
+    if (BACKDROP) {
+        /* the window in front owns the pointer and the keyboard; all we do is
+         * follow the size of the screen and the commands on stdin */
+        switch (e->type) {
+        case SDL_EVENT_QUIT:
+            running = false;
+            break;
+        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        case SDL_EVENT_WINDOW_RESIZED:
+            if (create_target()) { layout(); rebuild_chrome(); }
+            break;
+        default:
+            break;
+        }
+        return;
+    }
+
     switch (e->type) {
     case SDL_EVENT_QUIT:
         running = false;
@@ -4522,6 +4978,246 @@ static void handle_event(const SDL_Event *e)
     }
 }
 
+/* ------------------------------------------------------- backdrop commands
+ * One line in, one line out, on stdin and stdout. Coordinates are fractions
+ * of the window, so the program in front never has to know how big we are or
+ * which monitor we picked.
+ *
+ *   drag on|off      make the free numbers appear as tiles, or put them away
+ *   hover FX FY      -> "target N", "target NAME" or "target none"
+ *   fade in|out      blend the overview in or out
+ *   quit             fade out and leave
+ *   (end of input)   the same as quit: the parent is gone
+ */
+static void backdrop_reply(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    fputc('\n', stdout);
+    fflush(stdout);
+}
+
+static void backdrop_hover(float fx, float fy)
+{
+    float x = fx * (float)RW, y = fy * (float)RH;
+
+    int si = slot_at(x, y);
+    if (si >= 0 && SLOTS[si].ws < 0) {            /* a free number */
+        sel_active = false;
+        drop_kind  = DROP_WIN_NEWWS;              /* the ghost lights up */
+        drop_num   = SLOTS[si].num;
+        drag_active = true;
+        dirty = true;
+        backdrop_reply("target %d", SLOTS[si].num);
+        return;
+    }
+
+    int ws_idx = -1;
+    int win_idx = hit_test(x, y, &ws_idx);
+    drag_active = false;
+    drop_kind = DROP_NONE;
+
+    if (ws_idx < 0) {
+        sel_active = false;
+        dirty = true;
+        backdrop_reply("target none");
+        return;
+    }
+
+    sel_active = true;                            /* the selection cursor */
+    sel_ws = ws_idx;
+    WSS[ws_idx].sel = -1;
+    dirty = true;
+
+    /* Over a window, the pointer picks a side of it, exactly as dragging a
+     * window inside swov does: the bar shows where it will land, and the app
+     * is placed there once it opens. */
+    char place[64] = "";
+    if (win_idx >= 0) {
+        static const char *EDGE_NAME[] = { "left", "right", "top", "bottom" };
+        int e = edge_at(WINS[win_idx].card, x, y);
+        drag_active = true;
+        drop_kind   = DROP_WIN_NEAR;
+        drop_win    = win_idx;
+        drop_ws     = ws_idx;
+        drop_edge   = e;
+        snprintf(place, sizeof(place), " beside %d %s",
+                 WINS[win_idx].con_id, EDGE_NAME[e]);
+    }
+
+    const char *here = WSS[ws_idx].focused ? " current" : "";
+    if (WSS[ws_idx].num >= 0)
+        backdrop_reply("target %d%s%s", WSS[ws_idx].num, here, place);
+    else
+        backdrop_reply("target %s%s%s", WSS[ws_idx].name, here, place);
+}
+
+/* returns false when the channel is done with */
+static bool backdrop_command(char *line)
+{
+    char *nl = strchr(line, '\n');
+    if (nl) *nl = 0;
+    if (BACKDROP_LOG) fprintf(stderr, "swov: <- %s\n", line);
+
+    if (!strncmp(line, "hover ", 6)) {
+        float fx = 0.0f, fy = 0.0f;
+        if (sscanf(line + 6, "%f %f", &fx, &fy) == 2) backdrop_hover(fx, fy);
+        return true;
+    }
+    if (!strncmp(line, "assign ", 7)) {
+        int pid = 0; char ws[64] = "";
+        if (sscanf(line + 7, "%d %63s", &pid, ws) == 2 && pid > 0 && ws[0])
+            assign_pid_to_ws(pid, ws);
+        return true;
+    }
+    if (!strcmp(line, "drag on"))  { set_ghosts(0, 10); BLUR_WANT = 0.0f; return true; }
+    if (!strcmp(line, "drag off")) {
+        set_ghosts(-1, -1);
+        BLUR_WANT = 1.0f;
+        drag_active = false;
+        drop_kind = DROP_NONE;
+        sel_active = false;
+        dirty = true;
+        return true;
+    }
+    if (!strncmp(line, "raise ", 6) && line[6]) {
+        str_set(RAISE_APP, sizeof(RAISE_APP), line + 6);
+        RAISE_LEFT = 3;                       /* now, and twice more */
+        RAISE_AT   = 0.0;
+        /* Our window mapped on top of the one that asked for us, and on
+         * Wayland that one cannot lift itself back. sway can.
+         *
+         * Focusing it directly is not enough: it usually still *is* the
+         * focused window, thanks to `no_focus`, so sway has nothing to do and
+         * the stacking never changes. Focusing us first and it second makes
+         * the second a real change, which restacks. That is also why this
+         * waits for our own window to exist in the tree — asking before sway
+         * knows about it is the other half of the race. */
+        return true;
+    }
+    if (!strcmp(line, "fade in"))  { BACKDROP_WANT = 1.0f; return true; }
+    if (!strcmp(line, "fade out")) { BACKDROP_WANT = 0.0f; return true; }
+    if (!strcmp(line, "quit"))     return false;
+    return true;
+}
+
+/* read whatever is waiting, one line at a time */
+static void backdrop_poll(void)
+{
+    static char buf[512];
+    static int  len;
+
+    struct pollfd p = { 0, POLLIN, 0 };
+    while (poll(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP))) {
+        ssize_t n = read(0, buf + len, sizeof(buf) - 1 - (size_t)len);
+        if (n <= 0) { BACKDROP_LEAVING = true; return; }   /* parent is gone */
+        len += (int)n;
+        buf[len] = 0;
+
+        char *start = buf, *nl;
+        while ((nl = strchr(start, '\n')) != NULL) {
+            *nl = 0;
+            if (!backdrop_command(start)) { BACKDROP_LEAVING = true; return; }
+            start = nl + 1;
+        }
+        len = (int)strlen(start);
+        memmove(buf, start, (size_t)len + 1);
+    }
+}
+
+/* Put the window that spawned us back on top. Ours mapped over it and on
+ * Wayland it cannot lift itself; sway's `focus` on a floating container always
+ * raises it, so one command does the job — but only once sway knows our window
+ * exists. Rather than guess when that is, say it three times over half a
+ * second. Repeating is harmless: the wheel is already the focused window. */
+static void backdrop_raise_tick(void)
+{
+    if (RAISE_LEFT <= 0) return;
+    double now = now_secs();
+    if (now < RAISE_AT) return;
+
+    char *e = escape_arg(RAISE_APP);
+    bool ok = sway_cmd("[app_id=\"%s\"] focus", e);
+    free(e);
+
+    if (BACKDROP_LOG)
+        fprintf(stderr, "swov: raise [app_id=\"%s\"] focus -> %s\n",
+                RAISE_APP, ok ? "ok" : "no match");
+
+    RAISE_AT = now + 0.18;
+    RAISE_LEFT--;
+}
+
+/* ease towards the wanted alpha; leaving means fade out, then exit */
+static void backdrop_step(float ms)
+{
+    backdrop_raise_tick();
+
+    if (BACKDROP_LEAVING) BACKDROP_WANT = 0.0f;
+
+    float rate = C.anim_ms > 1.0f ? ms / C.anim_ms : 1.0f;
+    if (BACKDROP_A < BACKDROP_WANT) {
+        BACKDROP_A += rate;
+        if (BACKDROP_A > BACKDROP_WANT) BACKDROP_A = BACKDROP_WANT;
+        dirty = true;
+    } else if (BACKDROP_A > BACKDROP_WANT) {
+        BACKDROP_A -= rate;
+        if (BACKDROP_A < BACKDROP_WANT) BACKDROP_A = BACKDROP_WANT;
+        dirty = true;
+    }
+    if (BLUR_NOW != BLUR_WANT) {                  /* sharpen / soften again */
+        float step = rate * 1.6f;
+        if (BLUR_NOW < BLUR_WANT) { BLUR_NOW += step; if (BLUR_NOW > BLUR_WANT) BLUR_NOW = BLUR_WANT; }
+        else                      { BLUR_NOW -= step; if (BLUR_NOW < BLUR_WANT) BLUR_NOW = BLUR_WANT; }
+        dirty = true;
+    }
+    if (BACKDROP_LEAVING && BACKDROP_A <= 0.0f) running = false;
+}
+
+/* Two scaled copies of the frame we already rendered: full -> half -> small,
+ * then that small one stretched back over the screen. The card does the
+ * filtering, so it is three quad blits and no per-pixel work of our own. The
+ * sharp frame is then drawn over it with whatever alpha is left, which is how
+ * it sharpens while you drag. */
+static void backdrop_blur(float alpha)
+{
+    static const int FACTOR[4] = { 0, 5, 9, 15 };
+    int f  = FACTOR[C.blur < 0 ? 0 : (C.blur > 3 ? 3 : C.blur)];
+    int w1 = SDL_max(2, RW / 2), h1 = SDL_max(2, RH / 2);
+    int w2 = SDL_max(2, RW / f), h2 = SDL_max(2, RH / f);
+
+    if (!BLUR_HALF || BLUR_W != w2 || BLUR_H != h2) {
+        if (BLUR_HALF)  SDL_DestroyTexture(BLUR_HALF);
+        if (BLUR_SMALL) SDL_DestroyTexture(BLUR_SMALL);
+        BLUR_HALF = SDL_CreateTexture(REN, SDL_PIXELFORMAT_RGBA32,
+                                      SDL_TEXTUREACCESS_TARGET, w1, h1);
+        BLUR_SMALL = SDL_CreateTexture(REN, SDL_PIXELFORMAT_RGBA32,
+                                       SDL_TEXTUREACCESS_TARGET, w2, h2);
+        if (!BLUR_HALF || !BLUR_SMALL) { BLUR_W = BLUR_H = 0; return; }
+        SDL_SetTextureScaleMode(BLUR_HALF,  SDL_SCALEMODE_LINEAR);
+        SDL_SetTextureScaleMode(BLUR_SMALL, SDL_SCALEMODE_LINEAR);
+        BLUR_W = w2;
+        BLUR_H = h2;
+    }
+
+    /* copy, do not blend: the alpha of the overlay has to survive the trip */
+    SDL_SetTextureBlendMode(TARGET, SDL_BLENDMODE_NONE);
+    SDL_SetTextureBlendMode(BLUR_HALF, SDL_BLENDMODE_NONE);
+
+    SDL_SetRenderTarget(REN, BLUR_HALF);
+    SDL_RenderTexture(REN, TARGET, NULL, NULL);
+    SDL_SetRenderTarget(REN, BLUR_SMALL);
+    SDL_RenderTexture(REN, BLUR_HALF, NULL, NULL);
+    SDL_SetRenderTarget(REN, NULL);
+
+    SDL_SetTextureBlendMode(TARGET, SDL_BLENDMODE_BLEND);
+    SDL_SetTextureBlendMode(BLUR_SMALL, SDL_BLENDMODE_BLEND);
+    SDL_SetTextureAlphaModFloat(BLUR_SMALL, alpha);
+    SDL_RenderTexture(REN, BLUR_SMALL, NULL, NULL);
+}
+
 static void present(void)
 {
     if (TARGET) SDL_SetRenderTarget(REN, TARGET);
@@ -4532,7 +5228,14 @@ static void present(void)
         SDL_SetRenderDrawColorFloat(REN, 0, 0, 0, 0);
         SDL_RenderClear(REN);
         SDL_SetRenderDrawBlendMode(REN, SDL_BLENDMODE_BLEND);
-        SDL_RenderTexture(REN, TARGET, NULL, NULL);
+
+        float sharp = 1.0f;
+        if (BACKDROP && C.blur > 0 && BLUR_NOW > 0.0f) {
+            backdrop_blur(BACKDROP_A);
+            sharp = 1.0f - BLUR_NOW;
+        }
+        if (BACKDROP) SDL_SetTextureAlphaModFloat(TARGET, BACKDROP_A * sharp);
+        if (sharp > 0.0f) SDL_RenderTexture(REN, TARGET, NULL, NULL);
     }
 
     if (SHOT_PATH) {
@@ -4622,6 +5325,14 @@ int main(int argc, char **argv)
     bool  go_back = false;
     bool  show_usage_stats = false;
     bool  show_info = false;
+    bool  list_ws = false;
+    bool  adopt_focus = false, adopt_wait = false;
+    int   adopt_pid = -1;
+    const char *adopt_ws = NULL;
+    double adopt_timeout = 20.0;
+    int   adopt_beside = -1;
+    bool  adopt_no_assign = false;
+    const char *adopt_edge = NULL;
     const char *sets[64];
     int nsets = 0;
 
@@ -4629,11 +5340,26 @@ int main(int argc, char **argv)
         const char *a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else if (!strcmp(a, "-v") || !strcmp(a, "--version")) {
-            printf("swov %s (built %s)\n", SWOV_VERSION, __DATE__);
+            printf("swov %s (build %s)\n", SWOV_VERSION, SWOV_BUILD);
             return 0;
         }
         else if ((!strcmp(a, "-g") || !strcmp(a, "--go")) && i + 1 < argc) go_name = argv[++i];
         else if (!strcmp(a, "-b") || !strcmp(a, "--back")) go_back = true;
+        else if (!strcmp(a, "--workspaces")) list_ws = true;
+        else if (!strcmp(a, "--backdrop")) BACKDROP = true;
+        else if (!strcmp(a, "--backdrop-debug")) { BACKDROP = true; BACKDROP_LOG = true; }
+        else if (!strcmp(a, "--adopt") && i + 2 < argc) {
+            adopt_pid = atoi(argv[++i]);
+            adopt_ws  = argv[++i];
+        }
+        else if (!strcmp(a, "--adopt-focus")) adopt_focus = true;
+        else if (!strcmp(a, "--adopt-debug")) ADOPT_LOG = true;
+        else if (!strcmp(a, "--no-assign")) adopt_no_assign = true;
+        else if (!strcmp(a, "--beside") && i + 1 < argc) adopt_beside = atoi(argv[++i]);
+        else if (!strcmp(a, "--edge") && i + 1 < argc)   adopt_edge = argv[++i];
+        else if (!strcmp(a, "--adopt-wait"))  adopt_wait = true;
+        else if (!strcmp(a, "--adopt-timeout") && i + 1 < argc)
+            adopt_timeout = atof(argv[++i]);
         else if (!strcmp(a, "--usage")) show_usage_stats = true;
         else if (!strcmp(a, "--info")) show_info = true;
         else if ((!strcmp(a, "-c") || !strcmp(a, "--config")) && i + 1 < argc)
@@ -4656,6 +5382,8 @@ int main(int argc, char **argv)
     }
 
     if (use_cfg) {
+        SHARED_LOADED = sw_shared_apply("swov", cfg_set_shared, &C) != 0;
+
         bool named = cfg_path != NULL;
         if (!cfg_path) cfg_path = default_config_path();
         if (cfg_path) {
@@ -4681,8 +5409,10 @@ int main(int argc, char **argv)
         char *upath = usage_path();
         usage_load();
 
-        printf("swov %s (built %s)\n\n", SWOV_VERSION, __DATE__);
+        printf("swov %s (build %s)\n\n", SWOV_VERSION, SWOV_BUILD);
         printf("binary        %s\n", exe[0] ? exe : "(unknown)");
+        printf("shared config %s%s\n", sw_shared_path() ? sw_shared_path() : "(none)",
+               SHARED_LOADED ? "  [loaded]" : "  [not present]");
         printf("config        %s%s\n", CFG_PATH[0] ? CFG_PATH : "(none)",
                CFG_PATH[0] ? (CFG_LOADED ? "  [loaded]" : "  [missing, defaults in use]") : "");
         printf("usage file    %s\n", upath ? upath : "(none)");
@@ -4723,6 +5453,10 @@ int main(int argc, char **argv)
         printf("  show_empty %d   all_outputs %d   start_selection %d\n",
                C.show_empty, C.all_outputs, C.start_selection);
         printf("  header_pos %s   hints_pos %s\n", C.header_pos, C.hints_pos);
+        printf("  blur %d (backdrop only)   cpu %d (min %g, full %g)\n",
+               C.blur, C.cpu, (double)C.cpu_min, (double)C.cpu_full);
+        printf("  back %s\n",
+               C.back_scope == 1 ? "output" : C.back_scope == 2 ? "sway" : "global");
         printf("  track %d   usage_dots %d   dot_count %d   dot_px %.0f\n",
                C.track, C.usage_dots, C.dot_count, (double)C.dot_px);
         printf("  anim_ms %.0f   shadow %d   float_alpha %.2f   vsync %d\n",
@@ -4768,8 +5502,35 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    if (adopt_pid > 0 && !adopt_wait) {
+        /* Step into the background before touching the socket: whoever called
+         * us wants to carry on, and the window may be seconds away. */
+        pid_t p = fork();
+        if (p < 0) die("fork: %s", strerror(errno));
+        if (p > 0) return 0;
+        setsid();
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, 0); dup2(devnull, 1);
+            if (devnull > 2) close(devnull);
+        }
+    }
+
     sway_fd = sway_connect();
     if (sway_fd < 0) die("cannot reach sway (is SWAYSOCK set?)");
+
+    if (list_ws) {
+        int rc = print_workspaces();
+        close(sway_fd);
+        return rc;
+    }
+
+    if (adopt_pid > 0 && adopt_ws) {
+        int rc = adopt_window(adopt_pid, adopt_ws, adopt_timeout, adopt_focus,
+                              adopt_beside, adopt_edge, adopt_no_assign);
+        close(sway_fd);
+        return rc;
+    }
 
     /* Switching does not need a window, a renderer or a font: connect, say it,
      * leave. This is the path a keybinding should use. */
@@ -4783,7 +5544,9 @@ int main(int argc, char **argv)
             int  here_num = -1, target_num = -1;
             focused_workspace(here, sizeof(here), out, sizeof(out), &here_num);
 
-            if (C.track && last_workspace_here(out, here, target, sizeof(target), &target_num)) {
+            if (C.track && C.back_scope != 2 &&
+                last_workspace_here(C.back_scope == 1 ? out : NULL, here,
+                                    target, sizeof(target), &target_num)) {
                 /* By number where there is one: the workspace may have been
                  * renamed since we saw it, and asking sway for a name that no
                  * longer exists makes it create a second workspace with the
@@ -4823,8 +5586,11 @@ int main(int argc, char **argv)
                 str_set(FOCUSED_OUTPUT, sizeof(FOCUSED_OUTPUT), jstr(wsr->items[i], "output", ""));
     jfree(wsr);
 
-    SDL_SetHint(SDL_HINT_APP_ID, APP_ID);
-    SDL_SetAppMetadata("swov", SWOV_VERSION, "org.swov.overview");
+    /* A different app id, because a backdrop must not take the keyboard from
+     * the window in front of it:
+     *     for_window [app_id="swov-backdrop"] no_focus                     */
+    SDL_SetHint(SDL_HINT_APP_ID, BACKDROP ? APP_ID "-backdrop" : APP_ID);
+    SDL_SetAppMetadata(APP_ID, SWOV_VERSION, "org.swov.overview");
 
     if (!SDL_Init(SDL_INIT_VIDEO)) die("SDL_Init: %s", SDL_GetError());
     if (!TTF_Init()) die("TTF_Init: %s", SDL_GetError());
@@ -4834,7 +5600,8 @@ int main(int argc, char **argv)
 
     SDL_WindowFlags flags = SDL_WINDOW_BORDERLESS | SDL_WINDOW_TRANSPARENT |
                             SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    WIN_HANDLE = SDL_CreateWindow("swov", bounds.w, bounds.h, flags);
+    WIN_HANDLE = SDL_CreateWindow(BACKDROP ? APP_ID "-backdrop" : APP_ID,
+                                  bounds.w, bounds.h, flags);
     if (!WIN_HANDLE) die("SDL_CreateWindow: %s", SDL_GetError());
     SDL_SetWindowPosition(WIN_HANDLE, bounds.x, bounds.y);
 
@@ -4852,10 +5619,12 @@ int main(int argc, char **argv)
     usage_sync();
     sway_subscribe_events();
     if (!model_reload()) die("could not read the sway tree");
+    cpu_load();                  /* whatever swbr last measured */
     select_current_workspace();
 
-    sel_active = C.start_selection != 0;
-    if (C.start_selection == 2 && NWS > 0) WSS[sel_ws].sel = ws_first_visible(&WSS[sel_ws]);
+    sel_active = BACKDROP ? false : (C.start_selection != 0);
+    if (!BACKDROP && C.start_selection == 2 && NWS > 0)
+        WSS[sel_ws].sel = ws_first_visible(&WSS[sel_ws]);
     layout();
     apply_filter();
     rebuild_chrome();
@@ -4867,14 +5636,33 @@ int main(int argc, char **argv)
     Uint64 last_reload = 0;
     bool   pending_reload = false;
 
-    SDL_StartTextInput(WIN_HANDLE);
+    if (!BACKDROP) SDL_StartTextInput(WIN_HANDLE);
     SDL_RaiseWindow(WIN_HANDLE);
+    if (BACKDROP && SHOT_PATH) BACKDROP_A = 1.0f;   /* a still has nothing to fade */
     present();
+
+    if (BACKDROP) {
+        /* the window is up; whoever spawned us can put itself back on top */
+        printf("ready\n");
+        fflush(stdout);
+    }
+
+    Uint64 last_tick = SDL_GetTicks();
 
     while (running) {
         SDL_Event e;
         if (anim_running()) dirty = true;
-        if (SDL_WaitEventTimeout(&e, (anim_running() || pending_reload) ? 8 : 60)) {
+
+        if (BACKDROP) {
+            backdrop_poll();
+            Uint64 now = SDL_GetTicks();
+            backdrop_step((float)(now - last_tick));
+            last_tick = now;
+            if (!running) break;
+        }
+
+        if (SDL_WaitEventTimeout(&e, BACKDROP ? 8
+                                    : (anim_running() || pending_reload) ? 8 : 60)) {
             handle_event(&e);
             while (running && SDL_PollEvent(&e)) handle_event(&e);   /* coalesce */
         }
@@ -4907,6 +5695,8 @@ int main(int argc, char **argv)
 
     if (CUR_ARROW) SDL_DestroyCursor(CUR_ARROW);
     if (CUR_HAND)  SDL_DestroyCursor(CUR_HAND);
+    if (BLUR_HALF)  SDL_DestroyTexture(BLUR_HALF);
+    if (BLUR_SMALL) SDL_DestroyTexture(BLUR_SMALL);
     if (TARGET)    SDL_DestroyTexture(TARGET);
     if (F_BADGE)   TTF_CloseFont(F_BADGE);
     if (F_LABEL)   TTF_CloseFont(F_LABEL);

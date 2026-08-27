@@ -38,7 +38,7 @@ for_window [app_id="swov"] floating enable, border none
 | `0`–`9` | switch to that workspace |
 | `ctrl+0`–`9` | move the selection there |
 | arrows, `hjkl` | move the selection; it walks through tile borders and wraps around the grid |
-| `tab` / `shift+tab` | previous / next workspace |
+| `tab` / `shift+tab` | previous / next workspace; while searching, only the ones with a hit |
 | `ctrl+tab` (`+shift`) | one row down / up in the grid |
 | `w` | window selection ⇄ whole-workspace selection |
 | `enter`, click | focus |
@@ -54,8 +54,9 @@ for_window [app_id="swov"] floating enable, border none
 
 Mouse and keyboard share one cursor: pointing at a window selects it, so
 `space`, `x`, `ctrl`+digit and the rest act on whatever is under the pointer.
-Click a workspace name in the header to rename it; `enter` keeps it, `esc`
-drops it. The name is what `f` and `/` search, next to app ids and titles.
+Click the middle of a workspace name in the header to rename it; `enter` keeps
+it, `esc` drops it. The quarter to the left and to the right of the name is not
+part of that — clicking there selects the workspace. The name is what `f` and `/` search, next to app ids and titles.
 swov opens with the current workspace selected as a whole, no window picked.
 Orange is only ever the selection cursor; the workspace sway is showing and the
 window it has focused are marked in teal (`current`), search hits in violet
@@ -92,14 +93,98 @@ swov -b          # back to the last workspace you used *on this monitor*
 Both talk to the IPC socket and quit — no window, no font, about 5 ms. Good for
 keybindings.
 
-`-b` goes to the workspace activated most recently that is not the current one,
-on the monitor you are on. It switches *by number*, so a workspace renamed since
-is still the same workspace, and every swov run first checks where sway actually
-is — workspaces you reached with a sway keybinding count too. Press it twice and
-you are back where you started.
+`-b` goes to the workspace activated most recently that is not the current one.
+It switches *by number*, so a workspace renamed since is still the same
+workspace, and every swov run first checks where sway actually is — workspaces
+you reached with a sway keybinding count too. Press it twice and you are back
+where you started.
 
-sway's own `back_and_forth` is only the fallback when there is no history yet:
-it is global, so with two screens it throws focus onto the other monitor.
+With two monitors that means stepping to the other screen and pressing `-b`
+brings you back to the workspace you left there. Set `back=output` if you would
+rather stay on the monitor you are on and walk its own history, or `back=sway`
+for sway's `back_and_forth`. sway's is also the fallback when there is no
+history yet.
+
+## For other programs
+
+```sh
+swov --workspaces        # num, name, output, flags — one per line, tab separated
+swov --adopt PID 3       # wait for the window PID opens, then move it to 3
+swov --adopt PID 3 --beside 42 --edge left   # next to that window
+```
+
+Neither opens a window. `--workspaces` is how a launcher learns where an app
+could go; `--adopt` is how it gets there. sway has no "run this on workspace
+N", so swov watches the tree until a view belonging to that process (or to
+anything it started) appears, then moves it — no switching there and back, no
+flicker. It goes into the background at once, gives up after 20 seconds
+(`--adopt-timeout`), and with `--adopt-focus` also switches to the workspace.
+
+```sh
+swov --backdrop          # the overview behind someone else's window
+```
+
+Same overview, no input of its own, fading in from nothing so a window in
+front of it never flickers. It reads `hover FX FY`, `drag on|off`, `fade
+in|out`, `raise APP_ID` and `quit` on stdin, one line at a time, and answers a
+hover with the workspace under that point — plus `current` when that is the
+one you are on. `raise` exists because on Wayland the window that spawned the
+backdrop cannot lift itself back over it, and swov is talking to sway anyway. Coordinates are fractions of the screen, so the
+program in front needs to know nothing about monitors. When stdin closes it
+fades out and leaves.
+
+`blur=0..3` softens it while it sits behind something, so the window in front
+stays the thing you are looking at. It sharpens by itself the moment a drag
+starts and softens again when the drag ends, which is when you actually need
+to read the workspace you are aiming at. It costs three scaled blits of a
+frame that is already drawn, and swov only repaints on change, so an idle
+backdrop costs nothing at all.
+
+It uses its own app id, so give it a rule or it steals the keyboard:
+
+```
+no_focus [app_id="swov-backdrop"]
+for_window [app_id="swov-backdrop"] floating enable, border none
+```
+
+`no_focus` takes the criteria itself. `for_window [...] no_focus` is not the
+same thing and does nothing at all.
+
+`--backdrop-debug` is the same mode with the conversation echoed to stderr.
+
+Before it waits for anything, `--adopt` tells sway where that window belongs:
+
+```
+assign [pid=1234] workspace number 3
+```
+
+sway reads `assign` rules while it is deciding which workspace a new view goes
+to, before the container exists anywhere, so the window never appears on the
+workspace you are looking at and nothing there is rearranged.
+
+One rule is often not enough: a launcher, a wrapper script or an app that
+forks and lets the parent go leaves the window belonging to a pid nobody told
+us about. So for the first four seconds swov keeps sweeping `/proc` for
+processes descending from the one it started and puts a rule in front of each,
+up to two dozen.
+
+Moving the window afterwards is the fallback for when none of them matched,
+and it floats the window before moving it: a tiled window leaving a workspace
+makes everything left behind reflow, and that is the flash the rules are there
+to avoid. `--no-assign` leaves the whole mechanism out. The rules outlive the
+app — sway has no unassign — but each names one pid, so it does nothing once
+that process is gone.
+
+The pid is a hint, not a rule: a launcher, a wrapper script or an app that
+re-execs leaves a window whose parent chain no longer leads back to the
+process that was started. So swov also watches for a view that simply was not
+there before, and takes that. `--beside` places the new window next to an
+existing one with the same three sway commands a drag inside swov uses, and
+`--adopt-debug` narrates the whole thing to stderr.
+
+appwheel uses all three: `overview=1` puts swov behind the wheel, dragging an
+app asks it where the pointer is — including which side of which window — and
+dropping starts the app exactly there.
 
 ## Workspace usage
 
@@ -120,6 +205,16 @@ swov --info      # every path and setting in use: binary, config, usage file,
 
 `track=0` in the config turns the recording off.
 
+## Load per workspace
+
+A small moon next to each workspace number says how busy that workspace is: a
+sliver when it is idling, whole when something is working, running from teal
+through orange into red and held back towards `dim`, since it is secondary to
+everything else on the tile. swbr measures it — a rate needs two samples
+seconds apart and swov is only on screen for a moment — and leaves the answer
+in `$XDG_RUNTIME_DIR/swbr-cpu`. Without swbr running the file is stale or
+missing and nothing is drawn. `cpu=0` turns it off.
+
 ## Config
 
 `${XDG_CONFIG_HOME:-~/.config}/swov/config`, `key=value`, `#` comments. Every
@@ -131,6 +226,11 @@ swov --ssaa=1 --header_pos=top-left
 swov --shot /tmp/o.png     # one frame to a PNG, for tuning colours
 ```
 
+Colours and fonts can also be set once for swov, appwheel and swbr together in
+`${XDG_CONFIG_HOME:-~/.config}/sw/config`, using role names (`surface`,
+`accent`, `hl`, ...) that each program maps onto its own keys. `sw_theme.h`
+lists them. The file above is read after it, so swov's own config always wins.
+
 `config.example` lists everything with defaults. The ones worth knowing:
 
 | key | |
@@ -141,7 +241,9 @@ swov --shot /tmp/o.png     # one frame to a PNG, for tuning colours
 | `float_alpha` | how see-through floating and fullscreen windows are |
 | `win_gap`, `screen_pad` | space between windows, and around them |
 | `header_pos`, `hints_pos` | `none`, or `top`/`bottom` + `left`/`center`/`right` |
-| `anim_ms` | tile glide duration; `0` disables |
+| `anim_ms` | tile glide duration, and the backdrop fade; `0` disables |
+| `blur` | how soft `--backdrop` is drawn, `0`–`3` |
+| `cpu`, `cpu_min`, `cpu_full` | the load dot, and the range it covers |
 | `track`, `usage_dots`, `dot_count`, `dot_px` | usage recording and its dot scale |
 | `start_selection` | `workspace`, `none` or `window` |
 | `cols`, `rows` | force the grid; default picks the largest tiles |

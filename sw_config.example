@@ -1,0 +1,60 @@
+# ~/.config/sw/config — one look for swov, appwheel and swbr.
+#
+# Keys written here, before any [section], go to all three. Role names are
+# translated to each program's own keys; roles a program has no use for are
+# dropped. sw_theme.h holds the whole table.
+#
+# Read after the built-in defaults and before each program's own config, so
+# ~/.config/swov/config and the command line still win over anything here.
+
+# --- the palette ---------------------------------------------------------
+# role            swov            appwheel     swbr
+bg=0d1117cc     # bg              bg           —          the scrim
+surface=1e2733f2 # tile           ring         bg         the panel itself
+surface_alt=26313ff2 # tile_sel   ring2        —
+surface_hi=2b3644f2  # tile_hover —            ws_visible_bg
+inset=11171f9e  # mini_bg         center       —
+card=33404ff7   # card            —            ws_bg
+card_hi=46566af7 # card_hover     —            —
+card_focus=3b4a5bf7 # card_focus  —            —
+
+text=e8e8e8ff   # text            text         text
+subtext=b3c0cdff # subtext        —            ws_fg, ws_visible_fg
+dim=5a6b7aff    # dim             dim          dim
+hint=a7b5c4ff   # hint            —            —
+
+accent=89afc4ff # accent          accent       accent, msg_info
+hl=cb9b00ff     # hl              hl           hl, ws_focused_bg, mode_bg
+hltext=141414ff # hltext          hltext       ws_focused_fg, mode_fg
+current=4fb3a5ff # current        —            —
+match=b58ae0ff  # match           —            —
+warn=cb9b00ff   # —               —            msg_warn
+urgent=e0533cff # urgent          —            urgent, ws_urgent_bg, msg_error
+ok=3ddc84ff     # —               —            running
+outline=0a0e1499 # outline        —            outline, separator_color
+shadow=00000073 # shadow_color    —            —
+
+# --- everything else -----------------------------------------------------
+# font=                 leave unset and each program asks fc-match
+ui_scale=1.0
+anim_ms=160
+corner_radius=14 # swov radius, swbr radius. appwheel's `radius` is the size
+                 # of the wheel, so it is left alone
+ssaa=2           # swov, appwheel
+icons=1          # swov, appwheel
+icon_px=40
+
+# --- per program ---------------------------------------------------------
+# Inside a section that program's own key names work as well.
+
+[swov]
+# blur=2
+# cpu=1
+
+[appwheel]
+# radius=0.44
+# slots=8
+
+[swbr]
+# height=30
+# ws_cpu=1

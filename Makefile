@@ -1,64 +1,65 @@
-# swov — build and install
+# swov — Makefile
 #
-#   make                 build ./swov
-#   make install         into ~/.local/bin (override with PREFIX=/usr/local)
-#   make config          drop config.example into ~/.config/swov/config
-#   make debug           build ./swov-debug with the sanitizers on
-#   make clean uninstall
+#   make            build                                   -> ./swov
+#   make debug      build with the address and UB sanitizers -> ./swov-debug
+#   make strict     build with -Wall -Wextra
+#   make run        build and run
+#   make install    install to $(PREFIX)/bin        (default: ~/.local)
+#   make config     copy config.example to ~/.config/swov/config
+#   make clean
+#
+# Requires: a C compiler, pkg-config, and the SDL3, SDL3_image and SDL3_ttf
+# dev files. On Debian trixie and newer:
+#   sudo apt install build-essential pkg-config \
+#        libsdl3-dev libsdl3-image-dev libsdl3-ttf-dev
 
-PREFIX  ?= $(HOME)/.local
-BINDIR  ?= $(PREFIX)/bin
-CONFDIR ?= $(if $(XDG_CONFIG_HOME),$(XDG_CONFIG_HOME),$(HOME)/.config)/swov
+CC          ?= cc
+PKG_CONFIG  ?= pkg-config
+CFLAGS      ?= -std=c11 -O2
+PREFIX      ?= $(HOME)/.local
+bindir      ?= $(PREFIX)/bin
 
-PKGS       := sdl3 sdl3-image sdl3-ttf
-PKG_CFLAGS := $(shell pkg-config --cflags $(PKGS) 2>/dev/null)
-PKG_LIBS   := $(shell pkg-config --libs   $(PKGS) 2>/dev/null)
+BUILD       := $(shell md5sum swov.c 2>/dev/null | cut -c1-8)
+SRC         := swov.c
+HDR         := sw_theme.h
+BIN         := swov
+PKGS        := sdl3 sdl3-image sdl3-ttf
 
-CC       ?= cc
-CFLAGS   ?= -O2
-CFLAGS   += -std=c11 -Wall -Wextra $(PKG_CFLAGS)
-LDLIBS   += $(PKG_LIBS)
+SDL_CFLAGS  := $(shell $(PKG_CONFIG) --cflags $(PKGS))
+SDL_LIBS    := $(shell $(PKG_CONFIG) --libs $(PKGS))
 
-SAN := -fsanitize=address,undefined
+.PHONY: all debug strict run install config clean
 
-all: swov
+all: $(BIN)
 
-swov: swov.c | check
-	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+$(BIN): $(SRC) $(HDR)
+	$(CC) $(CFLAGS) -DSWOV_BUILD='"$(BUILD)"' $(SDL_CFLAGS) $(SRC) -o $(BIN) $(SDL_LIBS) -lm
+	@./$(BIN) --version
 
-swov-debug: swov.c | check
-	$(CC) -std=c11 -g -O1 -Wall -Wextra $(SAN) $(PKG_CFLAGS) -o $@ $< $(PKG_LIBS) $(SAN)
+debug: $(SRC) $(HDR)
+	$(CC) -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined \
+	  -DSWOV_BUILD='"$(BUILD)-dbg"' $(SDL_CFLAGS) $(SRC) -o $(BIN)-debug $(SDL_LIBS) -lm
 
-debug: swov-debug
+strict: $(SRC) $(HDR)
+	$(CC) -std=c11 -O2 -Wall -Wextra -DSWOV_BUILD='"$(BUILD)"' \
+	  $(SDL_CFLAGS) $(SRC) -o $(BIN) $(SDL_LIBS) -lm
 
-# a missing SDL3 is the one failure worth explaining
-check:
-	@pkg-config --exists $(PKGS) || { \
-	  echo "swov: SDL3 development files not found."; \
-	  echo "  Debian trixie or newer:"; \
-	  echo "    sudo apt install build-essential pkg-config \\"; \
-	  echo "         libsdl3-dev libsdl3-image-dev libsdl3-ttf-dev"; \
-	  echo "  Older releases: build SDL, SDL_image and SDL_ttf 3.2+ from source"; \
-	  echo "  and point PKG_CONFIG_PATH at your install prefix."; \
-	  exit 1; }
+run: all
+	./$(BIN)
 
-install: swov
-	install -Dm755 swov $(DESTDIR)$(BINDIR)/swov
-	@echo "installed $(DESTDIR)$(BINDIR)/swov"
+install: all
+	install -Dm755 $(BIN) $(DESTDIR)$(bindir)/$(BIN)
+	@echo "installed to $(DESTDIR)$(bindir)/$(BIN)"
+	@./$(BIN) --version
 
-# never overwrites an existing config
 config:
-	@if [ -e "$(CONFDIR)/config" ]; then \
-	  echo "$(CONFDIR)/config exists, leaving it alone"; \
+	@mkdir -p $(HOME)/.config/swov
+	@if [ -e $(HOME)/.config/swov/config ]; then \
+	  echo "$(HOME)/.config/swov/config exists, leaving it alone"; \
 	else \
-	  install -Dm644 config.example "$(CONFDIR)/config" && \
-	  echo "wrote $(CONFDIR)/config"; \
+	  cp config.example $(HOME)/.config/swov/config; \
+	  echo "wrote $(HOME)/.config/swov/config"; \
 	fi
 
-uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/swov
-
 clean:
-	rm -f swov swov-debug
-
-.PHONY: all debug check install config uninstall clean
+	rm -f $(BIN) $(BIN)-debug
