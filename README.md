@@ -208,6 +208,19 @@ dots filling from the bottom, relative to the busiest workspace — and prints t
 next to the window count. A workspace that falls empty is forgotten and starts
 from zero.
 
+`--timing` prints how long each part of startup took, to stderr, if one ever
+feels slow:
+
+```
+swov: sway socket    0.1 ms   (  0.1 total)
+swov: SDL_Init       1.8 ms   (  1.9 total)
+swov: font lookup  114.0 ms   (123.6 total)   <- fc-match, once per font
+```
+
+The answer fc-match gives never changes between runs, so it is kept in
+`~/.cache/swov/fonts` and the second run onwards costs nothing. Deleting that
+file makes swov ask again.
+
 ```sh
 swov --usage     # where you are, and how long each workspace has had you
 swov --info      # every path and setting in use: binary, config, usage file,
@@ -218,7 +231,8 @@ swov --info      # every path and setting in use: binary, config, usage file,
 
 ## Load per workspace
 
-A second dot scale down the *right* edge of each tile says how busy that
+The numbers are re-read while the overview is open, so a build starting after
+you opened it shows up. A second dot scale down the *right* edge of each tile says how busy that
 workspace is, mirroring the usage dots on the left: the same shape in a
 different colour, one for the time you have spent there and one for the work
 happening there now. The scale is in cores — one core kept busy is `1.0`, and `cpu_full=4` fills

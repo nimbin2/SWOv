@@ -1133,6 +1133,20 @@ static bool  node_is_view(const JV *n);
 static char *escape_arg(const char *s);
 
 static bool  ADOPT_LOG;               /* --adopt-debug: say what is happening */
+static bool  TIMING;                  /* --timing: where startup goes        */
+static double T0, T_LAST;
+
+/* Milliseconds since the last mark, on stderr. Cheap enough to leave in and
+ * the only honest way to answer "why was that slow this time". */
+static void mark(const char *what)
+{
+    if (!TIMING) return;
+    double now = now_secs();
+    if (T_LAST == 0.0) T_LAST = T0;
+    fprintf(stderr, "swov: %-18s %6.1f ms   (%6.1f total)\n",
+            what, (now - T_LAST) * 1000.0, (now - T0) * 1000.0);
+    T_LAST = now;
+}
 
 
 
@@ -1421,6 +1435,8 @@ typedef struct { char name[64]; float cores; } CpuWs;
 static CpuWs  CPU[64];
 static int    NCPU;
 
+static time_t CPU_MTIME;
+
 static void cpu_load(void)
 {
     NCPU = 0;
@@ -1437,6 +1453,7 @@ static void cpu_load(void)
 
     struct stat st;
     if (stat(path, &st) != 0) return;
+    CPU_MTIME = st.st_mtime;
     if (time(NULL) - st.st_mtime > 30) return;     /* nobody is measuring */
 
     FILE *f = fopen(path, "r");
@@ -4391,6 +4408,32 @@ static bool running = true;
 static bool dirty   = true;      /* a frame is only drawn when this is set */
 static bool BACKDROP;            /* drawn behind another program's window   */
 
+/* swbr writes a new set of numbers every few seconds; the overview sits open
+ * for longer than that, so it watches the file rather than reading it once. */
+static void cpu_poll(void)
+{
+    if (!C.cpu) return;
+
+    static Uint64 next;
+    Uint64 now = SDL_GetTicks();
+    if (now < next) return;
+    next = now + 1000;
+
+    char path[512];
+    const char *rt = getenv("XDG_RUNTIME_DIR");
+    if (rt && *rt) snprintf(path, sizeof(path), "%s/swbr-cpu", rt);
+    else {
+        const char *home = getenv("HOME");
+        if (!home) return;
+        snprintf(path, sizeof(path), "%s/.cache/swbr-cpu", home);
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_mtime == CPU_MTIME) return;
+    cpu_load();
+    dirty = true;
+}
+
 static void reload_model(void)
 {
     /* remember what was selected so a reload does not lose the cursor */
@@ -4428,6 +4471,7 @@ static void reload_model(void)
     }
 
     cpu_load();                  /* whatever swbr last measured */
+    mark("cpu numbers");
     layout();
     apply_filter();
     rebuild_chrome();
@@ -4536,17 +4580,56 @@ static void fontconfig_resolve(const char *family)
         if (!n) snprintf(fam, sizeof(fam), "sans");
     }
 
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd),
-             "fc-match -f '%%{file}\n' '%s' 2>/dev/null; "
-             "fc-match -f '%%{file}\n' '%s:bold' 2>/dev/null", fam, fam);
+    /* The answer never changes between runs, and a shell plus two fc-match
+     * processes is the most expensive thing startup does — tens of
+     * milliseconds when the fontconfig cache is warm, far worse when it is
+     * not. Keep it next to the usage file and the whole thing becomes two
+     * reads. */
+    char cache[512] = "";
+    const char *xdg = getenv("XDG_CACHE_HOME"), *home = getenv("HOME");
+    if (xdg && *xdg)       snprintf(cache, sizeof(cache), "%s/swov/fonts", xdg);
+    else if (home && *home) snprintf(cache, sizeof(cache), "%s/.cache/swov/fonts", home);
 
-    FILE *p = popen(cmd, "r");
-    if (!p) return;
-    char l1[1024] = {0}, l2[1024] = {0};
-    if (fgets(l1, sizeof(l1), p)) str_trim(l1);
-    if (fgets(l2, sizeof(l2), p)) str_trim(l2);
-    pclose(p);
+    char l1[1024] = {0}, l2[1024] = {0}, want[160] = {0};
+    snprintf(want, sizeof(want), "%s", fam);
+
+    if (cache[0]) {                       /* family, then the two paths */
+        FILE *c = fopen(cache, "r");
+        if (c) {
+            char had[160] = {0};
+            if (fgets(had, sizeof(had), c)) str_trim(had);
+            if (fgets(l1, sizeof(l1), c))   str_trim(l1);
+            if (fgets(l2, sizeof(l2), c))   str_trim(l2);
+            fclose(c);
+            if (strcmp(had, want) || !file_readable(l1)) l1[0] = l2[0] = 0;
+        }
+    }
+
+    if (!l1[0]) {
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd),
+                 "fc-match -f '%%{file}\n' '%s' 2>/dev/null; "
+                 "fc-match -f '%%{file}\n' '%s:bold' 2>/dev/null", fam, fam);
+
+        FILE *p = popen(cmd, "r");
+        if (!p) return;
+        if (fgets(l1, sizeof(l1), p)) str_trim(l1);
+        if (fgets(l2, sizeof(l2), p)) str_trim(l2);
+        pclose(p);
+
+        if (cache[0] && l1[0]) {
+            char *slash = strrchr(cache, '/');       /* mkdir -p, one level */
+            if (slash) {
+                *slash = 0;
+                char *up = strrchr(cache, '/');
+                if (up) { *up = 0; mkdir(cache, 0755); *up = '/'; }
+                mkdir(cache, 0755);
+                *slash = '/';
+            }
+            FILE *c = fopen(cache, "w");
+            if (c) { fprintf(c, "%s\n%s\n%s\n", want, l1, l2); fclose(c); }
+        }
+    }
 
     if (l1[0] && file_readable(l1)) FC_REGULAR = xstrdup(l1);
     if (l2[0] && file_readable(l2)) FC_BOLD    = xstrdup(l2);
@@ -4585,6 +4668,7 @@ static void load_fonts(void)
     bool have_paths = C.font[0] && strchr(C.font, '/') &&
                       (!C.font_bold[0] || strchr(C.font_bold, '/'));
     if (!have_paths) fontconfig_resolve(C.font);
+    mark("font lookup");
 
     char *regular = pick_font(C.font, false);
     if (!regular) die("no usable font found (install fontconfig and a TTF font)");
@@ -4605,6 +4689,7 @@ static void load_fonts(void)
     FC_REGULAR = FC_BOLD = NULL;
 
     if (!F_BADGE || !F_LABEL || !F_TITLE || !F_HINT) die("could not open fonts: %s", SDL_GetError());
+    mark("font open");
 }
 
 /* ------------------------------------------------------------------ main */
@@ -4653,6 +4738,7 @@ static void usage(void)
 "                      and exit. Runs in the background; --adopt-wait keeps it\n"
 "                      in the foreground, --adopt-focus also switches there,\n"
 "                      --adopt-timeout SECS gives up after that (default 20)\n"
+"      --timing        print how long each part of startup took, to stderr\n"
 "      --backdrop-debug  the same, narrating the conversation to stderr\n"
 "      --backdrop      draw the overview behind another window, taking no\n"
 "                      input of its own: it fades in, and reads commands on\n"
@@ -5600,6 +5686,7 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(a, "--adopt-focus")) adopt_focus = true;
         else if (!strcmp(a, "--adopt-debug")) ADOPT_LOG = true;
+        else if (!strcmp(a, "--timing")) TIMING = true;
         else if (!strcmp(a, "--no-assign")) adopt_no_assign = true;
         else if (!strcmp(a, "--beside") && i + 1 < argc) adopt_beside = atoi(argv[++i]);
         else if (!strcmp(a, "--edge") && i + 1 < argc)   adopt_edge = argv[++i];
@@ -5762,8 +5849,10 @@ int main(int argc, char **argv)
         }
     }
 
+    if (TIMING) T0 = now_secs();
     sway_fd = sway_connect();
     if (sway_fd < 0) die("cannot reach sway (is SWAYSOCK set?)");
+    mark("sway socket");
 
     if (list_ws) {
         int rc = print_workspaces();
@@ -5839,6 +5928,7 @@ int main(int argc, char **argv)
     SDL_SetAppMetadata(APP_ID, SWOV_VERSION, "org.swov.overview");
 
     if (!SDL_Init(SDL_INIT_VIDEO)) die("SDL_Init: %s", SDL_GetError());
+    mark("SDL_Init");
     if (!TTF_Init()) die("TTF_Init: %s", SDL_GetError());
 
     SDL_Rect bounds;
@@ -5853,10 +5943,12 @@ int main(int argc, char **argv)
 
     REN = SDL_CreateRenderer(WIN_HANDLE, NULL);
     if (!REN) die("SDL_CreateRenderer: %s", SDL_GetError());
+    mark("window+renderer");
     SDL_SetRenderDrawBlendMode(REN, SDL_BLENDMODE_BLEND);
     SDL_SetRenderVSync(REN, C.vsync ? 1 : 0);
 
     if (!create_target()) die("cannot size the window");
+    mark("render target");
     load_fonts();
 
     CUR_ARROW = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
@@ -5865,6 +5957,7 @@ int main(int argc, char **argv)
     usage_sync();
     sway_subscribe_events();
     if (!model_reload()) die("could not read the sway tree");
+    mark("sway tree");
     cpu_load();                  /* whatever swbr last measured */
     select_current_workspace();
 
@@ -5898,6 +5991,7 @@ int main(int argc, char **argv)
     while (running) {
         SDL_Event e;
         if (anim_running()) dirty = true;
+        cpu_poll();
 
         if (BACKDROP) {
             backdrop_poll();
