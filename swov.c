@@ -1251,6 +1251,8 @@ static int sweep_descendants(int root, int *out, int cap)
     return n;
 }
 
+static void move_to_ws_edge_named(int con_id, const char *ws, const char *edge);
+
 /* every view in the tree, so a window that turns up later can be spotted */
 static void collect_view_ids(const JV *node, int *ids, int *n, int cap)
 {
@@ -1368,6 +1370,14 @@ static int adopt_window(int pid, const char *ws, double timeout, bool focus,
         free(e);
     }
     sway_cmd("[con_id=%d] floating disable", con_id);
+
+    /* Dropped against the edge of a workspace whose windows are stacked: one
+     * move across the stack lifts the new window out of it and puts it beside
+     * the whole column, which is what "left of both" means. */
+    if (ok && beside <= 0 && edge) {
+        move_to_ws_edge_named(con_id, ws, edge);
+        if (ADOPT_LOG) fprintf(stderr, "swov: moved to the %s of everything there\n", edge);
+    }
 
     /* and then next to the window it was dropped on, splitting the way the
      * pointer said — the same three commands a drag inside swov uses */
@@ -3293,7 +3303,8 @@ typedef enum {
     DROP_WIN_NEAR,   /* window next to another window, splitting h or v    */
     DROP_WS_SWAP,    /* workspace onto another workspace                   */
     DROP_WS_NUM,     /* workspace onto a free number (a ghost slot)        */
-    DROP_WIN_NEWWS   /* window onto a free number: sway creates it          */
+    DROP_WIN_NEWWS,  /* window onto a free number: sway creates it          */
+    DROP_WS_EDGE     /* window along one edge of a tile: beside the lot      */
 } DropKind;
 
 enum { EDGE_LEFT, EDGE_RIGHT, EDGE_TOP, EDGE_BOTTOM };
@@ -3412,6 +3423,24 @@ static void drag_update_target(float x, float y)
     int win_idx = hit_test(x, y, &ws_idx);
     if (ws_idx < 0) return;
 
+    /* a band along the inside of the tile: beside everything on it */
+    {
+        SDL_FRect t = WSS[ws_idx].screen;
+        float bx = SDL_clamp(t.w * 0.09f, 6.0f * SC, t.w * 0.18f);
+        float by = SDL_clamp(t.h * 0.09f, 6.0f * SC, t.h * 0.18f);
+        int e = -1;
+        if      (x - t.x < bx)         e = EDGE_LEFT;
+        else if (t.x + t.w - x < bx)   e = EDGE_RIGHT;
+        else if (y - t.y < by)         e = EDGE_TOP;
+        else if (t.y + t.h - y < by)   e = EDGE_BOTTOM;
+        if (e >= 0 && WSS[ws_idx].count > 0) {
+            drop_kind = DROP_WS_EDGE;
+            drop_ws   = ws_idx;
+            drop_edge = e;
+            return;
+        }
+    }
+
     if (win_idx >= 0 && win_idx != press_win) {
         drop_kind = DROP_WIN_NEAR;
         drop_win  = win_idx;
@@ -3423,6 +3452,56 @@ static void drag_update_target(float x, float y)
         drop_kind = DROP_WIN_WS;
         drop_ws   = ws_idx;
     }
+}
+
+/* Dropping against the edge of a tile means "next to everything here", not
+ * "next to whichever window happens to be under the pointer". Two windows
+ * stacked one above the other are a column, and left of the column is not the
+ * same as left of its top window — which is all sway can be told about a
+ * single view.
+ *
+ * Whether the column has to be broken out of depends on how the workspace is
+ * split. If the windows sit side by side, putting the new one beside the
+ * outermost of them is already right. If they are stacked, the new window has
+ * to be moved out of that stack, which is what a perpendicular `move` does.
+ *
+ * Returns the window to work from, and sets *pop when the stack has to be
+ * escaped. -1 when the workspace is empty and a plain move will do. */
+static int ws_edge_ref(const Ws *ws, int edge, bool *pop)
+{
+    *pop = false;
+    if (ws->count <= 0) return -1;
+
+    bool horiz = (edge == EDGE_LEFT || edge == EDGE_RIGHT);
+    int  best = -1;
+    float best_v = 0.0f;
+    int   aligned = 0;
+
+    for (int i = 0; i < ws->count; ++i) {
+        const Win *w = &WINS[ws->first + i];
+        if (!win_visible(w)) continue;
+        float v = horiz ? w->card.x : w->card.y;
+        if (edge == EDGE_RIGHT)  v = w->card.x + w->card.w;
+        if (edge == EDGE_BOTTOM) v = w->card.y + w->card.h;
+
+        bool better = best < 0 ||
+                      ((edge == EDGE_LEFT || edge == EDGE_TOP) ? v < best_v : v > best_v);
+        if (better) { best = ws->first + i; best_v = v; }
+    }
+    if (best < 0) return -1;
+
+    /* how many share the outermost one's line: more than one means they are
+     * stacked across the direction we are dropping from */
+    float ref = horiz ? WINS[best].card.x : WINS[best].card.y;
+    float tol = horiz ? WINS[best].card.w * 0.25f : WINS[best].card.h * 0.25f;
+    for (int i = 0; i < ws->count; ++i) {
+        const Win *w = &WINS[ws->first + i];
+        if (!win_visible(w)) continue;
+        float v = horiz ? w->card.x : w->card.y;
+        if (SDL_fabsf(v - ref) <= tol) aligned++;
+    }
+    *pop = aligned > 1;
+    return best;
 }
 
 /* "7:chat" keeps its label when it becomes workspace 8 */
@@ -3506,6 +3585,121 @@ static void act_win_drop_near(Win *drag, Win *target, int edge)
     sway_cmd("unmark _swov_drop");
 }
 
+static const JV *jfind_workspace(const JV *node, const char *name)
+{
+    if (!node || node->type != J_OBJ) return NULL;
+    if (!strcmp(jstr(node, "type", ""), "workspace") &&
+        !strcmp(jstr(node, "name", ""), name)) return node;
+
+    for (int i = 0; i < node->count; ++i) {
+        const JV *kid = node->items[i];
+        if (!kid) continue;
+        if (kid->type == J_ARR) {
+            for (int j = 0; j < kid->count; ++j) {
+                const JV *r = jfind_workspace(kid->items[j], name);
+                if (r) return r;
+            }
+        } else if (kid->type == J_OBJ) {
+            const JV *r = jfind_workspace(kid, name);
+            if (r) return r;
+        }
+    }
+    return NULL;
+}
+
+static bool subtree_has_id(const JV *node, int id)
+{
+    if (!node || node->type != J_OBJ) return false;
+    if (jint(node, "id", -1) == id) return true;
+    for (int i = 0; i < node->count; ++i) {
+        const JV *kid = node->items[i];
+        if (!kid) continue;
+        if (kid->type == J_ARR) {
+            for (int j = 0; j < kid->count; ++j)
+                if (subtree_has_id(kid->items[j], id)) return true;
+        } else if (kid->type == J_OBJ) {
+            if (subtree_has_id(kid, id)) return true;
+        }
+    }
+    return false;
+}
+
+/* Is `con_id` the first (or last) direct child of that workspace?
+ *  1 = yes, 0 = on the workspace but not at that end, -1 = not there at all */
+static int ws_edge_state(const char *ws_name, int con_id, bool want_first)
+{
+    JV *tree = sway_query(IPC_GET_TREE);
+    if (!tree) return -1;
+
+    const JV *ws = jfind_workspace(tree, ws_name);
+    int state = -1;
+    if (ws) {
+        const JV *kids = jget(ws, "nodes");
+        if (kids && kids->type == J_ARR && kids->count > 0) {
+            const JV *end = kids->items[want_first ? 0 : kids->count - 1];
+            if (end && jint(end, "id", -1) == con_id) state = 1;
+            else state = subtree_has_id(ws, con_id) ? 0 : -1;
+        } else {
+            state = subtree_has_id(ws, con_id) ? 0 : -1;
+        }
+    }
+    jfree(tree);
+    return state;
+}
+
+/* Move it to one end of the workspace and check, rather than guessing how
+ * many moves it takes. One `move left` out of a stack lifts the window clear
+ * of the whole column; one inside a row only swaps it with a neighbour. Both
+ * end at the same place if you keep going until sway says it is the first
+ * child, and stopping on that condition means never one move too many —
+ * which would push it onto the next monitor. */
+static void move_to_ws_edge(int con_id, const char *ws_name, int edge)
+{
+    static const char *DIR[] = { "left", "right", "up", "down" };
+    bool first = (edge == EDGE_LEFT || edge == EDGE_TOP);
+
+    for (int i = 0; i < 10; ++i) {
+        int st = ws_edge_state(ws_name, con_id, first);
+        if (st == 1) return;                       /* where it was asked for */
+        if (st < 0)  return;                       /* not there: leave it be */
+        sway_cmd("[con_id=%d] move %s", con_id, DIR[edge]);
+    }
+}
+
+static void move_to_ws_edge_named(int con_id, const char *ws, const char *edge)
+{
+    int e = !strcmp(edge, "left") ? EDGE_LEFT : !strcmp(edge, "right") ? EDGE_RIGHT
+          : !strcmp(edge, "top")  ? EDGE_TOP  : EDGE_BOTTOM;
+    move_to_ws_edge(con_id, ws, e);
+}
+
+/* Beside everything on a workspace. Side by side already means the outermost
+ * window is the whole edge, so that is the ordinary case. Stacked means the
+ * new window has to leave the stack: a move across the stack's direction
+ * lifts it out and puts it beside the whole thing, which is the one shape
+ * sway can be asked for directly. */
+static void act_win_drop_edge(Win *drag, const Ws *ws, int edge)
+{
+    bool pop = false;
+    int  ref = ws_edge_ref(ws, edge, &pop);
+
+    if (ref >= 0 && !pop) { act_win_drop_near(drag, &WINS[ref], edge); return; }
+
+    if (drag->ws != (int)(ws - WSS)) {
+        if (ws->num >= 0)
+            sway_cmd("[con_id=%d] move container to workspace number %d",
+                     drag->con_id, ws->num);
+        else {
+            char *e = escape_arg(ws->name);
+            sway_cmd("[con_id=%d] move container to workspace \"%s\"", drag->con_id, e);
+            free(e);
+        }
+    }
+    if (ref < 0) return;                       /* nothing there to be beside */
+
+    move_to_ws_edge(drag->con_id, ws->name, edge);
+}
+
 static void drag_finish(void)
 {
     switch (drop_kind) {
@@ -3527,6 +3721,11 @@ static void drag_finish(void)
     case DROP_WIN_NEAR:
         if (press_win >= 0 && drop_win >= 0)
             act_win_drop_near(&WINS[press_win], &WINS[drop_win], drop_edge);
+        break;
+
+    case DROP_WS_EDGE:
+        if (press_win >= 0 && drop_ws >= 0)
+            act_win_drop_edge(&WINS[press_win], &WSS[drop_ws], drop_edge);
         break;
 
     case DROP_WS_SWAP:
@@ -3856,30 +4055,6 @@ static void draw_workspace(int idx)
 
     tex_draw(ws->badge, tile.x + tile.w - p - (float)ws->badge.w, top, num_col);
 
-    /* How busy that workspace is, as a moon filling from the bottom: barely
-     * there when it is idle, whole when something is working. Held back
-     * towards the tile colour, because it is not what the tile is about. */
-    float load = cpu_frac(ws->name);
-    if (load >= 0.0f) {
-        SDL_FColor hot = load < 0.5f ? mix(C.current, C.hl, load * 2.0f)
-                                     : mix(C.hl, C.urgent, (load - 0.5f) * 2.0f);
-        SDL_FColor lc = with_alpha(mix(C.dim, hot, 0.45f + 0.4f * load),
-                                   0.55f + 0.35f * load);
-        float d  = SDL_max(4.0f * SC, (float)ws->badge.h * 0.26f);
-        float dx = tile.x + tile.w - p - (float)ws->badge.w - d - 5.0f * SC;
-        float dy = top + (float)ws->badge.h * 0.5f - d * 0.5f;
-
-        fill_round_rect((SDL_FRect){ dx, dy, d, d }, d * 0.5f,
-                        with_alpha(lc, lc.a * 0.4f));      /* the whole disc */
-
-        float lit = d * (0.15f + 0.85f * load);            /* and how full   */
-        SDL_Rect clip = { (int)dx, (int)(dy + d - lit), (int)(d + 1.0f), (int)(lit + 1.0f) };
-        SDL_Rect prev;
-        bool had = SDL_GetRenderClipRect(REN, &prev) && SDL_RenderClipEnabled(REN);
-        SDL_SetRenderClipRect(REN, &clip);
-        fill_round_rect((SDL_FRect){ dx, dy, d, d }, d * 0.5f, lc);
-        SDL_SetRenderClipRect(REN, had ? &prev : NULL);
-    }
 
     float count_right = tile.x + p;
     if (ws->sub.t) {
@@ -3940,6 +4115,23 @@ static void draw_workspace(int idx)
             SDL_FRect dot = { cx - d * 0.5f, y0 + (float)i * (d + gap), d, d };
             fill_round_rect(dot, d * 0.5f,
                             on ? C.current : with_alpha(C.dim, 0.38f));
+        }
+
+        /* the same scale down the other edge, for what the workspace is doing
+         * now rather than how long you have spent there — swbr measures it,
+         * and draws the identical dots on its own workspace buttons */
+        float cpu = cpu_frac(ws->name);
+        if (cpu >= 0.0f) {
+            float cxr = tile.x + tile.w - C.pad * SC - d * 0.55f;
+            int   cl  = SDL_clamp((int)SDL_ceilf(cpu * (float)n), 1, n);
+            SDL_FColor hot = cpu < 0.85f ? C.accent
+                                         : mix(C.accent, C.urgent, (cpu - 0.85f) / 0.15f);
+            for (int i = 0; i < n; ++i) {
+                bool on = (n - i) <= cl;
+                SDL_FRect dot = { cxr - d * 0.5f, y0 + (float)i * (d + gap), d, d };
+                fill_round_rect(dot, d * 0.5f,
+                                on ? hot : with_alpha(C.dim, 0.30f));
+            }
         }
     }
 
@@ -4021,6 +4213,21 @@ static void draw_drop_indicator(void)
             else if (drop_edge == EDGE_RIGHT)  bar = (SDL_FRect){ r.x + r.w - b * 0.5f, r.y, b, r.h };
             else if (drop_edge == EDGE_TOP)    bar = (SDL_FRect){ r.x, r.y - b * 0.5f, r.w, b };
             else                               bar = (SDL_FRect){ r.x, r.y + r.h - b * 0.5f, r.w, b };
+            fill_round_rect(bar, b * 0.5f, C.hl);
+        }
+        break;
+
+    case DROP_WS_EDGE:
+        if (drop_ws >= 0) {
+            SDL_FRect r = WSS[drop_ws].screen;
+            stroke_round_rect(r, C.radius * SC * 0.7f, SDL_max(1.0f, thick * 0.6f),
+                              with_alpha(C.accent, 0.8f));
+            float b = thick * 1.8f;
+            SDL_FRect bar;
+            if (drop_edge == EDGE_LEFT)        bar = (SDL_FRect){ r.x, r.y, b, r.h };
+            else if (drop_edge == EDGE_RIGHT)  bar = (SDL_FRect){ r.x + r.w - b, r.y, b, r.h };
+            else if (drop_edge == EDGE_TOP)    bar = (SDL_FRect){ r.x, r.y, r.w, b };
+            else                               bar = (SDL_FRect){ r.x, r.y + r.h - b, r.w, b };
             fill_round_rect(bar, b * 0.5f, C.hl);
         }
         break;
@@ -5031,12 +5238,34 @@ static void backdrop_hover(float fx, float fy)
     WSS[ws_idx].sel = -1;
     dirty = true;
 
-    /* Over a window, the pointer picks a side of it, exactly as dragging a
-     * window inside swov does: the bar shows where it will land, and the app
-     * is placed there once it opens. */
-    char place[64] = "";
-    if (win_idx >= 0) {
-        static const char *EDGE_NAME[] = { "left", "right", "top", "bottom" };
+    /* Where inside the tile decides what happens, exactly as dragging a
+     * window inside swov does. Against an edge: beside everything on the
+     * workspace. Over a window: beside that one. The bar shows which. */
+    static const char *EDGE_NAME[] = { "left", "right", "top", "bottom" };
+    char place[80] = "";
+
+    SDL_FRect t = WSS[ws_idx].screen;
+    float bx = SDL_clamp(t.w * 0.09f, 6.0f * SC, t.w * 0.18f);
+    float by = SDL_clamp(t.h * 0.09f, 6.0f * SC, t.h * 0.18f);
+    int edge = -1;
+    if      (x - t.x < bx)       edge = EDGE_LEFT;
+    else if (t.x + t.w - x < bx) edge = EDGE_RIGHT;
+    else if (y - t.y < by)       edge = EDGE_TOP;
+    else if (t.y + t.h - y < by) edge = EDGE_BOTTOM;
+
+    if (edge >= 0 && WSS[ws_idx].count > 0) {
+        bool pop = false;
+        int  ref = ws_edge_ref(&WSS[ws_idx], edge, &pop);
+        drag_active = true;
+        drop_kind   = DROP_WS_EDGE;
+        drop_ws     = ws_idx;
+        drop_edge   = edge;
+        if (ref >= 0 && !pop)
+            snprintf(place, sizeof(place), " beside %d %s",
+                     WINS[ref].con_id, EDGE_NAME[edge]);
+        else if (ref >= 0)
+            snprintf(place, sizeof(place), " outer %s", EDGE_NAME[edge]);
+    } else if (win_idx >= 0) {
         int e = edge_at(WINS[win_idx].card, x, y);
         drag_active = true;
         drop_kind   = DROP_WIN_NEAR;

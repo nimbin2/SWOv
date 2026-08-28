@@ -73,6 +73,14 @@ click-through, so the windows underneath stay selectable.
 window it lands beside it, splitting horizontally; top or bottom splits
 vertically. A bar shows the edge before you let go.
 
+Against the **edge of the tile itself** it lands beside *everything* on that
+workspace, not beside whichever window is nearest. Two windows stacked one
+above the other are a column, and left of the column is a different place from
+left of its top window — the bar spans the whole edge to say which one you are
+getting. Where the windows already sit side by side the two are the same
+thing, so swov works that out from the layout and only breaks out of a stack
+when there is one.
+
 **A workspace** (grab the header strip) onto another swaps the two. Onto the
 left or right quarter of another it inserts there, pushing the occupied run up
 by one.
@@ -207,10 +215,11 @@ swov --info      # every path and setting in use: binary, config, usage file,
 
 ## Load per workspace
 
-A small moon next to each workspace number says how busy that workspace is: a
-sliver when it is idling, whole when something is working, running from teal
-through orange into red and held back towards `dim`, since it is secondary to
-everything else on the tile. swbr measures it — a rate needs two samples
+A second dot scale down the *right* edge of each tile says how busy that
+workspace is, mirroring the usage dots on the left: the same shape in a
+different colour, one for the time you have spent there and one for the work
+happening there now. It stays teal until a workspace is really pinned, and
+only then tips towards red. swbr measures it — a rate needs two samples
 seconds apart and swov is only on screen for a moment — and leaves the answer
 in `$XDG_RUNTIME_DIR/swbr-cpu`. Without swbr running the file is stale or
 missing and nothing is drawn. `cpu=0` turns it off.
