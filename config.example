@@ -27,11 +27,17 @@ usage_dots=1       # dot scale down the left edge of a tile: how much that
 dot_count=14       # how many dots the scale has; fewer are drawn if the tile
                    # is too short for them
 dot_px=5           # dot diameter
-cpu=1              # a dot next to a workspace number showing how busy it is.
-cpu_min=4          # swbr measures this and leaves it in
-cpu_full=60        # $XDG_RUNTIME_DIR/swbr-cpu; without swbr running there is
-                   # nothing to show and nothing is drawn
+cpu=1              # a dot scale down the right edge of a tile, mirroring the
+cpu_idle=0.01      # usage dots on the left. In cores: 1.0 is one core kept
+cpu_min=0.25       # busy, and four fills the scale. Anything alive but under
+cpu_full=4         # cpu_min gets one faint dot. swbr measures it and
+                   # leaves it in $XDG_RUNTIME_DIR/swbr-cpu; without swbr
+                   # running there is nothing to show and nothing is drawn
 
+drop_ghosts=0      # --backdrop only: 1 = while an app is being dragged over
+                   # the overview, offer the free workspace numbers as extra
+                   # tiles. They cost the real tiles two thirds of their size
+                   # just as you start aiming, so this is off
 blur=2             # --backdrop only: how soft the overview is drawn while
                    # something else has the foreground. 0 = off, 3 = softest.
                    # It sharpens by itself while an app is being dragged over

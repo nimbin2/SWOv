@@ -85,7 +85,10 @@ when there is one.
 left or right quarter of another it inserts there, pushing the occupied run up
 by one.
 
-**Ghost slots** are the free numbers 0–10. They appear when a workspace drag
+**Ghost slots** are the free numbers 0–10. Dragging a window inside swov
+brings them out; a drag from swas does not, unless `drop_ghosts=1` — they add
+a dozen tiles to the grid, and the workspaces you are aiming at shrink to a
+third just as you start aiming. They appear when a workspace drag
 starts, or when a dragged window leaves its own workspace, and the tiles glide
 aside to make room. Drop on one to give a workspace that number, or to create a
 workspace from a single window.
@@ -190,7 +193,7 @@ there before, and takes that. `--beside` places the new window next to an
 existing one with the same three sway commands a drag inside swov uses, and
 `--adopt-debug` narrates the whole thing to stderr.
 
-appwheel uses all three: `overview=1` puts swov behind the wheel, dragging an
+swas uses all three: `overview=1` puts swov behind the wheel, dragging an
 app asks it where the pointer is — including which side of which window — and
 dropping starts the app exactly there.
 
@@ -218,8 +221,11 @@ swov --info      # every path and setting in use: binary, config, usage file,
 A second dot scale down the *right* edge of each tile says how busy that
 workspace is, mirroring the usage dots on the left: the same shape in a
 different colour, one for the time you have spent there and one for the work
-happening there now. It stays teal until a workspace is really pinned, and
-only then tips towards red. swbr measures it — a rate needs two samples
+happening there now. The scale is in cores — one core kept busy is `1.0`, and `cpu_full=4` fills
+it. Anything alive but below the scale gets one faint dot, so a workspace that
+is doing something never looks asleep, while a terminal at a prompt stays
+blank. It stays teal until a workspace is really pinned, and only then tips
+towards red. swbr measures it — a rate needs two samples
 seconds apart and swov is only on screen for a moment — and leaves the answer
 in `$XDG_RUNTIME_DIR/swbr-cpu`. Without swbr running the file is stale or
 missing and nothing is drawn. `cpu=0` turns it off.
@@ -235,7 +241,7 @@ swov --ssaa=1 --header_pos=top-left
 swov --shot /tmp/o.png     # one frame to a PNG, for tuning colours
 ```
 
-Colours and fonts can also be set once for swov, appwheel and swbr together in
+Colours and fonts can also be set once for swov, swas and swbr together in
 `${XDG_CONFIG_HOME:-~/.config}/sw/config`, using role names (`surface`,
 `accent`, `hl`, ...) that each program maps onto its own keys. `sw_theme.h`
 lists them. The file above is read after it, so swov's own config always wins.
@@ -252,6 +258,7 @@ lists them. The file above is read after it, so swov's own config always wins.
 | `header_pos`, `hints_pos` | `none`, or `top`/`bottom` + `left`/`center`/`right` |
 | `anim_ms` | tile glide duration, and the backdrop fade; `0` disables |
 | `blur` | how soft `--backdrop` is drawn, `0`–`3` |
+| `drop_ghosts` | offer the free numbers while an app is dragged over the backdrop |
 | `cpu`, `cpu_min`, `cpu_full` | the load dot, and the range it covers |
 | `track`, `usage_dots`, `dot_count`, `dot_px` | usage recording and its dot scale |
 | `start_selection` | `workspace`, `none` or `window` |

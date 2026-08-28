@@ -1,10 +1,10 @@
-/* sw_theme.h — one look for swov, appwheel and swbr.
+/* sw_theme.h — one look for swov, swas and swbr.
  *
  *     ${XDG_CONFIG_HOME:-~/.config}/sw/config
  *
  * key=value, '#' comments, same as every other config here. Keys written
  * before any [section] go to all three programs; keys inside [swov],
- * [appwheel] or [swbr] go to that one only.
+ * [swas] or [swbr] go to that one only.
  *
  * Outside a section only *role* names are understood (surface, accent, hl,
  * ...). Each program translates them to its own keys, and roles it has no use
@@ -34,11 +34,11 @@
  * separated by commas: swbr paints its focused workspace button with `hl`.
  */
 typedef struct {
-    const char *role, *swov, *appwheel, *swbr;
+    const char *role, *swov, *swas, *swbr;
 } SwRole;
 
 static const SwRole SW_ROLES[] = {
-    /* role          swov            appwheel   swbr                           */
+    /* role          swov            swas       swbr                           */
     { "bg",          "bg",           "bg",      NULL                           },
     { "surface",     "tile",         "ring",    "bg"                           },
     { "surface_alt", "tile_sel",     "ring2",   NULL                           },
@@ -97,7 +97,7 @@ static int sw_ci_eq(const char *a, const char *b)
 static const char *sw_role_for(const SwRole *r, const char *app)
 {
     if (sw_ci_eq(app, "swov"))     return r->swov;
-    if (sw_ci_eq(app, "appwheel")) return r->appwheel;
+    if (sw_ci_eq(app, "swas") || sw_ci_eq(app, "appwheel")) return r->swas;
     if (sw_ci_eq(app, "swbr"))     return r->swbr;
     return NULL;
 }

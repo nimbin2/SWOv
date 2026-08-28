@@ -228,8 +228,10 @@ typedef struct {
     int   track;             /* record how long each workspace is used     */
     int   back_scope;        /* -b: 0 global, 1 this monitor, 2 sway's own */
     int   blur;              /* --backdrop only: 0 off, 1..3 how soft       */
-    int   cpu;               /* the load dot on a tile, measured by swbr    */
-    float cpu_min, cpu_full; /* under min nothing shows; full = fully hot   */
+    int   drop_ghosts;       /* --backdrop: offer the free numbers as tiles */
+    int   cpu;               /* the load dots on a tile, measured by swbr   */
+    float cpu_idle;          /* under this, nothing is happening at all     */
+    float cpu_min, cpu_full; /* the scale, in cores                         */
     int   dot_count;         /* how many dots the scale has                */
     float dot_px;            /* dot diameter                               */
     float anim_ms;           /* tile glide duration, 0 disables            */
@@ -280,8 +282,10 @@ static Cfg cfg_defaults(void)
     c.back_scope = 0;        /* global: go back to where I just was */
     c.blur       = 2;
     c.cpu        = 1;
-    c.cpu_min    = 4.0f;
-    c.cpu_full   = 60.0f;
+    c.drop_ghosts = 0;
+    c.cpu_idle   = 0.01f;    /* cores; under this nothing is happening */
+    c.cpu_min    = 0.25f;    /* cores, not a share of the machine */
+    c.cpu_full   = 4.0f;
     c.dot_count  = 14;
     c.dot_px     = 5.0f;
     c.anim_ms = 160.0f;
@@ -300,7 +304,7 @@ static Cfg cfg_defaults(void)
     c.quit_on_focus_loss = 1;
     c.quit_after_action  = 0;
 
-    /* palette: same family as the appwheel config */
+    /* palette: same family as the swas config */
     c.bg         = rgba(0x0d1117cc);  /* dims whatever is behind the overlay*/
     c.tile       = rgba(0x1e2733f2);  /* workspace tile                     */
     c.tile_sel   = rgba(0x26313ff2);  /* selected workspace tile            */
@@ -367,6 +371,8 @@ static void cfg_set(Cfg *c, const char *k, const char *v)
     else if (key_is(k,"dot_px"))        c->dot_px = (float)atof(v);
     else if (key_is(k,"track"))         c->track = atoi(v) != 0;
     else if (key_is(k,"cpu"))       c->cpu = atoi(v) != 0;
+    else if (key_is(k,"drop_ghosts")) c->drop_ghosts = atoi(v) != 0;
+    else if (key_is(k,"cpu_idle"))  c->cpu_idle = (float)atof(v);
     else if (key_is(k,"cpu_min"))   c->cpu_min = (float)atof(v);
     else if (key_is(k,"cpu_full"))  c->cpu_full = (float)atof(v);
     else if (key_is(k,"blur")) {
@@ -1411,7 +1417,7 @@ static Cfg           C;
  * swbr measures it — a rate needs two samples seconds apart, and swov is only
  * on screen for a moment — and leaves the answer here. If swbr is not running
  * the file is stale or missing and nothing is drawn. */
-typedef struct { char name[64]; float pct; } CpuWs;
+typedef struct { char name[64]; float cores; } CpuWs;
 static CpuWs  CPU[64];
 static int    NCPU;
 
@@ -1441,20 +1447,22 @@ static void cpu_load(void)
         if (!tab) continue;
         *tab = 0;
         str_set(CPU[NCPU].name, sizeof(CPU[0].name), line);
-        CPU[NCPU].pct = (float)atof(tab + 1);
+        CPU[NCPU].cores = (float)atof(tab + 1);
         NCPU++;
     }
     fclose(f);
 }
 
-/* how busy, 0..1, or -1 when there is nothing worth drawing */
+/* how busy, 0..1, or -1 when there is nothing worth drawing.
+ * The number swbr leaves behind is in cores: 1.0 is one core kept busy. */
 static float cpu_frac(const char *ws_name)
 {
     for (int i = 0; i < NCPU; ++i) {
         if (strcmp(CPU[i].name, ws_name)) continue;
-        if (CPU[i].pct < C.cpu_min) return -1.0f;
+        if (CPU[i].cores < C.cpu_idle) return -1.0f;   /* genuinely nothing */
+        if (CPU[i].cores < C.cpu_min)  return 0.0f;    /* a hint, one dot   */
         float span = C.cpu_full - C.cpu_min;
-        float f = span > 0.0f ? (CPU[i].pct - C.cpu_min) / span : 1.0f;
+        float f = span > 0.0f ? (CPU[i].cores - C.cpu_min) / span : 1.0f;
         return SDL_clamp(f, 0.0f, 1.0f);
     }
     return -1.0f;
@@ -4126,6 +4134,8 @@ static void draw_workspace(int idx)
             int   cl  = SDL_clamp((int)SDL_ceilf(cpu * (float)n), 1, n);
             SDL_FColor hot = cpu < 0.85f ? C.accent
                                          : mix(C.accent, C.urgent, (cpu - 0.85f) / 0.15f);
+            /* below the scale but not asleep: one dot, faint */
+            if (cpu <= 0.0f) hot = with_alpha(mix(C.dim, C.accent, 0.4f), 0.55f);
             for (int i = 0; i < n; ++i) {
                 bool on = (n - i) <= cl;
                 SDL_FRect dot = { cxr - d * 0.5f, y0 + (float)i * (d + gap), d, d };
@@ -4647,7 +4657,7 @@ static void usage(void)
 "      --backdrop      draw the overview behind another window, taking no\n"
 "                      input of its own: it fades in, and reads commands on\n"
 "                      stdin (hover FX FY, drag on|off, fade in|out, quit).\n"
-"                      This is what appwheel puts behind its wheel\n"
+"                      This is what swas puts behind its wheel\n"
 "      --usage         print how long each workspace has been used, and exit\n"
 "      --info          print every path and setting swov is using, and exit\n"
 "  -c, --config PATH   read this config file instead of the default\n"
@@ -5301,7 +5311,14 @@ static bool backdrop_command(char *line)
             assign_pid_to_ws(pid, ws);
         return true;
     }
-    if (!strcmp(line, "drag on"))  { set_ghosts(0, 10); BLUR_WANT = 0.0f; return true; }
+    if (!strcmp(line, "drag on")) {
+        /* Offering every free number adds a dozen tiles to the grid, and the
+         * workspaces you are actually aiming at shrink to a third of their
+         * size just as you start aiming. Off unless asked for. */
+        if (C.drop_ghosts) set_ghosts(0, 10);
+        BLUR_WANT = 0.0f;
+        return true;
+    }
     if (!strcmp(line, "drag off")) {
         set_ghosts(-1, -1);
         BLUR_WANT = 1.0f;
