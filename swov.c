@@ -240,6 +240,10 @@ typedef struct {
     char  hints_pos[16];
     int   show_empty;
     int   all_outputs;
+    int   outputs_map;       /* the little map of the monitors, bottom left  */
+    float outputs_map_w;     /* how wide, as a share of the tile area        */
+    char  output[64];        /* start looking at this screen, not the one
+                                sway is on                                   */
     int   show_header;
     int   show_hints;
     int   quit_on_focus_loss;
@@ -282,7 +286,7 @@ static Cfg cfg_defaults(void)
     c.back_scope = 0;        /* global: go back to where I just was */
     c.blur       = 2;
     c.cpu        = 1;
-    c.drop_ghosts = 0;
+    c.drop_ghosts = 1;
     c.cpu_idle   = 0.01f;    /* cores; under this nothing is happening */
     c.cpu_min    = 0.25f;    /* cores, not a share of the machine */
     c.cpu_full   = 4.0f;
@@ -299,6 +303,8 @@ static Cfg cfg_defaults(void)
 
     c.show_empty         = 1;
     c.all_outputs        = 0;
+    c.outputs_map        = 1;
+    c.outputs_map_w      = 0.18f;
     c.show_header        = 1;
     c.show_hints         = 1;
     c.quit_on_focus_loss = 1;
@@ -388,6 +394,9 @@ static void cfg_set(Cfg *c, const char *k, const char *v)
     else if (key_is(k,"hints_pos"))  str_set(c->hints_pos, sizeof(c->hints_pos), v);
     else if (key_is(k,"show_empty"))    c->show_empty = atoi(v) != 0;
     else if (key_is(k,"all_outputs"))   c->all_outputs = atoi(v) != 0;
+    else if (key_is(k,"outputs_map"))   c->outputs_map = atoi(v) != 0;
+    else if (key_is(k,"outputs_map_w")) c->outputs_map_w = (float)atof(v);
+    else if (key_is(k,"output"))        str_set(c->output, sizeof(c->output), v);
     else if (key_is(k,"show_header"))   c->show_header = atoi(v) != 0;
     else if (key_is(k,"show_hints"))    c->show_hints = atoi(v) != 0;
     else if (key_is(k,"quit_on_focus_loss")) c->quit_on_focus_loss = atoi(v) != 0;
@@ -2223,7 +2232,42 @@ static int NWIN = 0;
 static Ws  WSS[MAX_WORKSPACES];
 static int NWS = 0;
 
-static char FOCUSED_OUTPUT[64] = {0};   /* output sway currently focuses */
+static char FOCUSED_OUTPUT[64] = {0};   /* the output whose workspaces we show */
+static char HOME_OUTPUT[64]    = {0};   /* the one sway is really on           */
+static bool PINNED_OUTPUT;              /* ...and we are looking elsewhere     */
+
+/* Every monitor, in the arrangement sway has them in, so the overview can
+ * draw a little map of the desk and let you step onto another screen. */
+typedef struct {
+    char name[64];
+    int  x, y, w, h;
+    bool focused;
+    SDL_FRect box;                      /* where it sits in the map */
+} Out;
+static Out  OUTS[8];
+static int  NOUTS;
+static SDL_FRect MAP_RECT;              /* the free corner it is drawn in */
+
+static void outputs_reload(void)
+{
+    NOUTS = 0;
+    JV *outs = sway_query(IPC_GET_OUTPUTS);
+    if (!outs || outs->type != J_ARR) { jfree(outs); return; }
+
+    for (int i = 0; i < outs->count && NOUTS < (int)SDL_arraysize(OUTS); ++i) {
+        const JV *o = outs->items[i];
+        if (!jbool(o, "active", true)) continue;
+        const JV *r = jget(o, "rect");
+        Out *d = &OUTS[NOUTS++];
+        str_set(d->name, sizeof(d->name), jstr(o, "name", ""));
+        d->x = jint(r, "x", 0);      d->y = jint(r, "y", 0);
+        d->w = jint(r, "width", 0);  d->h = jint(r, "height", 0);
+        d->focused = jbool(o, "focused", false);
+        if (d->focused) str_set(HOME_OUTPUT, sizeof(HOME_OUTPUT), d->name);
+        d->box = (SDL_FRect){ 0, 0, 0, 0 };
+    }
+    jfree(outs);
+}
 static char CUR_OUTPUT[64]     = {0};   /* output the tree walk is inside */
 
 static void model_free(void)
@@ -2395,7 +2439,9 @@ static bool model_reload(void)
 
     /* sway reports no focused workspace for a moment after a rename; keeping
      * the previous output beats falling back to "every output" */
-    if (focused[0]) str_set(FOCUSED_OUTPUT, sizeof(FOCUSED_OUTPUT), focused);
+    if (focused[0] && !PINNED_OUTPUT)
+        str_set(FOCUSED_OUTPUT, sizeof(FOCUSED_OUTPUT), focused);
+    outputs_reload();
 
     JV *tree = sway_query(IPC_GET_TREE);
     if (!tree) { jfree(wsr); return false; }
@@ -2916,6 +2962,32 @@ static void layout(void)
     float aw = (float)RW - 2.0f * m;
     float ah = (float)RH - HEADER_H - FOOTER_H - m;
     if (aw < 40.0f || ah < 40.0f || NWS == 0) return;
+
+    /* The monitor map keeps a fixed place in the bottom left, always the
+     * same one whichever screen is being shown. Handing it whatever cell the
+     * grid happened to leave over meant it moved about, and vanished
+     * entirely when the grid came out full. The tiles get what is left. */
+    MAP_RECT = (SDL_FRect){ 0, 0, 0, 0 };
+    if (C.outputs_map && NOUTS > 1) {
+        int minx = OUTS[0].x, miny = OUTS[0].y;
+        int maxx = OUTS[0].x + OUTS[0].w, maxy = OUTS[0].y + OUTS[0].h;
+        for (int i = 1; i < NOUTS; ++i) {
+            if (OUTS[i].x < minx) minx = OUTS[i].x;
+            if (OUTS[i].y < miny) miny = OUTS[i].y;
+            if (OUTS[i].x + OUTS[i].w > maxx) maxx = OUTS[i].x + OUTS[i].w;
+            if (OUTS[i].y + OUTS[i].h > maxy) maxy = OUTS[i].y + OUTS[i].h;
+        }
+        float dw = (float)(maxx - minx), dh = (float)(maxy - miny);
+        if (dw > 1.0f && dh > 1.0f) {
+            float mw = aw * SDL_clamp(C.outputs_map_w, 0.05f, 0.45f);
+            float mh = mw * dh / dw;
+            float cap = ah * 0.30f;
+            if (mh > cap) { mh = cap; mw = mh * dw / dh; }
+            MAP_RECT = (SDL_FRect){ ax, ay + ah - mh, mw, mh };
+            ah -= mh + gap;
+            if (ah < 60.0f) { MAP_RECT = (SDL_FRect){ 0, 0, 0, 0 }; ah = (float)RH - HEADER_H - FOOTER_H - m; }
+        }
+    }
 
     /* aspect of the screen we are mirroring */
     float aspect = 16.0f / 9.0f;
@@ -3808,7 +3880,10 @@ static void rebuild_chrome(void)
 
     if (C.show_header) {
         char buf[256];
-        snprintf(buf, sizeof(buf), "%.63s   %d window%s on %d workspace%s",
+        /* Looking at a screen you are not on is worth saying outright: every
+         * key and every drop from here lands over there. */
+        snprintf(buf, sizeof(buf), "%s%.63s   %d window%s on %d workspace%s",
+                 PINNED_OUTPUT ? "viewing " : "",
                  FOCUSED_OUTPUT[0] ? FOCUSED_OUTPUT : "sway",
                  NWIN, NWIN == 1 ? "" : "s", NWS, NWS == 1 ? "" : "s");
         T_HEADER = text_make(F_HINT, buf);
@@ -4299,6 +4374,59 @@ static void draw_drop_indicator(void)
     }
 }
 
+/* The monitors as they sit on the desk, scaled into whatever corner of the
+ * grid was left over. Click one to look at its workspaces instead; the one
+ * you are looking at is filled, the one sway is really on keeps a ring. */
+static void draw_outputs_map(void)
+{
+    if (MAP_RECT.w < 16.0f || NOUTS < 2) return;
+
+    int minx = OUTS[0].x, miny = OUTS[0].y;
+    int maxx = OUTS[0].x + OUTS[0].w, maxy = OUTS[0].y + OUTS[0].h;
+    for (int i = 1; i < NOUTS; ++i) {
+        if (OUTS[i].x < minx) minx = OUTS[i].x;
+        if (OUTS[i].y < miny) miny = OUTS[i].y;
+        if (OUTS[i].x + OUTS[i].w > maxx) maxx = OUTS[i].x + OUTS[i].w;
+        if (OUTS[i].y + OUTS[i].h > maxy) maxy = OUTS[i].y + OUTS[i].h;
+    }
+    float dw = (float)(maxx - minx), dh = (float)(maxy - miny);
+    if (dw < 1.0f || dh < 1.0f) return;
+
+    /* fit the whole desk inside its box, aspect kept */
+    float pad = C.pad * SC * 0.5f;
+    float aw = MAP_RECT.w - 2.0f * pad, ah = MAP_RECT.h - 2.0f * pad;
+    float sc = SDL_min(aw / dw, ah / dh);
+    float bw = dw * sc, bh = dh * sc;
+    float bx = MAP_RECT.x + (MAP_RECT.w - bw) * 0.5f;
+    float by = MAP_RECT.y + (MAP_RECT.h - bh) * 0.5f;
+
+    float rad = SDL_max(2.0f, 4.0f * SC);
+    for (int i = 0; i < NOUTS; ++i) {
+        Out *d = &OUTS[i];
+        SDL_FRect r = { bx + (float)(d->x - minx) * sc + 1.0f * SC,
+                        by + (float)(d->y - miny) * sc + 1.0f * SC,
+                        (float)d->w * sc - 2.0f * SC,
+                        (float)d->h * sc - 2.0f * SC };
+        d->box = r;
+        if (r.w < 4.0f || r.h < 4.0f) continue;
+
+        bool showing = strcmp(d->name, FOCUSED_OUTPUT) == 0;
+        fill_round_rect(r, rad, showing ? mix(C.tile_sel, C.hl, 0.25f)
+                                        : with_alpha(C.tile, 0.75f));
+        if (d->focused)
+            stroke_round_rect(r, rad, SDL_max(1.0f, 2.0f * SC),
+                              with_alpha(C.current, 0.9f));
+
+        Tex t = text_make_fit(F_HINT, d->name, (int)(r.w - 4.0f * SC));
+        if (t.t) {
+            tex_draw(t, r.x + (r.w - (float)t.w) * 0.5f,
+                     r.y + (r.h - (float)t.h) * 0.5f,
+                     showing ? C.hltext : C.subtext);
+            tex_free(&t);
+        }
+    }
+}
+
 static void render(void)
 {
     SDL_SetRenderDrawBlendMode(REN, SDL_BLENDMODE_NONE);
@@ -4362,6 +4490,8 @@ static void render(void)
 
     if (drag_active) draw_drop_indicator();
 
+    draw_outputs_map();
+
     float m = C.margin * SC;
     float head_x0 = (float)RW, head_x1 = 0.0f;
     bool  head_top = pos_is_top(C.header_pos);
@@ -4371,7 +4501,15 @@ static void render(void)
                            : (float)RH - FOOTER_H * 0.5f - (float)T_HEADER.h * 0.5f;
         head_x0 = pos_x(C.header_pos, (float)T_HEADER.w, m);
         head_x1 = head_x0 + (float)T_HEADER.w;
-        tex_draw(T_HEADER, head_x0, y, C.hint);
+        if (PINNED_OUTPUT) {                       /* not the screen you are on */
+            float p = 6.0f * SC;
+            SDL_FRect box = { head_x0 - p, y - p * 0.5f,
+                              (float)T_HEADER.w + 2.0f * p, (float)T_HEADER.h + p };
+            fill_round_rect(box, box.h * 0.35f, with_alpha(C.hl, 0.22f));
+            stroke_round_rect(box, box.h * 0.35f, SDL_max(1.0f, 1.5f * SC),
+                              with_alpha(C.hl, 0.85f));
+        }
+        tex_draw(T_HEADER, head_x0, y, PINNED_OUTPUT ? C.hl : C.hint);
     }
 
     if (T_QUERY.t) {
@@ -5071,6 +5209,25 @@ static void handle_mouse_press(const SDL_MouseButtonEvent *b)
 
     if (editing) end_edit(true);                   /* a click elsewhere commits */
 
+    /* the map of the monitors: step onto one and look at its workspaces */
+    if (b->button == SDL_BUTTON_LEFT && MAP_RECT.w > 0.0f) {
+        for (int i = 0; i < NOUTS; ++i) {
+            SDL_FRect r = OUTS[i].box;
+            if (r.w <= 0.0f || mx < r.x || mx >= r.x + r.w ||
+                my < r.y || my >= r.y + r.h) continue;
+            if (strcmp(OUTS[i].name, FOCUSED_OUTPUT) == 0) {
+                PINNED_OUTPUT = false;             /* back to following sway */
+                str_set(FOCUSED_OUTPUT, sizeof(FOCUSED_OUTPUT), HOME_OUTPUT);
+            } else {
+                PINNED_OUTPUT = strcmp(OUTS[i].name, HOME_OUTPUT) != 0;
+                str_set(FOCUSED_OUTPUT, sizeof(FOCUSED_OUTPUT), OUTS[i].name);
+            }
+            reload_model();
+            dirty = true;
+            return;
+        }
+    }
+
     if (b->button == SDL_BUTTON_LEFT && ws_idx >= 0 && win_idx < 0) {
         SDL_FRect tb = WSS[ws_idx].title_hit;
         if (mx >= tb.x && mx < tb.x + tb.w && my >= tb.y && my < tb.y + tb.h) {
@@ -5398,9 +5555,11 @@ static bool backdrop_command(char *line)
         return true;
     }
     if (!strcmp(line, "drag on")) {
-        /* Offering every free number adds a dozen tiles to the grid, and the
-         * workspaces you are actually aiming at shrink to a third of their
-         * size just as you start aiming. Off unless asked for. */
+        /* The free numbers become ghost tiles to drop on, exactly as they do
+         * when a window is dragged inside swov — dropping an app on a
+         * workspace that does not exist yet has to work the same either way.
+         * They do cost the real tiles some size; drop_ghosts=0 keeps them
+         * out of a drag that comes from swas. */
         if (C.drop_ghosts) set_ghosts(0, 10);
         BLUR_WANT = 0.0f;
         return true;
@@ -5956,7 +6115,13 @@ int main(int argc, char **argv)
 
     usage_sync();
     sway_subscribe_events();
+    if (C.output[0]) {                 /* asked to look at another screen */
+        str_set(FOCUSED_OUTPUT, sizeof(FOCUSED_OUTPUT), C.output);
+        PINNED_OUTPUT = true;
+    }
     if (!model_reload()) die("could not read the sway tree");
+    if (C.output[0] && HOME_OUTPUT[0] && !strcmp(C.output, HOME_OUTPUT))
+        PINNED_OUTPUT = false;
     mark("sway tree");
     cpu_load();                  /* whatever swbr last measured */
     select_current_workspace();

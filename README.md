@@ -85,10 +85,11 @@ when there is one.
 left or right quarter of another it inserts there, pushing the occupied run up
 by one.
 
-**Ghost slots** are the free numbers 0–10. Dragging a window inside swov
-brings them out; a drag from swas does not, unless `drop_ghosts=1` — they add
-a dozen tiles to the grid, and the workspaces you are aiming at shrink to a
-third just as you start aiming. They appear when a workspace drag
+**Ghost slots** are the free numbers 0–10. They come out for a drag from swas as
+well as for one inside swov, so dropping an app on a workspace that does not
+exist yet works the same either way. `drop_ghosts=0` keeps them out of a swas
+drag, at the cost of not being able to make a workspace that way — they do add
+tiles to the grid, and the real ones shrink to fit. They appear when a workspace drag
 starts, or when a dragged window leaves its own workspace, and the tiles glide
 aside to make room. Drop on one to give a workspace that number, or to create a
 workspace from a single window.
@@ -197,6 +198,23 @@ swas uses all three: `overview=1` puts swov behind the wheel, dragging an
 app asks it where the pointer is — including which side of which window — and
 dropping starts the app exactly there.
 
+## More than one monitor
+
+With a second screen attached, the bottom left holds a small map of the
+monitors, laid out the way sway has them arranged, each with its name inside.
+It has that place to itself — the tiles are laid out in what is left over — so
+it is in the same spot whichever screen you are looking at, and it never
+collides with anything. `outputs_map_w` is how wide it is as a share of the
+tile area (0.18 by default), `outputs_map=0` turns it off.
+
+Click a monitor and the overview shows *its* workspaces instead. The one you
+are looking at is filled in, the one sway is really on keeps a ring, and while
+those differ the header says `viewing DP-1` in a highlighted box — everything
+you do from there, every key and every drop, lands on that screen. Clicking
+the one you are already looking at goes back to following sway.
+
+`swov output=DP-1` starts on a given screen.
+
 ## Workspace usage
 
 Every switch goes through swov, so it stamps the time as it goes: the workspace
@@ -274,6 +292,7 @@ lists them. The file above is read after it, so swov's own config always wins.
 | `blur` | how soft `--backdrop` is drawn, `0`–`3` |
 | `drop_ghosts` | offer the free numbers while an app is dragged over the backdrop |
 | `cpu`, `cpu_min`, `cpu_full` | the load dot, and the range it covers |
+| `outputs_map`, `outputs_map_w`, `output` | the monitor map, its width, and which screen to start on |
 | `track`, `usage_dots`, `dot_count`, `dot_px` | usage recording and its dot scale |
 | `start_selection` | `workspace`, `none` or `window` |
 | `cols`, `rows` | force the grid; default picks the largest tiles |
