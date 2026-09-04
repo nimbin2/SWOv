@@ -44,6 +44,19 @@ outputs_map=1      # with a second screen: a map of the monitors, bottom left,
                    # workspaces. It keeps that place to itself, so it is
                    # always in the same spot
 outputs_map_w=0.18 # how wide, as a share of the tile area
+launcher=swas --replace overview=1
+                   # what `d` opens. swas draws its own backdrop, so swov
+                   # steps aside rather than stacking two overlays
+over_fullscreen=1  # a fullscreen window is above anything a normal window
+                   # can reach, so swov takes it off fullscreen while it is
+                   # open and puts it back on the way out. 0 = open behind it
+drop_outputs=1     # while dragging, the other screens' workspaces show up
+                   # alongside this one's, marked with their output name, so
+                   # they can be dropped on directly
+map_dwell_ms=0     # dragging anything: hold it over another monitor
+                   # this long and the overview steps onto that screen. The
+                   # plate fills as you hold; moving at all starts the wait
+                   # again. 0 = off
 # output=DP-1      # start on that screen instead of the one sway is on
 blur=2             # --backdrop only: how soft the overview is drawn while
                    # something else has the foreground. 0 = off, 3 = softest.

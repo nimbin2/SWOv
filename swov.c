@@ -39,6 +39,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <limits.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "sw_theme.h"
@@ -229,6 +230,9 @@ typedef struct {
     int   back_scope;        /* -b: 0 global, 1 this monitor, 2 sway's own */
     int   blur;              /* --backdrop only: 0 off, 1..3 how soft       */
     int   drop_ghosts;       /* --backdrop: offer the free numbers as tiles */
+    int   drop_outputs;      /* mid-drag, show every screen's workspaces    */
+    int   over_fullscreen;   /* un-fullscreen what is in the way, and put
+                                it back on the way out                      */
     int   cpu;               /* the load dots on a tile, measured by swbr   */
     float cpu_idle;          /* under this, nothing is happening at all     */
     float cpu_min, cpu_full; /* the scale, in cores                         */
@@ -241,9 +245,11 @@ typedef struct {
     int   show_empty;
     int   all_outputs;
     int   outputs_map;       /* the little map of the monitors, bottom left  */
+    int   map_dwell_ms;      /* hold an app over one this long to step onto it */
     float outputs_map_w;     /* how wide, as a share of the tile area        */
     char  output[64];        /* start looking at this screen, not the one
                                 sway is on                                   */
+    char  launcher[192];     /* what `d` opens, and swov steps aside for     */
     int   show_header;
     int   show_hints;
     int   quit_on_focus_loss;
@@ -287,6 +293,8 @@ static Cfg cfg_defaults(void)
     c.blur       = 2;
     c.cpu        = 1;
     c.drop_ghosts = 1;
+    c.drop_outputs = 1;
+    c.over_fullscreen = 1;
     c.cpu_idle   = 0.01f;    /* cores; under this nothing is happening */
     c.cpu_min    = 0.25f;    /* cores, not a share of the machine */
     c.cpu_full   = 4.0f;
@@ -305,6 +313,8 @@ static Cfg cfg_defaults(void)
     c.all_outputs        = 0;
     c.outputs_map        = 1;
     c.outputs_map_w      = 0.18f;
+    c.map_dwell_ms       = 0;
+    str_set(c.launcher, sizeof(c.launcher), "swas --replace overview=1");
     c.show_header        = 1;
     c.show_hints         = 1;
     c.quit_on_focus_loss = 1;
@@ -378,6 +388,8 @@ static void cfg_set(Cfg *c, const char *k, const char *v)
     else if (key_is(k,"track"))         c->track = atoi(v) != 0;
     else if (key_is(k,"cpu"))       c->cpu = atoi(v) != 0;
     else if (key_is(k,"drop_ghosts")) c->drop_ghosts = atoi(v) != 0;
+    else if (key_is(k,"drop_outputs")) c->drop_outputs = atoi(v) != 0;
+    else if (key_is(k,"over_fullscreen")) c->over_fullscreen = atoi(v) != 0;
     else if (key_is(k,"cpu_idle"))  c->cpu_idle = (float)atof(v);
     else if (key_is(k,"cpu_min"))   c->cpu_min = (float)atof(v);
     else if (key_is(k,"cpu_full"))  c->cpu_full = (float)atof(v);
@@ -396,7 +408,9 @@ static void cfg_set(Cfg *c, const char *k, const char *v)
     else if (key_is(k,"all_outputs"))   c->all_outputs = atoi(v) != 0;
     else if (key_is(k,"outputs_map"))   c->outputs_map = atoi(v) != 0;
     else if (key_is(k,"outputs_map_w")) c->outputs_map_w = (float)atof(v);
+    else if (key_is(k,"map_dwell_ms"))  c->map_dwell_ms = atoi(v);
     else if (key_is(k,"output"))        str_set(c->output, sizeof(c->output), v);
+    else if (key_is(k,"launcher"))      str_set(c->launcher, sizeof(c->launcher), v);
     else if (key_is(k,"show_header"))   c->show_header = atoi(v) != 0;
     else if (key_is(k,"show_hints"))    c->show_hints = atoi(v) != 0;
     else if (key_is(k,"quit_on_focus_loss")) c->quit_on_focus_loss = atoi(v) != 0;
@@ -1327,7 +1341,10 @@ static int adopt_window(int pid, const char *ws, double timeout, bool focus,
     double deadline = now_secs() + timeout;
     int    con_id   = -1;
 
-    int assigned[24], nassigned = 0;
+    /* Each of these is a rule sway keeps for the rest of the session — there
+     * is no unassign — so they are worth counting. Two dozen per launch was
+     * generous; six covers a wrapper script and its children. */
+    int assigned[6], nassigned = 0;
     if (!no_assign) {
         assign_pid_to_ws(pid, ws);                /* before anything maps */
         assigned[nassigned++] = pid;
@@ -1612,6 +1629,42 @@ static void fill_round_rect(SDL_FRect r, float rad, SDL_FColor c)
         SDL_FRect bot = { x0, r.y + r.h - (float)i - 1.0f, w, 1.0f };
         SDL_RenderFillRect(REN, &top);
         SDL_RenderFillRect(REN, &bot);
+    }
+}
+
+/* The same, with the top or the bottom left square.
+ *
+ * A tab meets the panel below it and a panel meets the tab above it: rounding
+ * both sides of that join leaves a pinch of background showing through, which
+ * is what made a tabbed workspace look wrong. */
+static void fill_round_side(SDL_FRect r, float rad, bool round_top,
+                            bool round_bot, SDL_FColor c)
+{
+    if (r.w <= 0.0f || r.h <= 0.0f) return;
+    if (round_top && round_bot) { fill_round_rect(r, rad, c); return; }
+
+    rad = SDL_min(rad, SDL_min(r.w, r.h) * 0.5f);
+    if (rad <= 0.5f) { set_col(c); SDL_RenderFillRect(REN, &r); return; }
+
+    set_col(c);
+    SDL_FRect mid = { r.x, r.y + (round_top ? rad : 0.0f), r.w,
+                      r.h - (round_top ? rad : 0.0f) - (round_bot ? rad : 0.0f) };
+    SDL_RenderFillRect(REN, &mid);
+
+    int steps = (int)SDL_ceilf(rad);
+    for (int i = 0; i < steps; ++i) {
+        float dy = rad - (float)i - 0.5f;
+        float dx = SDL_sqrtf(SDL_max(0.0f, rad * rad - dy * dy));
+        float x0 = r.x + rad - dx;
+        float w  = r.w - 2.0f * rad + 2.0f * dx;
+        if (round_top) {
+            SDL_FRect t = { x0, r.y + (float)i, w, 1.0f };
+            SDL_RenderFillRect(REN, &t);
+        }
+        if (round_bot) {
+            SDL_FRect b = { x0, r.y + r.h - (float)i - 1.0f, w, 1.0f };
+            SDL_RenderFillRect(REN, &b);
+        }
     }
 }
 
@@ -2183,6 +2236,7 @@ typedef struct {
 
     int   x, y, w, h;          /* absolute geometry, as sway reports it */
     bool  floating, focused, urgent, fullscreen, sticky;
+    bool  is_self;             /* swov's own window, or its backdrop         */
     bool  marked;              /* multi-selection */
     bool  match;               /* passes the current filter */
     bool  visible;             /* the one on top of its tabbed container */
@@ -2232,6 +2286,7 @@ static int NWIN = 0;
 static Ws  WSS[MAX_WORKSPACES];
 static int NWS = 0;
 
+static bool DRAG_ALL_OUTPUTS = false;   /* mid-drag: every screen shows */
 static char FOCUSED_OUTPUT[64] = {0};   /* the output whose workspaces we show */
 static char HOME_OUTPUT[64]    = {0};   /* the one sway is really on           */
 static bool PINNED_OUTPUT;              /* ...and we are looking elsewhere     */
@@ -2246,7 +2301,17 @@ typedef struct {
 } Out;
 static Out  OUTS[8];
 static int  NOUTS;
-static SDL_FRect MAP_RECT;              /* the free corner it is drawn in */
+static bool dirty   = true;      /* a frame is only drawn when this is set */
+static SDL_FRect MAP_RECT;              /* the corner it is drawn in */
+static SDL_FRect CANCEL_RECT;           /* and the ✕ beside it, while dragging */
+
+/* Holding an app over another monitor for a moment steps the overview onto
+ * it, so a drag that started on one screen can finish on another. It is a
+ * press you hold, so it shows how far along it is. */
+static int    MAP_HOVER = -1;
+static int    DRAG_CON;          /* the window being dragged, by id */
+static double MAP_HOVER_SINCE;
+static float  MAP_HOVER_X, MAP_HOVER_Y;
 
 static void outputs_reload(void)
 {
@@ -2309,6 +2374,12 @@ static void collect_views(const JV *node, Ws *ws, bool floating)
 
         w->con_id     = jint(node, "id", 0);
         w->pid        = jint(node, "pid", 0);
+        /* This very window, and the backdrop behind it. It is on the
+         * workspace like anything else and hiding it would leave a hole, but
+         * it must not be selectable, droppable or in the way: it is about to
+         * be gone. */
+        w->is_self    = w->pid == getpid() ||
+                        !strncmp(w->app_id, APP_ID, sizeof(APP_ID) - 1);
         w->focused    = jbool(node, "focused", false);
         w->visible    = jbool(node, "visible", true);
         w->urgent     = jbool(node, "urgent", false);
@@ -2405,7 +2476,8 @@ static void walk_outputs(const JV *node)
     if (strcmp(type, "output") == 0) {
         const char *name = jstr(node, "name", "");
         if (strcmp(name, "__i3") == 0) return;
-        if (!C.all_outputs && FOCUSED_OUTPUT[0] && strcmp(name, FOCUSED_OUTPUT) != 0) return;
+        if (!C.all_outputs && !DRAG_ALL_OUTPUTS &&
+        FOCUSED_OUTPUT[0] && strcmp(name, FOCUSED_OUTPUT) != 0) return;
         str_set(CUR_OUTPUT, sizeof(CUR_OUTPUT), name);
     }
 
@@ -2597,6 +2669,41 @@ static float pos_x(const char *p, float w, float margin)
 static int  sel_ws = 0;
 static bool sel_active = true;   /* false: no tile and no window highlighted */
 static int  hov_ws = -1, hov_win = -1;
+
+/* A floating window is see-through and answers the pointer only through its
+ * name plate, so the windows underneath stay reachable. Once you are on that
+ * plate it comes forward and takes the whole of itself — otherwise you lose
+ * it the moment you move off the plate, which is exactly when you were about
+ * to aim inside it. It is given up again at the edges of its own card, and
+ * for one that covers the whole workspace, in a band along the tile: without
+ * that there would be no way back out. */
+static int  LIFT_WIN = -1;
+
+static bool lift_holds(const Win *w, const Ws *ws, float x, float y)
+{
+    SDL_FRect c = w->card;
+    if (x < c.x || x >= c.x + c.w || y < c.y || y >= c.y + c.h) return false;
+
+    float band = SDL_clamp(SDL_min(ws->tile.w, ws->tile.h) * 0.06f,
+                           8.0f * SC, 40.0f * SC);
+    bool fills = c.w >= ws->screen.w - band && c.h >= ws->screen.h - band;
+    if (!fills) return true;
+
+    return x >= ws->tile.x + band && x < ws->tile.x + ws->tile.w - band &&
+           y >= ws->tile.y + band && y < ws->tile.y + ws->tile.h - band;
+}
+
+static void lift_update(float x, float y, int ws_idx, int win_idx)
+{
+    if (LIFT_WIN >= 0 && LIFT_WIN < NWIN) {
+        const Win *w = &WINS[LIFT_WIN];
+        if (w->ws >= 0 && w->ws < NWS && lift_holds(w, &WSS[w->ws], x, y)) return;
+        LIFT_WIN = -1;
+    }
+    if (win_idx >= 0 && win_idx < NWIN && ws_idx >= 0 && !WINS[win_idx].is_self &&
+        (WINS[win_idx].floating || WINS[win_idx].fullscreen))
+        LIFT_WIN = win_idx;
+}
 static char query[128];
 static int  qlen = 0;
 static bool filtering = false;   /* "/" — hides everything that does not match */
@@ -2706,17 +2813,22 @@ static void layout_cards(Ws *ws)
         bool  tabs_fit = strip >= 16.0f * SC && base.w / (float)n >= 26.0f * SC;
 
         if (tabs_fit) {
-            /* a tab per window across the top, the active one showing its
-             * contents underneath — the same shape sway draws */
-            float tw = base.w / (float)n;
+            /* A tab per window across the top, the active one showing its
+             * contents underneath — the same shape sway draws. The strip is
+             * inset from the group's own edge, so a tab never sits against
+             * the border and the first and last are not clipped by its
+             * rounded corners. */
+            float pad = SDL_clamp(base.w * 0.02f, 2.0f * SC, 8.0f * SC);
+            float inner = base.w - 2.0f * pad;
+            float tw = inner / (float)n;
             for (int k = 0; k < n; ++k) {
                 Win *cw = &WINS[ws->first + group[k]];
-                cw->tab = (SDL_FRect){ base.x + (float)k * tw + inset * 0.5f, base.y,
-                                       tw - inset, strip };
+                cw->tab = (SDL_FRect){ base.x + pad + (float)k * tw + inset * 0.5f,
+                                       base.y + pad, tw - inset, strip };
                 cw->has_tab = true;
                 cw->card = (k == active)
-                    ? (SDL_FRect){ base.x, base.y + strip + inset * 0.5f,
-                                   base.w, base.h - strip - inset * 0.5f }
+                    ? (SDL_FRect){ base.x + pad, base.y + pad + strip + inset * 0.5f,
+                                   inner, base.h - 2.0f * pad - strip - inset * 0.5f }
                     : cw->tab;
             }
         } else {
@@ -2968,6 +3080,7 @@ static void layout(void)
      * grid happened to leave over meant it moved about, and vanished
      * entirely when the grid came out full. The tiles get what is left. */
     MAP_RECT = (SDL_FRect){ 0, 0, 0, 0 };
+    CANCEL_RECT = (SDL_FRect){ 0, 0, 0, 0 };
     if (C.outputs_map && NOUTS > 1) {
         int minx = OUTS[0].x, miny = OUTS[0].y;
         int maxx = OUTS[0].x + OUTS[0].w, maxy = OUTS[0].y + OUTS[0].h;
@@ -2984,6 +3097,14 @@ static void layout(void)
             float cap = ah * 0.30f;
             if (mh > cap) { mh = cap; mw = mh * dw / dh; }
             MAP_RECT = (SDL_FRect){ ax, ay + ah - mh, mw, mh };
+
+            /* Somewhere to put a drag down and have nothing happen. It runs
+               from the monitors to the right edge and fills the band, so
+               dragging downwards is enough — no aiming, no corner to find. */
+            float cx0 = ax + mw + gap * 2.0f;
+            CANCEL_RECT = (SDL_FRect){ cx0, ay + ah - mh,
+                                       SDL_max(mh, ax + aw - cx0), mh };
+
             ah -= mh + gap;
             if (ah < 60.0f) { MAP_RECT = (SDL_FRect){ 0, 0, 0, 0 }; ah = (float)RH - HEADER_H - FOOTER_H - m; }
         }
@@ -3347,7 +3468,10 @@ static int hit_test(float mx, float my, int *out_ws)
         *out_ws = i;
         for (int j = ws->count - 1; j >= 0; --j) {      /* floats are last = on top */
             Win *w = &WINS[ws->first + j];
-            SDL_FRect r = (w->hit.w > 0.0f) ? w->hit : w->card;
+            if (w->is_self) continue;              /* scenery, not a target */
+            SDL_FRect r = (ws->first + j == LIFT_WIN)
+                        ? w->card                          /* lifted: all of it */
+                        : ((w->hit.w > 0.0f) ? w->hit : w->card);
             if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h)
                 return ws->first + j;
         }
@@ -3401,7 +3525,8 @@ typedef enum {
     DROP_WS_SWAP,    /* workspace onto another workspace                   */
     DROP_WS_NUM,     /* workspace onto a free number (a ghost slot)        */
     DROP_WIN_NEWWS,  /* window onto a free number: sway creates it          */
-    DROP_WS_EDGE     /* window along one edge of a tile: beside the lot      */
+    DROP_WS_EDGE,    /* window along one edge of a tile: beside the lot      */
+    DROP_CANCEL      /* the ✕ beside the monitors: let go and nothing happens */
 } DropKind;
 
 enum { EDGE_LEFT, EDGE_RIGHT, EDGE_TOP, EDGE_BOTTOM };
@@ -3455,6 +3580,23 @@ static bool point_in(SDL_FRect r, float x, float y)
     return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
 }
 
+/* Every screen's workspaces, or only this one's. Rebuilding the model in the
+ * middle of a drag would lose the window being dragged, so its id is kept and
+ * looked up again on the other side. */
+static void show_all_outputs(bool on)
+{
+    if (DRAG_ALL_OUTPUTS == on) return;
+    DRAG_ALL_OUTPUTS = on;
+
+    int keep = press_win >= 0 ? WINS[press_win].con_id : DRAG_CON;
+    reload_model();
+    press_win = -1;
+    if (keep > 0)
+        for (int i = 0; i < NWIN; ++i)
+            if (WINS[i].con_id == keep) { press_win = i; break; }
+    dirty = true;
+}
+
 static void set_ghosts(int lo, int hi)
 {
     if (lo == ghost_lo && hi == ghost_hi) return;
@@ -3479,11 +3621,59 @@ static void update_ghosts(float x, float y)
     } else if (press_win >= 0) {
         want = !point_in(drag_src_tile, x, y);
     }
-    if (want) set_ghosts(0, 10);
+    if (want) {
+        if (C.drop_outputs) show_all_outputs(true);
+        set_ghosts(0, 10);
+    }
+}
+
+/* Holding a drag over another monitor steps the overview onto it. The press
+ * has to be still: any movement starts the wait again, so brushing past a
+ * plate on the way somewhere else never triggers it. */
+static bool point_in_cancel(float x, float y)
+{
+    return CANCEL_RECT.w > 0.0f &&
+           x >= CANCEL_RECT.x && x < CANCEL_RECT.x + CANCEL_RECT.w &&
+           y >= CANCEL_RECT.y && y < CANCEL_RECT.y + CANCEL_RECT.h;
+}
+
+static bool map_dwell_hover(float x, float y)
+{
+    if (MAP_RECT.w <= 0.0f) return false;
+
+    int on = -1;
+    for (int i = 0; i < NOUTS; ++i) {
+        SDL_FRect r = OUTS[i].box;
+        if (r.w > 0.0f && x >= r.x && x < r.x + r.w &&
+            y >= r.y && y < r.y + r.h) { on = i; break; }
+    }
+    if (on >= 0 && strcmp(OUTS[on].name, FOCUSED_OUTPUT) == 0) on = -1;
+
+    float moved = SDL_fabsf(x - MAP_HOVER_X) + SDL_fabsf(y - MAP_HOVER_Y);
+    if (on != MAP_HOVER || moved > 4.0f * SC) {
+        MAP_HOVER = on;
+        MAP_HOVER_SINCE = now_secs();
+        MAP_HOVER_X = x;
+        MAP_HOVER_Y = y;
+        dirty = true;
+    }
+    return on >= 0;
 }
 
 static void drag_update_target(float x, float y)
 {
+    if (point_in_cancel(x, y)) {
+        drop_kind = DROP_CANCEL;
+        drop_ws = drop_win = drop_num = -1;
+        MAP_HOVER = -1;
+        return;
+    }
+    if (map_dwell_hover(x, y)) {          /* over a monitor: nothing else */
+        drop_kind = DROP_NONE;
+        drop_ws = drop_win = drop_num = -1;
+        return;
+    }
+
     drop_kind = DROP_NONE;
     drop_ws = drop_win = drop_num = -1;
     drop_insert = false;
@@ -3844,11 +4034,14 @@ static void drag_finish(void)
                      WINS[press_win].con_id, drop_num);
         break;
 
+    case DROP_CANCEL:                        /* put down where it started */
     case DROP_NONE:
     default:
         break;
     }
 
+    show_all_outputs(false);
+    DRAG_CON = 0;
     drag_active = drag_ws_mode = false;
     drop_kind = DROP_NONE;
     press_win = press_ws = -1;
@@ -3979,14 +4172,28 @@ static void draw_card(Win *w, bool tile_selected)
     if (selected)   fill = mix(fill, C.hl, is_hovered ? 0.16f : 0.10f);
     if (dimmed)     fill = with_alpha(mix(fill, C.tile, 0.6f), fill.a * 0.45f);
 
+    /* The one being dragged, still drawn where it came from. Halfway to the
+     * background, so it reads as a space the window has left rather than a
+     * window sitting there — and it is the only thing on screen wearing the
+     * accent, so there is no forgetting which one is on the pointer. */
+    bool being_dragged = drag_active && press_win >= 0 && &WINS[press_win] == w;
+    if (being_dragged)
+        fill = with_alpha(mix(fill, C.bg, 0.55f), fill.a * 0.8f);
+
     /* A floating dialog, and especially a fullscreen window, sits on top of
      * the tiled ones. Drawing it solid would hide the whole workspace, so it
      * gets see-through — the more of the screen it covers, the more so. Its
      * border, icon and label stay at full strength, so it is still obvious
      * which window it is. */
+    /* Aiming inside a floating window is guesswork when it is see-through:
+     * you are trying to hit an edge you can barely make out. Point at one —
+     * or drag over one — and it comes forward, solid, until the pointer
+     * leaves again. */
+    bool lifted = LIFT_WIN >= 0 && LIFT_WIN < NWIN && &WINS[LIFT_WIN] == w;
+
     float over = 1.0f, cover = 0.0f;
     bool on_top = w->floating || w->fullscreen;
-    if (on_top) {
+    if (on_top && !lifted) {
         const Ws *ws = &WSS[w->ws];
         float screen_area = ws->screen.w * ws->screen.h;
         cover = (screen_area > 1.0f) ? (w->card.w * w->card.h) / screen_area : 1.0f;
@@ -3997,14 +4204,34 @@ static void draw_card(Win *w, bool tile_selected)
     /* Anything drawn on top of other windows gets a frame and a name plate
      * rather than a filled card: its label would otherwise sit in the middle,
      * exactly where the label of the window showing through already is. */
-    bool as_overlay = on_top;
+    bool as_overlay = on_top && !lifted;
+
+    /* A tab is rounded on top and flat where it meets its panel; the panel
+     * is flat on top and rounded below. A window that is neither is rounded
+     * all round, as before. */
+    bool is_tab   = w->has_tab && w->card.h <= w->tab.h + 1.0f;
+    bool is_panel = w->has_tab && !is_tab;
 
     if (w->floating) drop_shadow(r, rad, 9.0f * SC, with_alpha(C.shadow_col, C.shadow_col.a * over));
-    fill_round_rect(r, rad, fill);
+    if (is_tab)        fill_round_side(r, rad, true, false, fill);
+    else if (is_panel) fill_round_side(r, rad, false, true, fill);
+    else               fill_round_rect(r, rad, fill);
 
-    /* border: selection beats hover beats mark beats plain */
+    /* border: what is being dragged beats everything, then selection, hover,
+       mark, plain */
     float bw = SDL_max(1.0f, C.border * SC * 0.75f);
-    if (confirm_kill && (w->marked || selected))
+    if (lifted && !being_dragged) {
+        /* it has come forward: a heavier accent frame, and a soft one just
+           outside it so it reads as raised rather than merely outlined */
+        SDL_FRect glow = { r.x - 3.0f * SC, r.y - 3.0f * SC,
+                           r.w + 6.0f * SC, r.h + 6.0f * SC };
+        stroke_round_rect(glow, rad + 3.0f * SC, SDL_max(1.0f, 3.0f * SC),
+                          with_alpha(C.accent, 0.25f));
+    }
+
+    if (being_dragged)     stroke_round_rect(r, rad, bw * 1.6f, C.accent);
+    else if (lifted)       stroke_round_rect(r, rad, bw * 1.8f, C.accent);
+    else if (confirm_kill && (w->marked || selected))
                            stroke_round_rect(r, rad, bw * 1.35f, C.urgent);
     else if (selected)     stroke_round_rect(r, rad, bw * 1.35f, C.hl);
     else if (is_hit)       stroke_round_rect(r, rad, bw * 1.2f, C.match);
@@ -4111,6 +4338,64 @@ static void draw_card(Win *w, bool tile_selected)
     if (has_icon) SDL_SetTextureAlphaModFloat(w->icon, 1.0f);
 }
 
+static void rgb_to_hsv(SDL_FColor c, float *h, float *s, float *v)
+{
+    float mx = SDL_max(c.r, SDL_max(c.g, c.b));
+    float mn = SDL_min(c.r, SDL_min(c.g, c.b));
+    float d = mx - mn;
+    *v = mx;
+    *s = mx > 0.0001f ? d / mx : 0.0f;
+    if (d < 0.0001f) { *h = 0.0f; return; }
+    if      (mx == c.r) *h = 60.0f * SDL_fmodf((c.g - c.b) / d, 6.0f);
+    else if (mx == c.g) *h = 60.0f * ((c.b - c.r) / d + 2.0f);
+    else                *h = 60.0f * ((c.r - c.g) / d + 4.0f);
+    if (*h < 0.0f) *h += 360.0f;
+}
+
+static SDL_FColor hsv_to_rgb(float h, float s, float v, float a)
+{
+    h = SDL_fmodf(h, 360.0f);
+    if (h < 0.0f) h += 360.0f;
+    float c = v * s, x = c * (1.0f - SDL_fabsf(SDL_fmodf(h / 60.0f, 2.0f) - 1.0f));
+    float m = v - c, r = 0, g = 0, b = 0;
+    if      (h <  60) { r = c; g = x; }
+    else if (h < 120) { r = x; g = c; }
+    else if (h < 180) { g = c; b = x; }
+    else if (h < 240) { g = x; b = c; }
+    else if (h < 300) { r = x; b = c; }
+    else              { r = c; b = x; }
+    return (SDL_FColor){ r + m, g + m, b + m, a };
+}
+
+/* One colour per monitor: the accent, turned around the wheel by the golden
+ * angle for each screen. Two monitors never look alike, they keep the
+ * palette's weight, and none of them lands on `hl` — that one already means
+ * "this is the one you are on", and having a whole screen's worth of
+ * workspaces wear it said the opposite of what it meant. */
+static SDL_FColor output_colour(const char *name)
+{
+    int at = 0;
+    for (int i = 0; i < NOUTS; ++i)
+        if (!strcmp(OUTS[i].name, name)) { at = i; break; }
+
+    float h, sat, val, hl_h, hl_s, hl_v;
+    rgb_to_hsv(C.accent, &h, &sat, &val);
+    rgb_to_hsv(C.hl, &hl_h, &hl_s, &hl_v);
+
+    h += 137.5f * (float)at;                    /* golden angle: no repeats */
+    if (sat < 0.35f) sat = 0.55f;               /* a grey accent gives no hue */
+    if (val < 0.55f) val = 0.75f;
+
+    for (int guard = 0; guard < 4; ++guard) {   /* keep clear of hl */
+        float d = SDL_fabsf(SDL_fmodf(h - hl_h + 540.0f, 360.0f) - 180.0f);
+        if (d > 35.0f) break;
+        h += 50.0f;
+    }
+    return hsv_to_rgb(h, sat, val, 1.0f);
+}
+
+static SDL_FColor output_colour(const char *name);
+
 static void draw_workspace(int idx)
 {
     Ws *ws = &WSS[idx];
@@ -4126,8 +4411,18 @@ static void draw_workspace(int idx)
 
     bool has_hit = qlen == 0 || ws->count == 0 || ws_first_visible(ws) >= 0;
 
+    /* A workspace on another screen, shown because something is being
+     * dragged: a real place to drop on, but not here. Sinking it into the
+     * background was too polite to see at a glance, so it wears its
+     * monitor's colour instead — the tile is tinted with it, the border is
+     * it, and the name sits in a badge of it. */
+    bool elsewhere = ws->output[0] && FOCUSED_OUTPUT[0] &&
+                     strcmp(ws->output, FOCUSED_OUTPUT) != 0;
+    SDL_FColor ocol = output_colour(ws->output);
+
     SDL_FColor fill = selected ? C.tile_sel : (hovered ? C.tile_hover : C.tile);
     if (!has_hit) fill = with_alpha(mix(fill, C.bg, 0.35f), fill.a * 0.75f);
+    if (elsewhere) fill = mix(fill, ocol, 0.16f);
 
     drop_shadow(tile, rad, 7.0f * SC, C.shadow_col);
     fill_round_rect(tile, rad, fill);
@@ -4141,6 +4436,10 @@ static void draw_workspace(int idx)
                            bc = with_alpha(C.match, 0.8f);
     else if (ws->visible)  bc = with_alpha(C.current, 0.75f);
     else                   bw = SDL_max(1.0f, C.border * SC * 0.45f);
+    if (elsewhere && !selected) {
+        bc = with_alpha(ocol, 0.95f);
+        bw = SDL_max(1.5f, C.border * SC * 1.3f);
+    }
     stroke_round_rect(tile, rad, bw, bc);
 
     /* ---- tile header: count left, name centred, number right ---- */
@@ -4182,6 +4481,22 @@ static void draw_workspace(int idx)
         Tex t = text_make_fit(F_LABEL, buf[0] ? buf : "\xe2\x96\x8f", (int)(box.w - p));
         tex_draw(t, box.x + p * 0.5f, box.y + (box.h - (float)t.h) * 0.5f, C.text);
         tex_free(&t);
+    } else if (elsewhere && tb_w > 20.0f * SC) {
+        /* the monitor first, in its own colour, then the workspace */
+        Tex on = text_make_fit(F_LABEL, ws->output, (int)(tb_w * 0.55f));
+        float bh = (float)on.h + p * 0.5f;
+        SDL_FRect pill = { tb_x, top - p * 0.2f, (float)on.w + p, bh };
+        fill_round_rect(pill, bh * 0.35f, ocol);
+        tex_draw(on, pill.x + p * 0.5f, pill.y + (bh - (float)on.h) * 0.5f, C.bg);
+        tex_free(&on);
+
+        if (ws->title.t) {
+            float left = pill.x + pill.w + p * 0.6f;
+            Tex t = text_make_fit(F_LABEL, ws->name, (int)(tb_x + tb_w - left));
+            tex_draw(t, left, top + (bh - (float)t.h) * 0.5f - p * 0.2f,
+                     with_alpha(C.text, 0.9f));
+            tex_free(&t);
+        }
     } else if (ws->title.t && tb_w > 20.0f * SC) {
         Tex t = ws->title;
         float x = tb_x + (tb_w - (float)t.w) * 0.5f;
@@ -4411,8 +4726,37 @@ static void draw_outputs_map(void)
         if (r.w < 4.0f || r.h < 4.0f) continue;
 
         bool showing = strcmp(d->name, FOCUSED_OUTPUT) == 0;
-        fill_round_rect(r, rad, showing ? mix(C.tile_sel, C.hl, 0.25f)
-                                        : with_alpha(C.tile, 0.75f));
+
+        /* Held over: the plate presses in a little and fills from the left,
+         * so the wait reads as a button going down rather than a pause. */
+        float held = 0.0f;
+        if (i == MAP_HOVER && C.map_dwell_ms > 0)
+            held = SDL_clamp((float)((now_secs() - MAP_HOVER_SINCE) /
+                                     (C.map_dwell_ms / 1000.0)), 0.0f, 1.0f);
+        if (held > 0.0f) {
+            float in = held * SDL_min(r.w, r.h) * 0.06f;   /* pressed in */
+            r.x += in; r.y += in; r.w -= 2.0f * in; r.h -= 2.0f * in;
+        }
+
+        /* the same colour its workspaces wear while dragging, so the map and
+           the grid agree about which screen is which */
+        SDL_FColor oc = output_colour(d->name);
+        fill_round_rect(r, rad, showing ? mix(C.tile_sel, oc, 0.30f)
+                                        : mix(with_alpha(C.tile, 0.8f), oc, 0.35f));
+        stroke_round_rect(r, rad, SDL_max(1.0f, 1.2f * SC),
+                          with_alpha(oc, showing ? 0.95f : 0.7f));
+
+        if (held > 0.0f) {
+            SDL_FRect fillr = { r.x, r.y, r.w * held, r.h };
+            SDL_Rect clip = { (int)r.x, (int)r.y, (int)SDL_ceilf(fillr.w), (int)SDL_ceilf(r.h) };
+            SDL_Rect prev;
+            bool had = SDL_GetRenderClipRect(REN, &prev) && SDL_RenderClipEnabled(REN);
+            SDL_SetRenderClipRect(REN, &clip);
+            fill_round_rect(r, rad, with_alpha(C.hl, 0.55f + 0.35f * held));
+            SDL_SetRenderClipRect(REN, had ? &prev : NULL);
+            stroke_round_rect(r, rad, SDL_max(1.0f, 2.0f * SC), with_alpha(C.hl, 0.95f));
+        }
+
         if (d->focused)
             stroke_round_rect(r, rad, SDL_max(1.0f, 2.0f * SC),
                               with_alpha(C.current, 0.9f));
@@ -4421,9 +4765,56 @@ static void draw_outputs_map(void)
         if (t.t) {
             tex_draw(t, r.x + (r.w - (float)t.w) * 0.5f,
                      r.y + (r.h - (float)t.h) * 0.5f,
-                     showing ? C.hltext : C.subtext);
+                     showing ? C.hltext : with_alpha(C.text, 0.85f));
             tex_free(&t);
         }
+    }
+}
+
+/* Looking at a screen you are not sitting in front of is easy to forget, and
+ * everything you press lands over there. The whole overview gets a frame in
+ * that monitor's colour, the same one its workspaces and its plate on the map
+ * wear — hard to mistake for the ordinary view, impossible to miss. */
+static void draw_pinned_frame(void)
+{
+    if (!PINNED_OUTPUT || !FOCUSED_OUTPUT[0]) return;
+
+    SDL_FColor oc = output_colour(FOCUSED_OUTPUT);
+    float w = SDL_max(3.0f, 5.0f * SC);
+    SDL_FRect r = { w * 0.5f, w * 0.5f, (float)RW - w, (float)RH - w };
+    stroke_round_rect(r, C.radius * SC, w, with_alpha(oc, 0.9f));
+
+    /* and a second, softer one just inside it, so it reads as a frame rather
+       than a window border the compositor drew */
+    SDL_FRect inner = { r.x + w, r.y + w, r.w - 2.0f * w, r.h - 2.0f * w };
+    stroke_round_rect(inner, C.radius * SC, SDL_max(1.0f, 1.5f * SC),
+                      with_alpha(oc, 0.28f));
+}
+
+static void draw_cancel_target(void)
+{
+    if (CANCEL_RECT.w < 8.0f || !drag_active) return;
+
+    SDL_FRect r = CANCEL_RECT;
+    bool hot = drop_kind == DROP_CANCEL;
+    float rad = C.radius * SC;                 /* the same corner as a tile */
+
+    fill_round_rect(r, rad, hot ? with_alpha(C.urgent, 0.18f)
+                                : with_alpha(C.tile, 0.28f));
+    if (hot)
+        stroke_round_rect(r, rad, SDL_max(1.0f, 1.5f * SC),
+                          with_alpha(C.urgent, 0.85f));
+
+    /* A small ✕ in the middle, two strokes rather than a line of dots — the
+     * dots were what made it look chewed. */
+    float box = r.h * 0.20f, th = SDL_max(1.0f, 1.6f * SC);
+    SDL_FColor c = with_alpha(hot ? C.urgent : C.subtext, hot ? 0.95f : 0.45f);
+    float cx = r.x + r.w * 0.5f, cy = r.y + r.h * 0.5f;
+
+    set_col(c);
+    for (float o = -th * 0.5f; o <= th * 0.5f; o += 0.7f) {
+        SDL_RenderLine(REN, cx - box + o, cy - box, cx + box + o, cy + box);
+        SDL_RenderLine(REN, cx - box + o, cy + box, cx + box + o, cy - box);
     }
 }
 
@@ -4488,9 +4879,11 @@ static void render(void)
         if (i != sel_ws) draw_workspace(i);
     draw_workspace(sel_ws);                       /* selection is drawn last */
 
-    if (drag_active) draw_drop_indicator();
-
     draw_outputs_map();
+    draw_cancel_target();
+    draw_pinned_frame();
+
+    if (drag_active) draw_drop_indicator();
 
     float m = C.margin * SC;
     float head_x0 = (float)RW, head_x1 = 0.0f;
@@ -4501,15 +4894,14 @@ static void render(void)
                            : (float)RH - FOOTER_H * 0.5f - (float)T_HEADER.h * 0.5f;
         head_x0 = pos_x(C.header_pos, (float)T_HEADER.w, m);
         head_x1 = head_x0 + (float)T_HEADER.w;
+        SDL_FColor pin = output_colour(FOCUSED_OUTPUT);
         if (PINNED_OUTPUT) {                       /* not the screen you are on */
-            float p = 6.0f * SC;
+            float p = 8.0f * SC;
             SDL_FRect box = { head_x0 - p, y - p * 0.5f,
                               (float)T_HEADER.w + 2.0f * p, (float)T_HEADER.h + p };
-            fill_round_rect(box, box.h * 0.35f, with_alpha(C.hl, 0.22f));
-            stroke_round_rect(box, box.h * 0.35f, SDL_max(1.0f, 1.5f * SC),
-                              with_alpha(C.hl, 0.85f));
+            fill_round_rect(box, box.h * 0.35f, pin);
         }
-        tex_draw(T_HEADER, head_x0, y, PINNED_OUTPUT ? C.hl : C.hint);
+        tex_draw(T_HEADER, head_x0, y, PINNED_OUTPUT ? C.bg : C.hint);
     }
 
     if (T_QUERY.t) {
@@ -4543,7 +4935,6 @@ static void render(void)
 /* --------------------------------------------------------------- actions */
 
 static bool running = true;
-static bool dirty   = true;      /* a frame is only drawn when this is set */
 static bool BACKDROP;            /* drawn behind another program's window   */
 
 /* swbr writes a new set of numbers every few seconds; the overview sits open
@@ -4570,6 +4961,33 @@ static void cpu_poll(void)
     if (stat(path, &st) != 0 || st.st_mtime == CPU_MTIME) return;
     cpu_load();
     dirty = true;
+}
+
+/* A fullscreen window is above everything a normal window can reach, so an
+ * overlay that is not on the layer shell simply cannot be seen over it. The
+ * only honest way is to take it off fullscreen for as long as we are up, and
+ * put it back exactly as it was on the way out. */
+static int FS_RESTORE;
+
+static void fullscreen_step_aside(void)
+{
+    if (!C.over_fullscreen || BACKDROP) return;
+
+    for (int i = 0; i < NWIN; ++i) {
+        if (!WINS[i].fullscreen) continue;
+        if (FOCUSED_OUTPUT[0] && WINS[i].ws >= 0 && WINS[i].ws < NWS &&
+            strcmp(WSS[WINS[i].ws].output, FOCUSED_OUTPUT) != 0) continue;
+        FS_RESTORE = WINS[i].con_id;
+        sway_cmd("[con_id=%d] fullscreen disable", FS_RESTORE);
+        break;
+    }
+}
+
+static void fullscreen_put_back(void)
+{
+    if (FS_RESTORE <= 0) return;
+    sway_cmd("[con_id=%d] fullscreen enable", FS_RESTORE);
+    FS_RESTORE = 0;
 }
 
 static void reload_model(void)
@@ -4610,6 +5028,7 @@ static void reload_model(void)
 
     cpu_load();                  /* whatever swbr last measured */
     mark("cpu numbers");
+    if (!FS_RESTORE) fullscreen_step_aside();
     layout();
     apply_filter();
     rebuild_chrome();
@@ -4844,7 +5263,30 @@ static float        MOUSE_SCALE = 1.0f;
  * and gets back the workspace under them. It fades in so that picking an app
  * before the tree is even read shows nothing at all, rather than a frame that
  * flashes into view. */
+/* Anything else starting with a dash is a typo, and saying so beats doing
+ * nothing quietly — but only for names that are not options at all. */
+static bool arg_is_known(const char *a)
+{
+    static const char *KNOWN[] = {
+        "-h", "-n", "-v", "--help", "--version", "--info", "--usage",
+        "--workspaces", "--adopt", "--adopt-debug", "--adopt-focus",
+        "--adopt-timeout", "--adopt-wait", "--beside", "--edge", "--no-assign",
+        "--backdrop", "--backdrop-debug", "--timing", "--shot", "--mouse",
+        "--go", "--set", "--back", "--config", "--no-config", "--",
+    };
+    for (size_t i = 0; i < SDL_arraysize(KNOWN); ++i)
+        if (!strcmp(a, KNOWN[i])) return true;
+    return false;
+}
+
 static bool  BACKDROP;
+static int   OV_IN = 0, OV_OUT = 1;   /* the launcher's pipes, or our own
+                                         stdin and stdout when spawned */
+static bool  SERVING;                 /* a launcher of ours is in front */
+static void  serve_end(void);
+static void  backdrop_reply(const char *fmt, ...);
+static void  backdrop_raise_tick(void);
+static pid_t SERVE_PID;
 static float BACKDROP_A;              /* what is drawn now, 0..1 */
 static float BACKDROP_WANT = 1.0f;    /* where it is heading      */
 static bool  BACKDROP_LEAVING;
@@ -4977,6 +5419,68 @@ static int digit_from_scancode(SDL_Scancode sc)
 static void begin_edit(int idx);
 static void end_edit(bool commit);
 
+/* Hand the overview to a launcher without giving up being the overview.
+ *
+ * swas normally starts its own backdrop, so pressing `d` here would replace
+ * this window with an identical one. Instead it is started with two pipes and
+ * told to talk to us: the wheel appears in front, this stays behind it, and
+ * when the wheel is done we are still here. */
+static void serve_end(void)
+{
+    if (!SERVING) return;
+    SERVING = false;
+    if (OV_IN  > 2) close(OV_IN);
+    if (OV_OUT > 2) close(OV_OUT);
+    OV_IN = 0; OV_OUT = 1;
+    if (SERVE_PID > 0) { waitpid(SERVE_PID, NULL, WNOHANG); SERVE_PID = 0; }
+
+    drag_active = false;
+    drop_kind = DROP_NONE;
+    set_ghosts(-1, -1);
+    dirty = true;
+}
+
+static void serve_launcher(const char *cmd)
+{
+    if (!cmd || !*cmd || SERVING) return;
+
+    int to_swov[2], to_swas[2];
+    if (pipe(to_swov) != 0) return;                 /* swas -> us */
+    if (pipe(to_swas) != 0) { close(to_swov[0]); close(to_swov[1]); return; }
+
+    pid_t p = fork();
+    if (p < 0) {
+        close(to_swov[0]); close(to_swov[1]);
+        close(to_swas[0]); close(to_swas[1]);
+        return;
+    }
+    if (p == 0) {
+        char in[16], out[16];
+        snprintf(in,  sizeof(in),  "%d", to_swas[0]);   /* swas reads this */
+        snprintf(out, sizeof(out), "%d", to_swov[1]);   /* and writes this */
+        close(to_swov[0]);
+        close(to_swas[1]);
+        setenv("SWAS_OV_IN",  in,  1);
+        setenv("SWAS_OV_OUT", out, 1);
+        setsid();
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+
+    close(to_swov[1]);
+    close(to_swas[0]);
+    OV_IN  = to_swov[0];
+    OV_OUT = to_swas[1];
+    SERVE_PID = p;
+    SERVING = true;
+    fprintf(stderr, "swov: serving '%s' as its overview (pid %d)\n", cmd, (int)p);
+
+    int fl = fcntl(OV_IN, F_GETFL, 0);
+    if (fl != -1) fcntl(OV_IN, F_SETFL, fl | O_NONBLOCK);
+
+    backdrop_reply("ready");
+}
+
 static void handle_key(const SDL_KeyboardEvent *k)
 {
     bool shift = (k->mod & SDL_KMOD_SHIFT) != 0;
@@ -5096,6 +5600,10 @@ static void handle_key(const SDL_KeyboardEvent *k)
     case SDLK_TAB:
         if (k->mod & SDL_KMOD_CTRL) step_ws_row(shift ? -1 : 1);
         else                        step_ws(shift ? -1 : 1);
+        break;
+
+    case SDLK_D:                                   /* the launcher, in front */
+        if (C.launcher[0] && !SERVING) serve_launcher(C.launcher);
         break;
 
     case SDLK_W:                                   /* window level <-> workspace */
@@ -5318,6 +5826,8 @@ static void handle_mouse_motion(const SDL_MouseMotionEvent *mo)
     }
 
     if (drag_active) {
+        int dws = -1;
+        lift_update(mx, my, dws, hit_test(mx, my, &dws));
         drag_update_target(mx, my);
         dirty = true;
         return;
@@ -5325,6 +5835,7 @@ static void handle_mouse_motion(const SDL_MouseMotionEvent *mo)
 
     int ws_idx = -1;
     int win_idx = hit_test(mx, my, &ws_idx);
+    lift_update(mx, my, ws_idx, win_idx);
     if (ws_idx == hov_ws && win_idx == hov_win) return;
 
     hov_ws = ws_idx;
@@ -5430,7 +5941,11 @@ static void handle_event(const SDL_Event *e)
         break;
 
     case SDL_EVENT_WINDOW_FOCUS_LOST:
-        if (C.quit_on_focus_loss) running = false;
+        /* Losing the keyboard normally means the overview's moment has
+         * passed. Not while we are the backdrop for a launcher we started:
+         * that launcher taking the focus is the whole point, and quitting
+         * here is what made the overview vanish the instant swas appeared. */
+        if (C.quit_on_focus_loss && !SERVING && !BACKDROP) running = false;
         break;
 
     default:
@@ -5451,12 +5966,16 @@ static void handle_event(const SDL_Event *e)
  */
 static void backdrop_reply(const char *fmt, ...)
 {
+    char line[512];
     va_list ap;
     va_start(ap, fmt);
-    vprintf(fmt, ap);
+    int n = vsnprintf(line, sizeof(line) - 2, fmt, ap);
     va_end(ap);
-    fputc('\n', stdout);
-    fflush(stdout);
+    if (n < 0) return;
+    line[n] = '\n';
+    line[n + 1] = 0;
+    ssize_t w = write(OV_OUT, line, (size_t)n + 1);
+    (void)w;
 }
 
 static void backdrop_hover(float fx, float fy)
@@ -5465,7 +5984,7 @@ static void backdrop_hover(float fx, float fy)
 
     int si = slot_at(x, y);
     if (si >= 0 && SLOTS[si].ws < 0) {            /* a free number */
-        sel_active = false;
+
         drop_kind  = DROP_WIN_NEWWS;              /* the ghost lights up */
         drop_num   = SLOTS[si].num;
         drag_active = true;
@@ -5474,13 +5993,34 @@ static void backdrop_hover(float fx, float fy)
         return;
     }
 
+    if (point_in_cancel(x, y)) {              /* let go here and nothing happens */
+        drag_active = true;
+        drop_kind = DROP_CANCEL;
+        MAP_HOVER = -1;
+        dirty = true;
+        backdrop_reply("target none");
+        return;
+    }
+
+    /* over the map of the monitors: hold still and we step onto that one */
+    if (MAP_RECT.w > 0.0f) {
+        bool on_map = map_dwell_hover(x, y);
+        if (on_map) {
+
+            drag_active = false;
+            drop_kind = DROP_NONE;
+            backdrop_reply("target none");
+            return;
+        }
+    }
+
     int ws_idx = -1;
     int win_idx = hit_test(x, y, &ws_idx);
     drag_active = false;
     drop_kind = DROP_NONE;
 
     if (ws_idx < 0) {
-        sel_active = false;
+
         dirty = true;
         backdrop_reply("target none");
         return;
@@ -5555,6 +6095,7 @@ static bool backdrop_command(char *line)
         return true;
     }
     if (!strcmp(line, "drag on")) {
+        if (C.drop_outputs) show_all_outputs(true);
         /* The free numbers become ghost tiles to drop on, exactly as they do
          * when a window is dragged inside swov — dropping an app on a
          * workspace that does not exist yet has to work the same either way.
@@ -5565,6 +6106,8 @@ static bool backdrop_command(char *line)
         return true;
     }
     if (!strcmp(line, "drag off")) {
+        MAP_HOVER = -1;
+        show_all_outputs(false);
         set_ghosts(-1, -1);
         BLUR_WANT = 1.0f;
         drag_active = false;
@@ -5600,10 +6143,16 @@ static void backdrop_poll(void)
     static char buf[512];
     static int  len;
 
-    struct pollfd p = { 0, POLLIN, 0 };
+    struct pollfd p = { OV_IN, POLLIN, 0 };
     while (poll(&p, 1, 0) > 0 && (p.revents & (POLLIN | POLLHUP))) {
-        ssize_t n = read(0, buf + len, sizeof(buf) - 1 - (size_t)len);
-        if (n <= 0) { BACKDROP_LEAVING = true; return; }   /* parent is gone */
+        ssize_t n = read(OV_IN, buf + len, sizeof(buf) - 1 - (size_t)len);
+        if (n <= 0) {
+            /* Serving a launcher we started ourselves: it has finished, so
+             * go back to being an overview rather than leaving with it. */
+            if (SERVING) { serve_end(); len = 0; return; }
+            BACKDROP_LEAVING = true;
+            return;
+        }
         len += (int)n;
         buf[len] = 0;
 
@@ -5642,9 +6191,59 @@ static void backdrop_raise_tick(void)
 }
 
 /* ease towards the wanted alpha; leaving means fade out, then exit */
+/* the hold, checked every frame: the pointer may have stopped moving, so no
+ * further hover ever arrives */
+static void map_dwell_tick(void)
+{
+    if (MAP_HOVER < 0) return;
+    dirty = true;                                  /* the fill is growing */
+
+    double want = C.map_dwell_ms / 1000.0;
+    if (want <= 0.0) want = 0.001;
+    if (now_secs() - MAP_HOVER_SINCE < want) return;
+
+    str_set(FOCUSED_OUTPUT, sizeof(FOCUSED_OUTPUT), OUTS[MAP_HOVER].name);
+    PINNED_OUTPUT = strcmp(FOCUSED_OUTPUT, HOME_OUTPUT) != 0;
+    MAP_HOVER = -1;
+
+    /* A window being dragged from here is about to vanish from the model —
+     * it lives on the screen we are leaving. Keep hold of its id so it can
+     * still be dropped on the screen we are arriving at. */
+    if (press_win >= 0) DRAG_CON = WINS[press_win].con_id;
+
+    drop_kind = DROP_NONE;
+    drop_ws = drop_win = -1;
+    press_win = press_ws = -1;
+    sel_active = false;
+    reload_model();
+
+    if (DRAG_CON > 0) {                            /* find it again, or keep
+                                                      dragging by id alone */
+        for (int i = 0; i < NWIN; ++i)
+            if (WINS[i].con_id == DRAG_CON) { press_win = i; break; }
+    }
+
+    /* The drag is still in the air — a screen changed under it, nothing was
+     * let go of. Say so, or a launcher waiting on the other end of the pipe
+     * acts on the target it had a moment ago. */
+    if (BACKDROP || SERVING) {
+        drag_active = true;
+        set_ghosts(C.drop_ghosts ? 0 : -1, C.drop_ghosts ? 10 : -1);
+        backdrop_reply("target none");
+
+        /* The app on the pointer is drawn by the launcher, on its own
+         * surface. Redrawing everything here is enough for sway to put this
+         * window in front of it, and then the icon is behind the overview
+         * for the rest of the drag. Ask for it back. */
+        if (RAISE_APP[0]) { RAISE_LEFT = 3; RAISE_AT = 0.0; }
+    }
+    dirty = true;
+}
+
 static void backdrop_step(float ms)
 {
     backdrop_raise_tick();
+    map_dwell_tick();
 
     if (BACKDROP_LEAVING) BACKDROP_WANT = 0.0f;
 
@@ -5846,6 +6445,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--adopt-focus")) adopt_focus = true;
         else if (!strcmp(a, "--adopt-debug")) ADOPT_LOG = true;
         else if (!strcmp(a, "--timing")) TIMING = true;
+        else if (a[0] == '-' && !strchr(a, '=') && !arg_is_known(a))
+            fprintf(stderr, "swov: unknown option '%s' (see --help)\n", a);
         else if (!strcmp(a, "--no-assign")) adopt_no_assign = true;
         else if (!strcmp(a, "--beside") && i + 1 < argc) adopt_beside = atoi(argv[++i]);
         else if (!strcmp(a, "--edge") && i + 1 < argc)   adopt_edge = argv[++i];
@@ -6157,16 +6758,18 @@ int main(int argc, char **argv)
         SDL_Event e;
         if (anim_running()) dirty = true;
         cpu_poll();
+        if (drag_active) map_dwell_tick();
 
-        if (BACKDROP) {
+        if (BACKDROP || SERVING) {
             backdrop_poll();
+            if (SERVING) backdrop_raise_tick();
             Uint64 now = SDL_GetTicks();
-            backdrop_step((float)(now - last_tick));
+            if (BACKDROP) backdrop_step((float)(now - last_tick));
             last_tick = now;
             if (!running) break;
         }
 
-        if (SDL_WaitEventTimeout(&e, BACKDROP ? 8
+        if (SDL_WaitEventTimeout(&e, (BACKDROP || SERVING) ? 8
                                     : (anim_running() || pending_reload) ? 8 : 60)) {
             handle_event(&e);
             while (running && SDL_PollEvent(&e)) handle_event(&e);   /* coalesce */
@@ -6210,6 +6813,7 @@ int main(int argc, char **argv)
     TTF_Quit();
     SDL_DestroyRenderer(REN);
     SDL_DestroyWindow(WIN_HANDLE);
+    fullscreen_put_back();
     SDL_Quit();
     if (sway_fd >= 0) close(sway_fd);
     if (sway_evt_fd >= 0) close(sway_evt_fd);

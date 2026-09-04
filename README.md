@@ -45,6 +45,7 @@ for_window [app_id="swov"] floating enable, border none
 | `space`, right click | mark or unmark a window (marks are what the next action applies to) |
 | `shift+space`, `a` | mark or unmark the whole workspace |
 | `c` | clear all marks |
+| `d` | open the launcher (`swas`) and step aside |
 | `x`, `del` | close marked or selected windows, `enter` confirms |
 | middle click | close that window straight away |
 | `f` | find windows by app id, title or workspace name, highlighting the hits |
@@ -68,6 +69,18 @@ Press, move, release. `Esc` cancels.
 
 A floating or fullscreen window is grabbed by its name plate — the rest of it is
 click-through, so the windows underneath stay selectable.
+
+The window on the pointer keeps its place in the grid while you drag it,
+sunk halfway into the background with an accent border — the only thing on
+screen wearing that colour, so there is no forgetting which one you picked up.
+
+A floating window is drawn see-through and answers the pointer only through
+its name plate, so the windows underneath stay reachable. Touch that plate and
+it comes forward — solid, framed in accent with a soft halo around it, and
+taking the whole of itself — so its edges can be
+aimed at and an app dropped inside it. It is given up when the pointer leaves
+its card, and for one that covers the whole workspace, in a band around the
+edge of the tile, since otherwise there would be no way back out.
 
 **A window** onto a tile moves it there. Onto the left or right edge of another
 window it lands beside it, splitting horizontally; top or bottom splits
@@ -207,13 +220,63 @@ it is in the same spot whichever screen you are looking at, and it never
 collides with anything. `outputs_map_w` is how wide it is as a share of the
 tile area (0.18 by default), `outputs_map=0` turns it off.
 
-Click a monitor and the overview shows *its* workspaces instead. The one you
+Each monitor wears the same colour as its workspaces do while dragging, so
+the map and the grid agree about which screen is which. Click one and the
+overview shows *its* workspaces instead. The one you
 are looking at is filled in, the one sway is really on keeps a ring, and while
-those differ the header says `viewing DP-1` in a highlighted box — everything
+those differ the whole overview is framed in that monitor's colour — the same
+one its workspaces and its plate wear — with `viewing DP-1` in the header on a
+solid badge of it — everything
 you do from there, every key and every drop, lands on that screen. Clicking
 the one you are already looking at goes back to following sway.
 
+While anything is being dragged, the workspaces of your **other screens**
+appear alongside this one's, each wearing its monitor's colour — the tile is
+tinted with it, the border is it, and the output name sits in a filled badge
+of it where the workspace name usually goes. The colours are the accent turned
+around the wheel by the golden angle, one step per screen, so two monitors
+never look alike and none of them lands on `hl` — that one already means "this
+is where you are" — so a window or an app goes straight onto workspace 8 on the
+other monitor without changing what you are looking at. `drop_outputs=0`
+keeps them out.
+
+Holding a drag over a monitor in the map switches to that one after
+`map_dwell_ms`, which is off by default now that the workspaces come to you — an app coming from swas, a window, or a whole workspace. The press
+has to be still: any movement starts the wait again, so brushing past a plate
+on the way somewhere else never triggers it. A window carries on being
+dragged across the change, so it can be dropped on the screen you arrive at,
+and a launcher is told the target is void at the moment of the switch — the
+drag is still in the air, nothing was let go of. The plate presses in and
+fills as you hold, so the wait reads as a button going down; moving off before
+it completes cancels. That way a drag that started on one screen can finish on
+another.
+
 `swov output=DP-1` starts on a given screen.
+
+swov's own window is on the workspace like anything else, so it is drawn —
+leaving a hole where it sits would be worse — but it is never selectable,
+droppable or in the way.
+
+While something is being dragged, a ✕ bar runs along the bottom from the
+monitor map to the right edge. Dragging downwards is enough to reach it — no
+aiming, no corner to find — and letting go there does nothing at all. Letting
+go there does nothing at all — the same as dropping it back where it came
+from, but without having to find that spot again.
+
+swas is started with two pipes and told to talk to *this* overview rather
+than bringing up its own, so the wheel appears in front and this window stays
+where it is. Pick an app, drop it, and the wheel closes again — the overview
+is still there, on the same screen, with the same selection. `launcher=`
+changes the command; the whole thing is one argument, so it needs quoting on
+a shell: `swov 'launcher=swas --replace overview=1'`. It is the default, so
+pressing `d` works without setting anything.
+
+## Over a fullscreen window
+
+A fullscreen window sits above everything an ordinary window can reach, so an
+overlay that is not on the layer shell cannot be drawn over it. swov takes it
+off fullscreen while it is up and puts it back exactly as it was on the way
+out. `over_fullscreen=0` leaves it alone, and swov opens behind it.
 
 ## Workspace usage
 
@@ -293,6 +356,11 @@ lists them. The file above is read after it, so swov's own config always wins.
 | `drop_ghosts` | offer the free numbers while an app is dragged over the backdrop |
 | `cpu`, `cpu_min`, `cpu_full` | the load dot, and the range it covers |
 | `outputs_map`, `outputs_map_w`, `output` | the monitor map, its width, and which screen to start on |
+| `drop_outputs` | show the other screens' workspaces while dragging |
+| `over_fullscreen` | un-fullscreen whatever is in the way, and restore it on exit |
+| `map_dwell_ms` | hold a drag over a monitor this long to switch to it; `0` is off |
+| `launcher` | what `d` opens; `swas --replace overview=1` by default |
+| `cancel_drop` | the ✕ beside the monitor map: let a drag go there and nothing happens |
 | `track`, `usage_dots`, `dot_count`, `dot_px` | usage recording and its dot scale |
 | `start_selection` | `workspace`, `none` or `window` |
 | `cols`, `rows` | force the grid; default picks the largest tiles |
