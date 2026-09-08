@@ -238,8 +238,13 @@ collides with anything. `outputs_map_w` is how wide it is as a share of the
 tile area (0.18 by default), `outputs_map=0` turns it off.
 
 Each monitor wears the same colour as its workspaces do while dragging, so
-the map and the grid agree about which screen is which. Click one and the
-overview shows *its* workspaces instead. The one you
+the map and the grid agree about which screen is which. One border each: how
+strongly a plate is filled says which screen is being shown, and a dot in its
+corner says which one sway is actually on.
+
+Click a monitor and the overview shows *its* workspaces instead. Drag a
+workspace onto one and it moves to that screen whole; drag a window onto one
+and it goes to whatever workspace is showing there. The one you
 are looking at is filled in, the one sway is really on keeps a ring, and while
 those differ the whole overview is framed in that monitor's colour — the same
 one its workspaces and its plate wear — with `viewing DP-1` in the header on a

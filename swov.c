@@ -2318,6 +2318,7 @@ static SDL_FRect CANCEL_RECT;           /* and the ✕ beside it, while dragging
  * press you hold, so it shows how far along it is. */
 static int    MAP_HOVER = -1;
 static int    DRAG_CON;          /* the window being dragged, by id */
+static int    drop_out = -1;     /* the monitor a drag is over, in the map */
 static int    SNAP_WIN = -1;     /* the card a floating drag is resting on */
 static double SNAP_AT;           /* ...and since when */
 static float  SNAP_X, SNAP_Y;    /* where the pointer was when it settled */
@@ -3643,7 +3644,8 @@ typedef enum {
     DROP_WS_NUM,     /* workspace onto a free number (a ghost slot)        */
     DROP_WIN_NEWWS,  /* window onto a free number: sway creates it          */
     DROP_WS_EDGE,    /* window along one edge of a tile: beside the lot      */
-    DROP_CANCEL      /* the ✕ beside the monitors: let go and nothing happens */
+    DROP_CANCEL,     /* the ✕ beside the monitors: let go and nothing happens */
+    DROP_OUTPUT      /* onto a monitor in the map: send it to that screen     */
 } DropKind;
 
 enum { EDGE_LEFT, EDGE_RIGHT, EDGE_TOP, EDGE_BOTTOM };
@@ -3766,6 +3768,9 @@ static bool map_dwell_hover(float x, float y)
     }
     if (on >= 0 && strcmp(OUTS[on].name, FOCUSED_OUTPUT) == 0) on = -1;
 
+    if (on >= 0) { drop_kind = DROP_OUTPUT; drop_out = on; }
+    else if (drop_kind == DROP_OUTPUT) { drop_kind = DROP_NONE; drop_out = -1; }
+
     float moved = SDL_fabsf(x - MAP_HOVER_X) + SDL_fabsf(y - MAP_HOVER_Y);
     if (on != MAP_HOVER || moved > 4.0f * SC) {
         MAP_HOVER = on;
@@ -3786,9 +3791,8 @@ static void drag_update_target(float x, float y)
         return;
     }
     if (map_dwell_hover(x, y)) {          /* over a monitor: nothing else */
-        drop_kind = DROP_NONE;
         drop_ws = drop_win = drop_num = -1;
-        return;
+        return;                           /* map_dwell_hover set the kind */
     }
 
     drop_kind = DROP_NONE;
@@ -4195,6 +4199,21 @@ static void drag_finish(void)
                      WINS[press_win].con_id, drop_num);
         break;
 
+    case DROP_OUTPUT:
+        /* Onto a screen in the map: send it there. A workspace moves whole,
+         * a window goes to whatever workspace is showing on that screen. */
+        if (drop_out >= 0 && drop_out < NOUTS) {
+            char *o = escape_arg(OUTS[drop_out].name);
+            if (drag_ws_mode && press_ws >= 0 && WSS[press_ws].num >= 0)
+                sway_cmd("workspace number %d; move workspace to output \"%s\"",
+                         WSS[press_ws].num, o);
+            else if (press_win >= 0)
+                sway_cmd("[con_id=%d] move container to output \"%s\"",
+                         WINS[press_win].con_id, o);
+            free(o);
+        }
+        break;
+
     case DROP_CANCEL:                        /* put down where it started */
     case DROP_NONE:
     default:
@@ -4375,6 +4394,25 @@ static void draw_card(Win *w, bool tile_selected)
      * all round, as before. */
     bool is_tab   = w->has_tab && w->card.h <= w->tab.h + 1.0f;
     bool is_panel = w->has_tab && !is_tab;
+
+    /* The one on top shows its contents below, so its own tab was never
+     * drawn: with two windows you saw a single tab and could not tell a pair
+     * from one window with a title. It gets a tab like the others, filled
+     * rather than outlined because it is the one you are looking at. */
+    if (is_panel) {
+        SDL_FRect tb = xf(w->tab);
+        float trad = SDL_min(rad, SDL_min(tb.w, tb.h) * 0.4f);
+        fill_round_side(tb, trad, true, false,
+                        w->focused ? C.card_focus : mix(C.card, C.bg, 0.10f));
+        stroke_round_rect(tb, trad, SDL_max(1.0f, C.border * SC * 0.5f),
+                          with_alpha(C.accent, 0.45f));
+        if (w->label.t) {
+            float lx = tb.x + (tb.w - (float)w->label.w) * 0.5f;
+            float ly = tb.y + (tb.h - (float)w->label.h) * 0.5f;
+            if ((float)w->label.w < tb.w - 6.0f * SC)
+                tex_draw(w->label, lx, ly, C.text);
+        }
+    }
 
     if (w->floating) drop_shadow(r, rad, 9.0f * SC, with_alpha(C.shadow_col, C.shadow_col.a * over));
     if (is_tab)        fill_round_side(r, rad, true, false, fill);
@@ -4928,13 +4966,14 @@ static void draw_outputs_map(void)
             r.x += in; r.y += in; r.w -= 2.0f * in; r.h -= 2.0f * in;
         }
 
-        /* the same colour its workspaces wear while dragging, so the map and
-           the grid agree about which screen is which */
+        /* One border, in the same colour its workspaces wear while dragging.
+           Two rings and two fills competing for the same plate was what made
+           this look muddled: which screen is being shown is said by how
+           strongly it is filled, and which one sway is on by a dot. */
         SDL_FColor oc = output_colour(d->name);
-        fill_round_rect(r, rad, showing ? mix(C.tile_sel, oc, 0.30f)
-                                        : mix(with_alpha(C.tile, 0.8f), oc, 0.35f));
-        stroke_round_rect(r, rad, SDL_max(1.0f, 1.2f * SC),
-                          with_alpha(oc, showing ? 0.95f : 0.7f));
+        fill_round_rect(r, rad, with_alpha(oc, showing ? 0.55f : 0.18f));
+        stroke_round_rect(r, rad, SDL_max(1.0f, (showing ? 2.0f : 1.2f) * SC),
+                          with_alpha(oc, showing ? 1.0f : 0.55f));
 
         if (held > 0.0f) {
             SDL_FRect fillr = { r.x, r.y, r.w * held, r.h };
@@ -4947,15 +4986,22 @@ static void draw_outputs_map(void)
             stroke_round_rect(r, rad, SDL_max(1.0f, 2.0f * SC), with_alpha(C.hl, 0.95f));
         }
 
-        if (d->focused)
-            stroke_round_rect(r, rad, SDL_max(1.0f, 2.0f * SC),
-                              with_alpha(C.current, 0.9f));
+        if (drag_active && drop_kind == DROP_OUTPUT && drop_out == i) {
+            fill_round_rect(r, rad, with_alpha(oc, 0.75f));
+            stroke_round_rect(r, rad, SDL_max(2.0f, 3.0f * SC), C.hl);
+        }
+
+        if (d->focused) {                     /* where sway actually is */
+            float dot = SDL_min(6.0f * SC, SDL_min(r.w, r.h) * 0.22f);
+            SDL_FRect p = { r.x + dot * 0.7f, r.y + dot * 0.7f, dot, dot };
+            fill_round_rect(p, dot * 0.5f, C.current);
+        }
 
         Tex t = text_make_fit(F_HINT, d->name, (int)(r.w - 4.0f * SC));
         if (t.t) {
             tex_draw(t, r.x + (r.w - (float)t.w) * 0.5f,
                      r.y + (r.h - (float)t.h) * 0.5f,
-                     showing ? C.hltext : with_alpha(C.text, 0.85f));
+                     showing ? C.bg : with_alpha(C.text, 0.9f));
             tex_free(&t);
         }
     }
