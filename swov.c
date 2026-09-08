@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/file.h>
@@ -233,6 +234,8 @@ typedef struct {
     int   drop_outputs;      /* mid-drag, show every screen's workspaces    */
     int   over_fullscreen;   /* un-fullscreen what is in the way, and put
                                 it back on the way out                      */
+    int   snap_ms;           /* hold a floating window over another this
+                                long to put it into the layout instead      */
     int   cpu;               /* the load dots on a tile, measured by swbr   */
     float cpu_idle;          /* under this, nothing is happening at all     */
     float cpu_min, cpu_full; /* the scale, in cores                         */
@@ -296,6 +299,7 @@ static Cfg cfg_defaults(void)
     c.drop_ghosts = 1;
     c.drop_outputs = 1;
     c.over_fullscreen = 1;
+    c.snap_ms = 1000;
     c.cpu_idle   = 0.01f;    /* cores; under this nothing is happening */
     c.cpu_min    = 0.25f;    /* cores, not a share of the machine */
     c.cpu_full   = 4.0f;
@@ -392,6 +396,7 @@ static void cfg_set(Cfg *c, const char *k, const char *v)
     else if (key_is(k,"drop_ghosts")) c->drop_ghosts = atoi(v) != 0;
     else if (key_is(k,"drop_outputs")) c->drop_outputs = atoi(v) != 0;
     else if (key_is(k,"over_fullscreen")) c->over_fullscreen = atoi(v) != 0;
+    else if (key_is(k,"snap_ms")) c->snap_ms = atoi(v);
     else if (key_is(k,"cpu_idle"))  c->cpu_idle = (float)atof(v);
     else if (key_is(k,"cpu_min"))   c->cpu_min = (float)atof(v);
     else if (key_is(k,"cpu_full"))  c->cpu_full = (float)atof(v);
@@ -2313,6 +2318,10 @@ static SDL_FRect CANCEL_RECT;           /* and the ✕ beside it, while dragging
  * press you hold, so it shows how far along it is. */
 static int    MAP_HOVER = -1;
 static int    DRAG_CON;          /* the window being dragged, by id */
+static int    SNAP_WIN = -1;     /* the card a floating drag is resting on */
+static double SNAP_AT;           /* ...and since when */
+static float  SNAP_X, SNAP_Y;    /* where the pointer was when it settled */
+static bool   SNAP_DONE;         /* the hold finished: now pick an edge */
 static double MAP_HOVER_SINCE;
 static float  MAP_HOVER_X, MAP_HOVER_Y;
 
@@ -3512,6 +3521,24 @@ static void navigate(int dx, int dy)
     }
 }
 
+/* How good a hit is, lowest first.
+ *
+ * What you typed is nearly always the start of a window's title, so that wins
+ * outright; then the title anywhere, then the application, then the workspace
+ * it happens to sit on. Ties go alphabetically, so the same query always
+ * lands on the same window. */
+static int match_score(const Win *w)
+{
+    if (qlen == 0) return 100;
+    if (!strncasecmp(w->title, query, (size_t)qlen))   return 0;
+    if (ci_contains(w->title, query))                  return 1;
+    if (!strncasecmp(w->app_id, query, (size_t)qlen))  return 2;
+    if (ci_contains(w->app_id, query))                 return 3;
+    if (ci_contains(w->app_key, query))                return 4;
+    if (ci_contains(w->ws_name, query))                return 5;
+    return 100;
+}
+
 static void apply_filter(void)
 {
     for (int i = 0; i < NWIN; ++i) {
@@ -3520,10 +3547,23 @@ static void apply_filter(void)
                    ci_contains(w->app_id, query) || ci_contains(w->app_key, query) ||
                    ci_contains(w->ws_name, query);
     }
-    if (qlen > 0) {                       /* jump to the first workspace with a hit */
-        for (int i = 0; i < NWS; ++i) {
-            int v = ws_first_visible_match(&WSS[i]);
-            if (v >= 0) { sel_ws = i; WSS[i].sel = v; sel_active = true; return; }
+    if (qlen > 0) {                       /* jump to the best hit, not the first */
+        int best = -1, best_score = 100;
+        for (int i = 0; i < NWIN; ++i) {
+            Win *w = &WINS[i];
+            if (!w->match || w->is_self || !win_visible(w)) continue;
+            int sc = match_score(w);
+            if (sc > 5) continue;
+            if (best < 0 || sc < best_score ||
+                (sc == best_score && strcasecmp(w->title, WINS[best].title) < 0)) {
+                best = i; best_score = sc;
+            }
+        }
+        if (best >= 0 && WINS[best].ws >= 0 && WINS[best].ws < NWS) {
+            sel_ws = WINS[best].ws;
+            WSS[sel_ws].sel = best - WSS[sel_ws].first;
+            sel_active = true;
+            return;
         }
         /* Nothing matched. Leaving the previous selection lit says something
          * was found and points at the wrong thing; enter would then act on
@@ -3806,12 +3846,43 @@ static void drag_update_target(float x, float y)
     }
 
     if (win_idx >= 0 && win_idx != press_win) {
+        /* A floating window is being moved, not filed away. Passing over
+         * other windows on the way somewhere should not tile it — so it
+         * simply lands on that workspace, still floating, unless you hold
+         * still over one. Hold, and it snaps into the layout beside it: the
+         * card fills up while you wait, and the edge bar appears when it is
+         * ready. A tiled window has no such doubt and snaps at once. */
+        bool floaty = press_win >= 0 && WINS[press_win].floating && C.snap_ms > 0;
+        if (floaty) {
+            if (SNAP_WIN != win_idx) {
+                SNAP_WIN = win_idx; SNAP_AT = now_secs();
+                SNAP_X = x; SNAP_Y = y; SNAP_DONE = false;
+            } else if (!SNAP_DONE &&
+                       SDL_fabsf(x - SNAP_X) + SDL_fabsf(y - SNAP_Y) > 4.0f * SC) {
+                SNAP_AT = now_secs();          /* still moving: not deliberate */
+                SNAP_X = x; SNAP_Y = y;
+            }
+
+            if (!SNAP_DONE && (now_secs() - SNAP_AT) * 1000.0 < (double)C.snap_ms) {
+                drop_kind = DROP_WIN_WS;      /* move it there, keep it floating */
+                drop_ws   = ws_idx;
+                drop_win  = -1;
+                return;
+            }
+            /* Once it has snapped, moving about picks the edge rather than
+             * starting the wait again — the decision has been made. */
+            SNAP_DONE = true;
+        } else {
+            SNAP_WIN = -1;
+        }
+
         drop_kind = DROP_WIN_NEAR;
         drop_win  = win_idx;
         drop_ws   = ws_idx;
         drop_edge = edge_at(WINS[win_idx].card, x, y);
         return;
     }
+    SNAP_WIN = -1;
     if (win_idx < 0) {
         drop_kind = DROP_WIN_WS;
         drop_ws   = ws_idx;
@@ -3936,8 +4007,20 @@ static void act_ws_insert(int ws_idx, int num)
 
 /* Put the dragged window next to `target`, splitting the target the right
  * way first. A mark is the only reliable way to say "there" to sway. */
+/* A floating window dropped next to a tiled one has to stop floating, or
+ * sway puts it where it likes and the split you asked for never happens.
+ * Dropped on the open part of a workspace it stays floating: that is the
+ * difference between "put this in the layout" and "move this over there". */
+static void unfloat_for_layout(Win *drag)
+{
+    if (!drag || !drag->floating) return;
+    sway_cmd("[con_id=%d] floating disable", drag->con_id);
+    drag->floating = false;
+}
+
 static void act_win_drop_near(Win *drag, Win *target, int edge)
 {
+    unfloat_for_layout(drag);
     if (!drag || !target || drag == target) return;
     bool horiz = (edge == EDGE_LEFT || edge == EDGE_RIGHT);
 
@@ -4044,6 +4127,7 @@ static void move_to_ws_edge_named(int con_id, const char *ws, const char *edge)
  * sway can be asked for directly. */
 static void act_win_drop_edge(Win *drag, const Ws *ws, int edge)
 {
+    unfloat_for_layout(drag);
     bool pop = false;
     int  ref = ws_edge_ref(ws, edge, &pop);
 
@@ -4118,6 +4202,8 @@ static void drag_finish(void)
     }
 
     show_all_outputs(false);
+    SNAP_WIN = -1;
+    SNAP_DONE = false;
     DRAG_CON = 0;
     drag_active = drag_ws_mode = false;
     drop_kind = DROP_NONE;
@@ -4141,6 +4227,7 @@ static void drag_cancel(void)
 /* ---------------------------------------------------------------- chrome */
 
 static Tex T_HEADER, T_HINTS, T_QUERY;
+static double QUERY_FLASH;   /* enter on a query that found nothing */
 
 static void rebuild_chrome(void)
 {
@@ -4297,6 +4384,19 @@ static void draw_card(Win *w, bool tile_selected)
     /* border: what is being dragged beats everything, then selection, hover,
        mark, plain */
     float bw = SDL_max(1.0f, C.border * SC * 0.75f);
+    /* the hold that turns a move into a snap, filling from the bottom */
+    if (drag_active && !SNAP_DONE && SNAP_WIN >= 0 && SNAP_WIN < NWIN &&
+        &WINS[SNAP_WIN] == w && C.snap_ms > 0) {
+        float k = (float)((now_secs() - SNAP_AT) * 1000.0 / (double)C.snap_ms);
+        k = SDL_clamp(k, 0.0f, 1.0f);
+        if (k < 1.0f) {
+            SDL_FRect fillr = { r.x, r.y + r.h * (1.0f - k), r.w, r.h * k };
+            fill_round_rect(fillr, rad * 0.5f, with_alpha(C.accent, 0.22f));
+            stroke_round_rect(r, rad, SDL_max(1.0f, 2.0f * SC),
+                              with_alpha(C.accent, 0.35f + 0.5f * k));
+        }
+    }
+
     if (lifted && !being_dragged) {
         /* it has come forward: a heavier accent frame, and a soft one just
            outside it so it reads as raised rather than merely outlined */
@@ -5000,8 +5100,20 @@ static void render(void)
                           (HEADER_H - (float)T_QUERY.h) * 0.55f - p * 0.5f,
                           (float)T_QUERY.w + 2.0f * p, (float)T_QUERY.h + p };
         SDL_FColor qc = confirm_kill ? C.urgent : (filtering ? C.accent : C.match);
-        fill_round_rect(box, box.h * 0.35f, mix(C.tile, C.bg, 0.15f));
-        stroke_round_rect(box, box.h * 0.35f, SDL_max(1.0f, 1.5f * SC), with_alpha(qc, 0.8f));
+
+        /* pressed enter on a query that matched nothing: the field answers */
+        float flash = 0.0f;
+        if (QUERY_FLASH > 0.0) {
+            flash = 1.0f - (float)((now_secs() - QUERY_FLASH) / 0.6);
+            if (flash <= 0.0f) { QUERY_FLASH = 0.0; flash = 0.0f; }
+            else { qc = mix(qc, C.urgent, flash); dirty = true; }
+        }
+
+        fill_round_rect(box, box.h * 0.35f,
+                        mix(mix(C.tile, C.bg, 0.15f), C.urgent, flash * 0.30f));
+        stroke_round_rect(box, box.h * 0.35f,
+                          SDL_max(1.0f, (1.5f + 1.5f * flash) * SC),
+                          with_alpha(qc, 0.8f + 0.2f * flash));
         tex_draw(T_QUERY, box.x + p, box.y + p * 0.5f, qc);
     }
 
@@ -5684,6 +5796,10 @@ static void handle_key(const SDL_KeyboardEvent *k)
     case SDLK_RETURN:
     case SDLK_KP_ENTER:
         if (NWS == 0) { running = false; break; }
+        /* A query that found nothing has no selection to act on. Leaving and
+         * switching to whatever happened to be selected before is the worst
+         * of the possible answers; the field says no instead. */
+        if (qlen > 0 && !sel_active) { QUERY_FLASH = now_secs(); dirty = true; break; }
         if (ws_sel_win(&WSS[sel_ws])) act_focus_window(ws_sel_win(&WSS[sel_ws]));
         else                          act_goto_workspace(&WSS[sel_ws]);
         break;
@@ -6850,7 +6966,15 @@ int main(int argc, char **argv)
         SDL_Event e;
         if (anim_running()) dirty = true;
         cpu_poll();
-        if (drag_active) map_dwell_tick();
+        if (drag_active) {
+            map_dwell_tick();
+            if (SNAP_WIN >= 0) {          /* the hold is running: keep drawing */
+                float mx, my;
+                SDL_GetMouseState(&mx, &my);
+                drag_update_target(mx * MOUSE_SCALE, my * MOUSE_SCALE);
+                dirty = true;
+            }
+        }
 
         if (BACKDROP || SERVING) {
             backdrop_poll();

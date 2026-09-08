@@ -48,7 +48,7 @@ for_window [app_id="swov"] floating enable, border none
 | `d` | open the launcher (`swas`) and step aside |
 | `x`, `del` | close marked or selected windows, `enter` confirms |
 | middle click | close that window straight away |
-| `f` | find windows by app id, title or workspace name, highlighting the hits; nothing is selected while nothing matches |
+| `f` | find windows by title, app id or workspace name; the best hit is selected, nothing is while nothing matches |
 | `/` | filter: same search, but hides everything else |
 | `r` | reload |
 | `esc` | cancel a drag, else quit |
@@ -81,6 +81,23 @@ taking the whole of itself — so its edges can be
 aimed at and an app dropped inside it. It is given up when the pointer leaves
 its card, and for one that covers the whole workspace, in a band around the
 edge of the tile, since otherwise there would be no way back out.
+
+What you typed is nearly always the start of a window's title, so a title
+that begins with it wins outright; then a title containing it, then the
+application, then the workspace it sits on. Ties go alphabetically, so the
+same query always lands on the same window. Pressing enter on a query that
+found nothing flashes the field rather than acting on whatever was selected
+before.
+
+A **floating** window is being moved, not filed away, so passing over other
+windows on the way somewhere does not tile it: it lands on that workspace and
+stays floating. Hold still over one for `snap_ms` (1 s) and it snaps into
+the layout beside it instead — the card fills up while you wait, and the edge
+bar appears when it is ready. Moving the pointer starts the wait again, so it
+takes a deliberate pause rather than a slow pass. Once it has snapped, moving
+about picks which edge; the decision has been made. `snap_ms=0` goes back to tiling immediately.
+
+A tiled window has no such doubt and snaps at once, as before.
 
 **A window** onto a tile moves it there. Onto the left or right edge of another
 window it lands beside it, splitting horizontally; top or bottom splits
@@ -371,6 +388,7 @@ lists them. The file above is read after it, so swov's own config always wins.
 | `outputs_map`, `outputs_map_w`, `output` | the monitor map, its width, and which screen to start on |
 | `drop_outputs` | show the other screens' workspaces while dragging |
 | `over_fullscreen` | un-fullscreen whatever is in the way, and restore it on exit |
+| `snap_ms` | hold a floating window over another this long to tile it; `0` = at once |
 | `map_dwell_ms` | hold a drag over a monitor this long to switch to it; `0` is off |
 | `launcher` | what `d` opens; `swas --replace overview=1` by default |
 | `tab` | `recent` walks the last used apps, `workspace` walks workspaces |

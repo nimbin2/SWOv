@@ -50,6 +50,11 @@ tab=recent         # what tab walks: recent = the apps you used last, in that
 launcher=swas --replace overview=1
                    # what `d` opens. swas draws its own backdrop, so swov
                    # steps aside rather than stacking two overlays
+snap_ms=1000       # dragging a floating window: hold it still over another
+                   # this long and it snaps into the layout beside it. Moving
+                   # starts the wait again. Without the hold it just moves to
+                   # that workspace, still floating.
+                   # 0 = tile as soon as it is over a window
 over_fullscreen=1  # a fullscreen window is above anything a normal window
                    # can reach, so swov takes it off fullscreen while it is
                    # open and puts it back on the way out. 0 = open behind it
