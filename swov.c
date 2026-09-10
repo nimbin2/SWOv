@@ -236,6 +236,7 @@ typedef struct {
                                 it back on the way out                      */
     int   snap_ms;           /* hold a floating window over another this
                                 long to put it into the layout instead      */
+    int   focus_self;        /* ask sway for the keyboard after mapping     */
     int   cpu;               /* the load dots on a tile, measured by swbr   */
     float cpu_idle;          /* under this, nothing is happening at all     */
     float cpu_min, cpu_full; /* the scale, in cores                         */
@@ -300,6 +301,7 @@ static Cfg cfg_defaults(void)
     c.drop_outputs = 1;
     c.over_fullscreen = 1;
     c.snap_ms = 1000;
+    c.focus_self = 1;
     c.cpu_idle   = 0.01f;    /* cores; under this nothing is happening */
     c.cpu_min    = 0.25f;    /* cores, not a share of the machine */
     c.cpu_full   = 4.0f;
@@ -397,6 +399,7 @@ static void cfg_set(Cfg *c, const char *k, const char *v)
     else if (key_is(k,"drop_outputs")) c->drop_outputs = atoi(v) != 0;
     else if (key_is(k,"over_fullscreen")) c->over_fullscreen = atoi(v) != 0;
     else if (key_is(k,"snap_ms")) c->snap_ms = atoi(v);
+    else if (key_is(k,"focus_self")) c->focus_self = atoi(v) != 0;
     else if (key_is(k,"cpu_idle"))  c->cpu_idle = (float)atof(v);
     else if (key_is(k,"cpu_min"))   c->cpu_min = (float)atof(v);
     else if (key_is(k,"cpu_full"))  c->cpu_full = (float)atof(v);
@@ -5238,6 +5241,9 @@ static void fullscreen_put_back(void)
     FS_RESTORE = 0;
 }
 
+/* set from the loop, where the backdrop flags are in scope */
+static void focus_self_soon(void);
+
 static void reload_model(void)
 {
     /* remember what was selected so a reload does not lose the cursor */
@@ -5278,6 +5284,12 @@ static void reload_model(void)
     focus_load();                /* and the order things were used in */
     mark("cpu numbers");
     if (!FS_RESTORE) fullscreen_step_aside();
+
+    /* Whether a new window is given the keyboard is the compositor's
+     * business, and an overlay without it does nothing at all — every key
+     * goes to whatever is underneath. So it asks, a few times over half a
+     * second, rather than assuming. Harmless when it already has it. */
+    focus_self_soon();
     layout();
     apply_filter();
     rebuild_chrome();
@@ -6426,6 +6438,14 @@ static void backdrop_poll(void)
  * raises it, so one command does the job — but only once sway knows our window
  * exists. Rather than guess when that is, say it three times over half a
  * second. Repeating is harmless: the wheel is already the focused window. */
+static void focus_self_soon(void)
+{
+    if (BACKDROP || SERVING || !C.focus_self || RAISE_APP[0]) return;
+    str_set(RAISE_APP, sizeof(RAISE_APP), APP_ID);
+    RAISE_LEFT = 3;
+    RAISE_AT = 0.0;
+}
+
 static void backdrop_raise_tick(void)
 {
     if (RAISE_LEFT <= 0) return;
@@ -7022,9 +7042,10 @@ int main(int argc, char **argv)
             }
         }
 
+        if (RAISE_LEFT > 0) backdrop_raise_tick();
+
         if (BACKDROP || SERVING) {
             backdrop_poll();
-            if (SERVING) backdrop_raise_tick();
             Uint64 now = SDL_GetTicks();
             if (BACKDROP) backdrop_step((float)(now - last_tick));
             last_tick = now;

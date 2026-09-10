@@ -50,6 +50,9 @@ tab=recent         # what tab walks: recent = the apps you used last, in that
 launcher=swas --replace overview=1
                    # what `d` opens. swas draws its own backdrop, so swov
                    # steps aside rather than stacking two overlays
+focus_self=1       # ask sway for the keyboard once the window is up. An
+                   # overlay that is not focused does nothing: every key goes
+                   # to whatever is underneath it
 snap_ms=1000       # dragging a floating window: hold it still over another
                    # this long and it snaps into the layout beside it. Moving
                    # starts the wait again. Without the hold it just moves to

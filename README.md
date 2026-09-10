@@ -33,6 +33,11 @@ bindsym $mod+Tab exec swov
 for_window [app_id="swov"] floating enable, border none
 ```
 
+Without that `for_window` line swov opens as an ordinary tile, which rearranges
+the layout it is meant to be showing you. It also asks sway for the keyboard
+itself once it is up (`focus_self=1`), since an overlay that is not focused
+does nothing at all — every key goes to whatever is underneath it.
+
 | key | action |
 | --- | --- |
 | `0`–`9` | switch to that workspace |
@@ -394,6 +399,7 @@ lists them. The file above is read after it, so swov's own config always wins.
 | `drop_outputs` | show the other screens' workspaces while dragging |
 | `over_fullscreen` | un-fullscreen whatever is in the way, and restore it on exit |
 | `snap_ms` | hold a floating window over another this long to tile it; `0` = at once |
+| `focus_self` | ask sway for the keyboard after mapping |
 | `map_dwell_ms` | hold a drag over a monitor this long to switch to it; `0` is off |
 | `launcher` | what `d` opens; `swas --replace overview=1` by default |
 | `tab` | `recent` walks the last used apps, `workspace` walks workspaces |
