@@ -237,6 +237,12 @@ typedef struct {
     int   snap_ms;           /* hold a floating window over another this
                                 long to put it into the layout instead      */
     int   focus_self;        /* ask sway for the keyboard after mapping     */
+    int   show_pid;          /* the process id on every card                */
+    int   ghost_click;       /* clicking an empty number switches to it      */
+    int   rename_icon;       /* a pencil in the header starts a rename; 0 =
+                              the old invisible middle of the name      */
+    int   slots_lo, slots_hi;/* numbers that always have a tile, empty or
+                                not; 0,0 = only the ones that exist         */
     int   cpu;               /* the load dots on a tile, measured by swbr   */
     float cpu_idle;          /* under this, nothing is happening at all     */
     float cpu_min, cpu_full; /* the scale, in cores                         */
@@ -302,6 +308,11 @@ static Cfg cfg_defaults(void)
     c.over_fullscreen = 1;
     c.snap_ms = 1000;
     c.focus_self = 1;
+    c.show_pid = 1;
+    c.ghost_click = 1;
+    c.rename_icon = 1;
+    c.slots_lo = 1;          /* all ten numbers, always there */
+    c.slots_hi = 10;
     c.cpu_idle   = 0.01f;    /* cores; under this nothing is happening */
     c.cpu_min    = 0.25f;    /* cores, not a share of the machine */
     c.cpu_full   = 4.0f;
@@ -400,6 +411,15 @@ static void cfg_set(Cfg *c, const char *k, const char *v)
     else if (key_is(k,"over_fullscreen")) c->over_fullscreen = atoi(v) != 0;
     else if (key_is(k,"snap_ms")) c->snap_ms = atoi(v);
     else if (key_is(k,"focus_self")) c->focus_self = atoi(v) != 0;
+    else if (key_is(k,"show_pid")) c->show_pid = atoi(v) != 0;
+    else if (key_is(k,"ghost_click")) c->ghost_click = atoi(v) != 0;
+    else if (key_is(k,"rename_icon")) c->rename_icon = atoi(v) != 0;
+    else if (key_is(k,"ws_slots")) {          /* "1-10", or "0" for none */
+        int lo = 0, hi = 0;
+        if (sscanf(v, "%d-%d", &lo, &hi) != 2) { lo = 0; hi = atoi(v); }
+        if (hi < lo) { int t = lo; lo = hi; hi = t; }
+        c->slots_lo = lo; c->slots_hi = hi;
+    }
     else if (key_is(k,"cpu_idle"))  c->cpu_idle = (float)atof(v);
     else if (key_is(k,"cpu_min"))   c->cpu_min = (float)atof(v);
     else if (key_is(k,"cpu_full"))  c->cpu_full = (float)atof(v);
@@ -1526,6 +1546,7 @@ static TTF_Font     *F_BADGE;   /* workspace number            */
 static TTF_Font     *F_LABEL;   /* app name on a window card   */
 static TTF_Font     *F_TITLE;   /* window title (small)        */
 static TTF_Font     *F_HINT;    /* header / footer             */
+static TTF_Font     *F_PID;     /* the pid in a card's corner  */
 static float         SC = 1.0f; /* supersampling scale factor  */
 
 static int px(float logical) { return (int)(logical * SC + 0.5f); }
@@ -2265,7 +2286,7 @@ typedef struct {
     bool  lay_sub;             /* is there room for the title */
 
     SDL_Texture *icon;         /* borrowed from the icon cache */
-    Tex   label, subtitle;
+    Tex   label, subtitle, pidtex;
 } Win;
 
 typedef struct {
@@ -2284,10 +2305,11 @@ typedef struct {
     int   ntop;
 
     SDL_FRect tile, screen;    /* layout (render pixels) */
+    bool  marked;              /* the workspace itself, not its windows     */
     SDL_FRect title_box;       /* where the name is drawn in the header      */
-    SDL_FRect title_hit;       /* its middle half: clicking there renames.
-                                * The quarter to the left and to the right
-                                * selects the workspace, like the tile. */
+    SDL_FRect title_hit;       /* clicking there renames: the pencil at the
+                                * right end of the name, or with
+                                * rename_icon=0 the middle half of it */
     SDL_FRect tile_from;       /* where this tile animates from */
     Tex   badge, sub, title;
 } Ws;
@@ -2322,6 +2344,11 @@ static SDL_FRect CANCEL_RECT;           /* and the ✕ beside it, while dragging
 static int    MAP_HOVER = -1;
 static int    DRAG_CON;          /* the window being dragged, by id */
 static int    drop_out = -1;     /* the monitor a drag is over, in the map */
+static int    press_slot = -1;   /* an empty number the press landed on     */
+static int    OUT_PRESS = -1;    /* a monitor being dragged in the map      */
+static float  OUT_PRESS_X, OUT_PRESS_Y;
+static int    OUT_TARGET = -1;   /* ...and the one it is being put against  */
+static int    OUT_EDGE;
 static int    SNAP_WIN = -1;     /* the card a floating drag is resting on */
 static double SNAP_AT;           /* ...and since when */
 static float  SNAP_X, SNAP_Y;    /* where the pointer was when it settled */
@@ -2492,8 +2519,14 @@ static void walk_outputs(const JV *node)
     if (strcmp(type, "output") == 0) {
         const char *name = jstr(node, "name", "");
         if (strcmp(name, "__i3") == 0) return;
-        if (!C.all_outputs && !DRAG_ALL_OUTPUTS &&
-        FOCUSED_OUTPUT[0] && strcmp(name, FOCUSED_OUTPUT) != 0) return;
+        /* Asking for a fixed set of numbers only makes sense if the
+         * workspaces behind them are real wherever they live: otherwise 3
+         * and 5 are on the other screen, so the model has never heard of
+         * them, and their tiles come out as empty numbered placeholders —
+         * the grid looks right and the windows are missing. */
+        bool want_all = C.all_outputs || DRAG_ALL_OUTPUTS || C.slots_hi > 0;
+        if (!want_all && FOCUSED_OUTPUT[0] &&
+            strcmp(name, FOCUSED_OUTPUT) != 0) return;
         str_set(CUR_OUTPUT, sizeof(CUR_OUTPUT), name);
     }
 
@@ -2617,6 +2650,21 @@ static Slot   DYING[16];          /* ghosts on their way out                 */
 static int    NDYING;
 static Uint64 dying_start;
 static bool   laid_out_once;
+static bool   shown_once;    /* a frame has been presented */
+
+/* Nothing glides while swov is still settling.
+ *
+ * Opening it lays the grid out several times over: with the model half
+ * built, again once the fonts are in, again when sway gives the window its
+ * real size, and again for the events our own focus request provokes. Any of
+ * those counted as "where the tiles were a moment ago", so they slid into
+ * position instead of simply being there. A frame on screen is not enough of
+ * a test — the resize comes after it. */
+#define SETTLE_MS 500
+static bool settled(void)
+{
+    return shown_once && SDL_GetTicks() > SETTLE_MS;
+}
 
 static Uint64 anim_start;         /* tiles glide when the grid changes       */
 
@@ -2685,6 +2733,8 @@ static float pos_x(const char *p, float w, float margin)
 static int  sel_ws = 0;
 static bool sel_active = true;   /* false: no tile and no window highlighted */
 static int  hov_ws = -1, hov_win = -1;
+static bool pencil_hot;          /* the pointer is on a rename pencil */
+static void draw_pencil(SDL_FRect r, SDL_FColor c);
 
 /* A floating window is see-through and answers the pointer only through its
  * name plate, so the windows underneath stay reachable. Once you are on that
@@ -3052,6 +3102,7 @@ static void build_texts(void)
         Win *w = &WINS[i];
         tex_free(&w->label);
         tex_free(&w->subtitle);
+        tex_free(&w->pidtex);
         w->hit = w->card;                    /* the whole card, unless a plate
                                               * takes over below */
 
@@ -3063,6 +3114,15 @@ static void build_texts(void)
         w->label = text_make_fit(F_LABEL, name, maxw);
         if (w->lay_sub && strcmp(name, w->title) != 0)
             w->subtitle = text_make_fit(F_TITLE, w->title, maxw);
+
+        /* The pid, small and out of the way. It is the one thing about a
+         * window you cannot get at from the title, and the thing you want
+         * when something has to be killed or traced. */
+        if (C.show_pid && w->pid > 0) {
+            char p[24];
+            snprintf(p, sizeof(p), "%d", w->pid);
+            w->pidtex = text_make_fit(F_PID ? F_PID : F_HINT, p, maxw);
+        }
 
         SDL_FRect plate;
         if (card_is_overlay(w) && overlay_plate(w, w->card, &plate, NULL))
@@ -3269,7 +3329,7 @@ static void layout(void)
                 break;
             }
         }
-        if (!laid_out_once) SLOTS[i].from = SLOTS[i].tile;      /* no intro */
+        if (!settled()) SLOTS[i].from = SLOTS[i].tile;       /* no intro */
         if (!matched || SDL_fabsf(SLOTS[i].from.x - SLOTS[i].tile.x) > 0.5f ||
                         SDL_fabsf(SLOTS[i].from.y - SLOTS[i].tile.y) > 0.5f ||
                         SDL_fabsf(SLOTS[i].from.w - SLOTS[i].tile.w) > 0.5f)
@@ -3299,7 +3359,7 @@ static void layout(void)
         moved = true;
     }
 
-    if (moved && laid_out_once) anim_start = SDL_GetTicks();
+    if (moved && settled()) anim_start = SDL_GetTicks();
     laid_out_once = true;
 
     build_texts();
@@ -3313,8 +3373,20 @@ static void layout(void)
         float right = ws->tile.x + ws->tile.w - p -
                       (ws->badge.t ? (float)ws->badge.w : 0.0f) - p;
         float w = SDL_max(right - left, 0.0f);
-        ws->title_box = (SDL_FRect){ left, ws->tile.y, w, head_h };
-        ws->title_hit = (SDL_FRect){ left + w * 0.25f, ws->tile.y, w * 0.5f, head_h };
+        if (C.rename_icon) {
+            /* The middle of the name used to be an invisible button, and
+             * clicking a header to grab the workspace opened the editor by
+             * accident. Now it is a pencil you can see, at the right end of
+             * the name, and the name itself is part of the header like
+             * everywhere else. The name is centred in what is left. */
+            float icon = SDL_min(head_h * 0.72f, SDL_max(w, 0.0f));
+            ws->title_box = (SDL_FRect){ left, ws->tile.y, SDL_max(w - icon, 0.0f), head_h };
+            ws->title_hit = (SDL_FRect){ left + w - icon, ws->tile.y + (head_h - icon) * 0.5f,
+                                         icon, icon };
+        } else {
+            ws->title_box = (SDL_FRect){ left, ws->tile.y, w, head_h };
+            ws->title_hit = (SDL_FRect){ left + w * 0.25f, ws->tile.y, w * 0.5f, head_h };
+        }
     }
 }
 
@@ -3719,6 +3791,28 @@ static void show_all_outputs(bool on)
     dirty = true;
 }
 
+static void set_ghosts(int lo, int hi);
+
+/* The numbers on show. Outside a drag it is whatever ws_slots asks for, so
+ * 1..10 are always there whether or not sway has them yet; during a drag it
+ * reaches one further either side, which is how you get to 0 and to 11. */
+static void ghosts_default(void)
+{
+    if (C.slots_hi > 0) set_ghosts(C.slots_lo, C.slots_hi);
+    else                set_ghosts(-1, -1);
+}
+
+static void ghosts_dragging(void)
+{
+    if (C.slots_hi > 0) {
+        int lo = C.slots_lo - 1;
+        if (lo < 0) lo = 0;
+        set_ghosts(lo, C.slots_hi + 1);
+    } else if (C.drop_ghosts) {
+        set_ghosts(0, 10);
+    }
+}
+
 static void set_ghosts(int lo, int hi)
 {
     if (lo == ghost_lo && hi == ghost_hi) return;
@@ -3745,7 +3839,9 @@ static void update_ghosts(float x, float y)
     }
     if (want) {
         if (C.drop_outputs) show_all_outputs(true);
-        set_ghosts(0, 10);
+        ghosts_dragging();
+    } else {
+        ghosts_default();
     }
 }
 
@@ -4207,7 +4303,15 @@ static void drag_finish(void)
          * a window goes to whatever workspace is showing on that screen. */
         if (drop_out >= 0 && drop_out < NOUTS) {
             char *o = escape_arg(OUTS[drop_out].name);
-            if (drag_ws_mode && press_ws >= 0 && WSS[press_ws].num >= 0)
+            int moved = 0;
+            if (drag_ws_mode)                /* every marked one, or the one */
+                for (int i = 0; i < NWS; ++i)
+                    if (WSS[i].marked && WSS[i].num >= 0) {
+                        sway_cmd("workspace number %d; move workspace to output \"%s\"",
+                                 WSS[i].num, o);
+                        moved++;
+                    }
+            if (!moved && drag_ws_mode && press_ws >= 0 && WSS[press_ws].num >= 0)
                 sway_cmd("workspace number %d; move workspace to output \"%s\"",
                          WSS[press_ws].num, o);
             else if (press_win >= 0)
@@ -4231,6 +4335,7 @@ static void drag_finish(void)
     drop_kind = DROP_NONE;
     press_win = press_ws = -1;
     ghost_lo = ghost_hi = -1;
+    ghosts_default();
     layout();
     reload_model();          /* the event socket refreshes again once sway settles */
 }
@@ -4243,6 +4348,7 @@ static void drag_cancel(void)
     press_down = false;
     press_win = press_ws = -1;
     ghost_lo = ghost_hi = -1;
+    ghosts_default();
     if (had_ghosts) layout();
 }
 
@@ -4327,6 +4433,9 @@ static SDL_FRect xf(SDL_FRect r)
                         r.w * XF_SX, r.h * XF_SY };
 }
 
+/* how solid an icon is drawn: a workspace on another screen is faded */
+static float ICON_FADE = 1.0f;
+
 static void draw_icon(SDL_Texture *icon, float cx, float top, float size)
 {
     if (!icon) return;
@@ -4337,7 +4446,9 @@ static void draw_icon(SDL_Texture *icon, float cx, float top, float size)
         else if (th > tw) w = size * (tw / th);
     }
     SDL_FRect dst = { cx - w * 0.5f, top + (size - h) * 0.5f, w, h };
+    SDL_SetTextureAlphaModFloat(icon, ICON_FADE);
     SDL_RenderTexture(REN, icon, NULL, &dst);
+    SDL_SetTextureAlphaModFloat(icon, 1.0f);
 }
 
 static void draw_card(Win *w, bool tile_selected)
@@ -4377,14 +4488,25 @@ static void draw_card(Win *w, bool tile_selected)
      * leaves again. */
     bool lifted = LIFT_WIN >= 0 && LIFT_WIN < NWIN && &WINS[LIFT_WIN] == w;
 
-    float over = 1.0f, cover = 0.0f;
+    /* A workspace that lives on another screen is shown in full, windows and
+     * all — you want to see what is over there — but washed out, so a glance
+     * is enough to know it is not here. Blur would be truer to the idea;
+     * this renderer has no shader to do it with, and fading everything
+     * uniformly reads the same way at a glance. */
+    float away = 1.0f;
+    if (w->ws >= 0 && w->ws < NWS && WSS[w->ws].output[0] && FOCUSED_OUTPUT[0] &&
+        strcmp(WSS[w->ws].output, FOCUSED_OUTPUT) != 0)
+        away = 0.45f;
+
+    ICON_FADE = away;
+    float over = away, cover = 0.0f;
     bool on_top = w->floating || w->fullscreen;
     if (on_top && !lifted) {
         const Ws *ws = &WSS[w->ws];
         float screen_area = ws->screen.w * ws->screen.h;
         cover = (screen_area > 1.0f) ? (w->card.w * w->card.h) / screen_area : 1.0f;
         cover = SDL_clamp(cover, 0.0f, 1.0f);
-        over = C.float_alpha * (1.0f - 0.55f * cover);
+        over = C.float_alpha * (1.0f - 0.55f * cover) * away;
         fill = with_alpha(fill, fill.a * over);
     }
     /* Anything drawn on top of other windows gets a frame and a name plate
@@ -4418,6 +4540,8 @@ static void draw_card(Win *w, bool tile_selected)
     }
 
     if (w->floating) drop_shadow(r, rad, 9.0f * SC, with_alpha(C.shadow_col, C.shadow_col.a * over));
+    if (away < 1.0f && !on_top) fill = with_alpha(fill, fill.a * away);
+
     if (is_tab)        fill_round_side(r, rad, true, false, fill);
     else if (is_panel) fill_round_side(r, rad, false, true, fill);
     else               fill_round_rect(r, rad, fill);
@@ -4480,8 +4604,8 @@ static void draw_card(Win *w, bool tile_selected)
     SDL_FColor lab_col = (selected || is_hovered) ? C.text : C.subtext;
     if (w->urgent) lab_col = C.urgent;
     SDL_FColor sub_col = mix(C.dim, C.text, (selected || is_hovered) ? 0.55f : 0.32f);
-    lab_col = with_alpha(lab_col, lab_col.a * a);
-    sub_col = with_alpha(sub_col, sub_col.a * a);
+    lab_col = with_alpha(lab_col, lab_col.a * a * away);
+    sub_col = with_alpha(sub_col, sub_col.a * a * away);
 
     bool has_icon = C.icons && w->icon && w->lay_icon >= 10.0f * SC;
     if (has_icon) SDL_SetTextureAlphaModFloat(w->icon, a);
@@ -4512,6 +4636,16 @@ static void draw_card(Win *w, bool tile_selected)
     float lab_h = w->label.t    ? (float)w->label.h    : 0.0f;
     float sub_h = w->subtitle.t ? (float)w->subtitle.h : 0.0f;
     float g1 = 4.0f * SC, g2 = 1.0f * SC;
+
+    if (w->pidtex.t && r.w > (float)w->pidtex.w + 12.0f * SC &&
+        r.h > (float)w->pidtex.h + 12.0f * SC) {
+        tex_draw(w->pidtex,
+                 r.x + r.w - (float)w->pidtex.w - pad * 0.6f,
+                 r.y + pad * 0.4f,
+                 /* a step quieter than a card's subtitle, which sits at
+                    0.32 of the way from dim to text when it is not selected */
+                 with_alpha(mix(C.dim, C.text, 0.22f), 0.9f * away));
+    }
 
     switch (w->lay_mode) {
     case CL_ROW: {
@@ -4658,6 +4792,10 @@ static void draw_workspace(int idx)
         bc = with_alpha(ocol, 0.95f);
         bw = SDL_max(1.5f, C.border * SC * 1.3f);
     }
+    if (ws->marked) {                    /* picked out to be moved together */
+        bc = C.hl;
+        bw = SDL_max(2.0f, C.border * SC * 1.8f);
+    }
     stroke_round_rect(tile, rad, bw, bc);
 
     /* ---- tile header: count left, name centred, number right ---- */
@@ -4721,6 +4859,14 @@ static void draw_workspace(int idx)
         if ((float)t.w > tb_w) x = tb_x;
         SDL_FColor col = selected ? C.text : mix(C.subtext, C.tile, 0.15f);
         tex_draw(t, x, top + ((float)ws->badge.h - (float)t.h) * 0.55f, col);
+    }
+
+    /* The rename pencil: faint until the pointer is on it, so it says "this
+     * can be named" without competing with the name. */
+    if (C.rename_icon && !editing_this && ws->title_hit.w > 6.0f * SC) {
+        SDL_FRect ir = xf(ws->title_hit);
+        bool hot = hov_ws == idx && pencil_hot;
+        draw_pencil(ir, hot ? C.hl : with_alpha(C.subtext, selected ? 0.55f : 0.32f));
     }
 
     /* How much this workspace gets used, as a column of dots down the left
@@ -4961,7 +5107,7 @@ static void draw_outputs_map(void)
         /* Held over: the plate presses in a little and fills from the left,
          * so the wait reads as a button going down rather than a pause. */
         float held = 0.0f;
-        if (i == MAP_HOVER && C.map_dwell_ms > 0)
+        if (i == MAP_HOVER && C.map_dwell_ms > 0 && !drag_active)
             held = SDL_clamp((float)((now_secs() - MAP_HOVER_SINCE) /
                                      (C.map_dwell_ms / 1000.0)), 0.0f, 1.0f);
         if (held > 0.0f) {
@@ -4987,6 +5133,20 @@ static void draw_outputs_map(void)
             fill_round_rect(r, rad, with_alpha(C.hl, 0.55f + 0.35f * held));
             SDL_SetRenderClipRect(REN, had ? &prev : NULL);
             stroke_round_rect(r, rad, SDL_max(1.0f, 2.0f * SC), with_alpha(C.hl, 0.95f));
+        }
+
+        if (OUT_PRESS == i) {                 /* the one on the pointer */
+            stroke_round_rect(r, rad, SDL_max(2.0f, 2.5f * SC),
+                              with_alpha(C.hl, 0.9f));
+        }
+        if (OUT_TARGET == i) {                /* and where it will go */
+            float b2 = SDL_max(3.0f, 4.0f * SC);
+            SDL_FRect bar;
+            if (OUT_EDGE == EDGE_LEFT)        bar = (SDL_FRect){ r.x - b2 * 0.5f, r.y, b2, r.h };
+            else if (OUT_EDGE == EDGE_RIGHT)  bar = (SDL_FRect){ r.x + r.w - b2 * 0.5f, r.y, b2, r.h };
+            else if (OUT_EDGE == EDGE_TOP)    bar = (SDL_FRect){ r.x, r.y - b2 * 0.5f, r.w, b2 };
+            else                              bar = (SDL_FRect){ r.x, r.y + r.h - b2 * 0.5f, r.w, b2 };
+            fill_round_rect(bar, b2 * 0.5f, C.hl);
         }
 
         if (drag_active && drop_kind == DROP_OUTPUT && drop_out == i) {
@@ -5055,6 +5215,35 @@ static void draw_cancel_target(void)
         SDL_RenderLine(REN, cx - box + o, cy - box, cx + box + o, cy + box);
         SDL_RenderLine(REN, cx - box + o, cy + box, cx + box + o, cy - box);
     }
+}
+
+/* A pencil at 45 degrees, point down-left: a body, a band where the wood
+ * starts, and the tip. Drawn as geometry so it stays crisp at any scale and
+ * does not depend on the font having a glyph for it. */
+static void draw_pencil(SDL_FRect r, SDL_FColor c)
+{
+    float s = SDL_min(r.w, r.h) * 0.70f;
+    float cx = r.x + r.w * 0.5f, cy = r.y + r.h * 0.5f;
+    const float k = 0.70710678f;
+    float dx = -k, dy = k, nx = k, ny = k;       /* along it, and across it */
+    float L = s * 0.5f, W = s * 0.15f, cone = s * 0.30f;
+
+    float tx = cx + dx * L, ty = cy + dy * L;                       /* tip  */
+    float bx = cx + dx * (L - cone), by = cy + dy * (L - cone);     /* wood */
+    float ex = cx - dx * L, ey = cy - dy * L;                       /* end  */
+
+    SDL_FColor wood = { c.r, c.g, c.b, c.a * 0.55f };
+    SDL_Vertex v[9] = {
+        { { ex + nx * W, ey + ny * W }, c, { 0, 0 } },
+        { { ex - nx * W, ey - ny * W }, c, { 0, 0 } },
+        { { bx + nx * W, by + ny * W }, c, { 0, 0 } },
+        { { bx - nx * W, by - ny * W }, c, { 0, 0 } },
+        { { bx + nx * W, by + ny * W }, wood, { 0, 0 } },
+        { { bx - nx * W, by - ny * W }, wood, { 0, 0 } },
+        { { tx, ty }, c, { 0, 0 } },
+    };
+    int idx[9] = { 0, 1, 2,  1, 3, 2,  4, 5, 6 };
+    SDL_RenderGeometry(REN, NULL, v, 7, idx, 9);
 }
 
 static void render(void)
@@ -5290,6 +5479,7 @@ static void reload_model(void)
      * goes to whatever is underneath. So it asks, a few times over half a
      * second, rather than assuming. Harmless when it already has it. */
     focus_self_soon();
+    if (!drag_active) ghosts_default();
     layout();
     apply_filter();
     rebuild_chrome();
@@ -5310,6 +5500,15 @@ static void act_goto_workspace(const Ws *ws)
     sway_cmd("workspace --no-auto-back-and-forth \"%s\"", e);
     free(e);
     if (C.track) usage_switch(ws->name, ws->output, ws->num);
+    running = false;
+}
+
+/* An empty number: sway has no such workspace yet, so it is asked for by
+ * number and creates it on the way there. */
+static void act_goto_number(int num)
+{
+    if (num < 0) return;
+    sway_cmd("workspace number %d", num);
     running = false;
 }
 
@@ -5500,6 +5699,7 @@ static void load_fonts(void)
     F_LABEL = open_font(bold,    (float)C.label_px * u, true, synth);
     F_TITLE = open_font(regular, (float)C.title_px * u, false, false);
     F_HINT  = open_font(regular, (float)C.hint_px  * u, false, false);
+    F_PID   = open_font(regular, (float)C.hint_px  * u * 0.82f, false, false);
     free(regular);
     free(bold);
     free(FC_REGULAR);
@@ -5697,7 +5897,7 @@ static void serve_end(void)
 
     drag_active = false;
     drop_kind = DROP_NONE;
-    set_ghosts(-1, -1);
+    ghosts_default();
     dirty = true;
 }
 
@@ -5888,8 +6088,13 @@ static void handle_key(const SDL_KeyboardEvent *k)
     case SDLK_SPACE:
         if (NWS > 0) {
             Ws *ws = &WSS[sel_ws];
-            if (!shift && ws->sel >= 0) act_toggle_mark(ws_sel_win(ws));
-            else                        toggle_ws_marks(ws);
+            /* On a window, space marks that window. On a workspace with no
+             * window picked, it marks the workspace — several of those can
+             * then be dragged to another screen in one go. shift+space still
+             * marks everything inside one. */
+            if (!shift && ws->sel >= 0)      act_toggle_mark(ws_sel_win(ws));
+            else if (!shift)                 ws->marked = !ws->marked;
+            else                             toggle_ws_marks(ws);
         }
         break;
 
@@ -5899,6 +6104,7 @@ static void handle_key(const SDL_KeyboardEvent *k)
 
     case SDLK_C:
         for (int i = 0; i < NWIN; ++i) WINS[i].marked = false;
+        for (int i = 0; i < NWS;  ++i) WSS[i].marked  = false;
         break;
 
     case SDLK_X:
@@ -5983,6 +6189,20 @@ static void handle_mouse_press(const SDL_MouseButtonEvent *b)
 
     if (editing) end_edit(true);                   /* a click elsewhere commits */
 
+    /* a monitor picked up out of the map: it can be put down against
+       another one to rearrange the desk */
+    if (b->button == SDL_BUTTON_LEFT && MAP_RECT.w > 0.0f) {
+        for (int i = 0; i < NOUTS; ++i) {
+            SDL_FRect r = OUTS[i].box;
+            if (r.w <= 0.0f || mx < r.x || mx >= r.x + r.w ||
+                my < r.y || my >= r.y + r.h) continue;
+            OUT_PRESS = i;
+            OUT_PRESS_X = mx;
+            OUT_PRESS_Y = my;
+            break;
+        }
+    }
+
     /* the map of the monitors: step onto one and look at its workspaces */
     if (b->button == SDL_BUTTON_LEFT && MAP_RECT.w > 0.0f) {
         for (int i = 0; i < NOUTS; ++i) {
@@ -6000,6 +6220,12 @@ static void handle_mouse_press(const SDL_MouseButtonEvent *b)
             dirty = true;
             return;
         }
+    }
+
+    press_slot = -1;
+    if (ws_idx < 0) {                        /* maybe an empty number */
+        int si = slot_at(mx, my);
+        if (si >= 0 && SLOTS[si].ws < 0) press_slot = si;
     }
 
     if (b->button == SDL_BUTTON_LEFT && ws_idx >= 0 && win_idx < 0) {
@@ -6043,11 +6269,41 @@ static void handle_mouse_press(const SDL_MouseButtonEvent *b)
     }
 }
 
+/* Rearranging the desk. sway places outputs by absolute pixel position, so
+ * putting one against another's edge is arithmetic: the same top, and an x
+ * one width to the left, or whatever the chosen side asks for. */
+static void outputs_rearrange(int moved, int anchor, int edge)
+{
+    if (moved < 0 || anchor < 0 || moved == anchor ||
+        moved >= NOUTS || anchor >= NOUTS) return;
+
+    Out *m = &OUTS[moved], *a = &OUTS[anchor];
+    int x = a->x, y = a->y;
+    switch (edge) {
+    case EDGE_LEFT:   x = a->x - m->w;  y = a->y;         break;
+    case EDGE_RIGHT:  x = a->x + a->w;  y = a->y;         break;
+    case EDGE_TOP:    x = a->x;         y = a->y - m->h;  break;
+    default:          x = a->x;         y = a->y + a->h;  break;
+    }
+
+    char *n = escape_arg(m->name);
+    sway_cmd("output \"%s\" position %d %d", n, x, y);
+    free(n);
+    reload_model();
+}
+
 static void handle_mouse_release(const SDL_MouseButtonEvent *b)
 {
     if (b->button != SDL_BUTTON_LEFT) return;
 
     float mx = b->x * MOUSE_SCALE, my = b->y * MOUSE_SCALE;
+
+    if (OUT_PRESS >= 0) {
+        if (OUT_TARGET >= 0) outputs_rearrange(OUT_PRESS, OUT_TARGET, OUT_EDGE);
+        OUT_PRESS = OUT_TARGET = -1;
+        dirty = true;
+        return;
+    }
 
     if (drag_active) {
         drag_update_target(mx, my);
@@ -6057,6 +6313,20 @@ static void handle_mouse_release(const SDL_MouseButtonEvent *b)
     }
     if (!press_down) return;
     press_down = false;
+
+    /* An empty number is a workspace that does not exist yet. Clicking one
+     * goes there and sway creates it — the hit test only knows about
+     * workspaces sway has, so the slot has to be asked directly. */
+    {
+        int si = slot_at(mx, my);
+        if (si >= 0 && SLOTS[si].ws < 0) {
+            int num = SLOTS[si].num;
+            press_win = press_ws = -1;
+            if (C.ghost_click && si == press_slot) act_goto_number(num);
+            press_slot = -1;
+            return;
+        }
+    }
 
     /* a plain click: only acts when press and release landed on the same
      * window, or on the same workspace */
@@ -6091,6 +6361,23 @@ static void handle_mouse_motion(const SDL_MouseMotionEvent *mo)
         }
     }
 
+    /* dragging a monitor about in the map */
+    if (OUT_PRESS >= 0) {
+        OUT_TARGET = -1;
+        if (SDL_fabsf(mx - OUT_PRESS_X) + SDL_fabsf(my - OUT_PRESS_Y) > 6.0f * SC)
+            for (int i = 0; i < NOUTS; ++i) {
+                if (i == OUT_PRESS) continue;
+                SDL_FRect r = OUTS[i].box;
+                if (r.w <= 0.0f || mx < r.x || mx >= r.x + r.w ||
+                    my < r.y || my >= r.y + r.h) continue;
+                OUT_TARGET = i;
+                OUT_EDGE = edge_at(r, mx, my);
+                break;
+            }
+        dirty = true;
+        return;
+    }
+
     if (drag_active) {
         int dws = -1;
         lift_update(mx, my, dws, hit_test(mx, my, &dws));
@@ -6102,6 +6389,14 @@ static void handle_mouse_motion(const SDL_MouseMotionEvent *mo)
     int ws_idx = -1;
     int win_idx = hit_test(mx, my, &ws_idx);
     lift_update(mx, my, ws_idx, win_idx);
+
+    bool ph = false;
+    if (C.rename_icon && ws_idx >= 0 && win_idx < 0) {
+        SDL_FRect tb = WSS[ws_idx].title_hit;
+        ph = mx >= tb.x && mx < tb.x + tb.w && my >= tb.y && my < tb.y + tb.h;
+    }
+    if (ph != pencil_hot) { pencil_hot = ph; dirty = true; }
+
     if (ws_idx == hov_ws && win_idx == hov_win) return;
 
     hov_ws = ws_idx;
@@ -6367,14 +6662,14 @@ static bool backdrop_command(char *line)
          * workspace that does not exist yet has to work the same either way.
          * They do cost the real tiles some size; drop_ghosts=0 keeps them
          * out of a drag that comes from swas. */
-        if (C.drop_ghosts) set_ghosts(0, 10);
+        ghosts_dragging();
         BLUR_WANT = 0.0f;
         return true;
     }
     if (!strcmp(line, "drag off")) {
         MAP_HOVER = -1;
         show_all_outputs(false);
-        set_ghosts(-1, -1);
+        ghosts_default();
         BLUR_WANT = 1.0f;
         drag_active = false;
         drop_kind = DROP_NONE;
@@ -6469,12 +6764,16 @@ static void backdrop_raise_tick(void)
  * further hover ever arrives */
 static void map_dwell_tick(void)
 {
+    /* Nought means off, not "at once". Read as a duration it came out as a
+     * millisecond, so dragging a workspace over a monitor switched the view
+     * the instant the pointer arrived — and the drop then had nothing left
+     * to do. The switch is off by default: dropping is the way to move
+     * something to another screen. */
+    if (C.map_dwell_ms <= 0) { MAP_HOVER = -1; return; }
     if (MAP_HOVER < 0) return;
     dirty = true;                                  /* the fill is growing */
 
-    double want = C.map_dwell_ms / 1000.0;
-    if (want <= 0.0) want = 0.001;
-    if (now_secs() - MAP_HOVER_SINCE < want) return;
+    if (now_secs() - MAP_HOVER_SINCE < C.map_dwell_ms / 1000.0) return;
 
     str_set(FOCUSED_OUTPUT, sizeof(FOCUSED_OUTPUT), OUTS[MAP_HOVER].name);
     PINNED_OUTPUT = strcmp(FOCUSED_OUTPUT, HOME_OUTPUT) != 0;
@@ -6612,6 +6911,7 @@ static void present(void)
         running = false;
     }
     SDL_RenderPresent(REN);
+    shown_once = true;
 }
 
 /* Place the overlay on the output sway is using. Matching by name only works
@@ -6889,6 +7189,13 @@ int main(int argc, char **argv)
     mark("sway socket");
 
     if (list_ws) {
+        /* the model as swov sees it, which is the only way to tell whether a
+           workspace on another screen brought its windows with it */
+        if (model_reload()) {
+            for (int i = 0; i < NWS; ++i)
+                fprintf(stderr, "swov: %-8s %-8s %2d window(s)\n",
+                        WSS[i].name, WSS[i].output, WSS[i].count);
+        }
         int rc = print_workspaces();
         close(sway_fd);
         return rc;

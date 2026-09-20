@@ -50,6 +50,20 @@ tab=recent         # what tab walks: recent = the apps you used last, in that
 launcher=swas --replace overview=1
                    # what `d` opens. swas draws its own backdrop, so swov
                    # steps aside rather than stacking two overlays
+ws_slots=1-10      # the default. These numbers always have a tile, whether sway has the
+                   # workspace yet or not — so the grid is the same shape
+                   # every time you open it. While dragging it reaches one
+                   # further either side, which is how you get to 0 and 11.
+                   # 0 = only the workspaces that exist
+all_outputs=1      # every screen's workspaces, not just this one's, with the
+                   # output name in the title. ws_slots already brings them
+                   # in, so this is only about the labels
+show_pid=1         # the process id, top right corner of every card
+ghost_click=1      # clicking an empty number goes there, and sway makes the
+                   # workspace on the way. 0 = drop target only
+rename_icon=1      # a small pencil at the right of each header renames the
+                   # workspace. 0 = no pencil; the middle of the name renames,
+                   # which is easy to hit by accident when grabbing a header
 focus_self=1       # ask sway for the keyboard once the window is up. An
                    # overlay that is not focused does nothing: every key goes
                    # to whatever is underneath it

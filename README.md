@@ -15,8 +15,9 @@ Debian trixie and newer:
 ```sh
 sudo apt install build-essential pkg-config libsdl3-dev libsdl3-image-dev libsdl3-ttf-dev
 make
-make install          # ~/.local/bin, or PREFIX=/usr/local
+sudo make install     # /usr/bin, examples in /usr/share/swov
 make config           # optional: config.example -> ~/.config/swov/config
+make link             # or: config -> the installed example, kept in sync
 ```
 
 `make debug` builds `swov-debug` with the address and UB sanitizers.
@@ -40,15 +41,15 @@ does nothing at all — every key goes to whatever is underneath it.
 
 | key | action |
 | --- | --- |
-| `0`–`9` | switch to that workspace |
+| `0`–`9` | switch to that workspace, empty or not |
 | `ctrl+0`–`9` | move the selection there |
 | arrows, `hjkl` | move the selection; it walks through tile borders and wraps around the grid |
 | `tab` / `shift+tab` | the app you were in before this one, then the one before that (`tab=workspace` walks workspaces instead) |
 | `ctrl+tab` (`+shift`) | one row down / up in the grid |
 | `w` | window selection ⇄ whole-workspace selection |
 | `enter`, click | focus |
-| `space`, right click | mark or unmark a window (marks are what the next action applies to) |
-| `shift+space`, `a` | mark or unmark the whole workspace |
+| `space`, right click | mark or unmark a window; with no window picked, the workspace itself |
+| `shift+space`, `a` | mark or unmark every window in the workspace |
 | `c` | clear all marks |
 | `d` | open the launcher (`swas`) and step aside |
 | `x`, `del` | close marked or selected windows, `enter` confirms |
@@ -60,9 +61,9 @@ does nothing at all — every key goes to whatever is underneath it.
 
 Mouse and keyboard share one cursor: pointing at a window selects it, so
 `space`, `x`, `ctrl`+digit and the rest act on whatever is under the pointer.
-Click the middle of a workspace name in the header to rename it; `enter` keeps
-it, `esc` drops it. The quarter to the left and to the right of the name is not
-part of that — clicking there selects the workspace. The name is what `f` and `/` search, next to app ids and titles.
+Click the pencil at the right end of a workspace header to rename it; `enter`
+keeps it, `esc` drops it. The rest of the header selects and drags like the
+tile. The name is what `f` and `/` search, next to app ids and titles.
 swov opens with the current workspace selected as a whole, no window picked.
 Orange is only ever the selection cursor; the workspace sway is showing and the
 window it has focused are marked in teal (`current`), search hits in violet
@@ -119,6 +120,24 @@ when there is one.
 **A workspace** (grab the header strip) onto another swaps the two. Onto the
 left or right quarter of another it inserts there, pushing the occupied run up
 by one.
+
+`ws_slots=1-10`, the default, gives those numbers a tile whether or not sway has the
+workspace yet, so the grid is the same shape every time you open it. It also
+brings in every screen's workspaces, since a fixed set of numbers only makes
+sense if the workspaces behind them are real wherever they live — otherwise
+the ones on another monitor would be numbered placeholders with no windows in
+them. While
+something is being dragged it reaches one further either side — that is how
+you drop onto 0, or onto 11. The ones that live on another monitor are shown in
+full — their windows, their titles, their icons — but washed out to about
+half strength, so a glance is enough to know they are not here. Their tile
+also carries that monitor's colour.
+
+Clicking an empty number goes there, and sway creates the workspace on the
+way — that is what `ws_slots=1-10` is for: ten numbers you can always reach,
+whether or not anything is on them. The hit test only knows about workspaces
+sway already has, so the slot is asked directly. `ghost_click=0` makes them
+drop targets only.
 
 **Ghost slots** are the free numbers 0–10. They come out for a drag from swas as
 well as for one inside swov, so dropping an app on a workspace that does not
@@ -248,8 +267,14 @@ strongly a plate is filled says which screen is being shown, and a dot in its
 corner says which one sway is actually on.
 
 Click a monitor and the overview shows *its* workspaces instead. Drag a
-workspace onto one and it moves to that screen whole; drag a window onto one
-and it goes to whatever workspace is showing there. The one you
+workspace onto one and it moves to that screen whole — and if several
+workspaces are marked, all of them go, keeping their layouts. Drag a window
+onto one and it goes to whatever workspace is showing there.
+
+**Drag a monitor itself** onto another and it is repositioned against the side
+you drop on: a bar shows which edge, and sway is told the absolute position
+that puts it there. `output "eDP-1" position 1920 -1080` for above a screen
+that starts at 1920,0, and so on. The one you
 are looking at is filled in, the one sway is really on keeps a ring, and while
 those differ the whole overview is framed in that monitor's colour — the same
 one its workspaces and its plate wear — with `viewing DP-1` in the header on a
@@ -279,6 +304,13 @@ it completes cancels. That way a drag that started on one screen can finish on
 another.
 
 `swov output=DP-1` starts on a given screen.
+
+Tiles glide when the grid changes, but never on the way in. Opening swov lays
+the grid out several times over — with the model half-built, again once the
+fonts are in, again when sway gives the window its real size, again for the
+events its own focus request provokes — and any of those counted as "where
+the tiles were a moment ago". Nothing animates in the first half second, so
+the first thing you see is simply in place.
 
 swov's own window is on the workspace like anything else, so it is drawn —
 leaving a hole where it sits would be worse — but it is never selectable,
@@ -317,6 +349,11 @@ running all day and does: it keeps the last thirty-two windows in
 `$XDG_RUNTIME_DIR/swbr-focus`, most recent first, and swov reads that when it
 starts. Without swbr there is no order to walk, so tab quietly falls back to
 stepping through workspaces — which is also what `tab=workspace` does.
+
+Every card carries its pid in the top right corner, in smaller type, a step
+quieter than the subtitle beneath it — the one thing about a window you cannot read off the
+title, and the thing you want when something has to be killed or traced.
+`show_pid=0` turns it off.
 
 ## Workspace usage
 
@@ -395,11 +432,15 @@ lists them. The file above is read after it, so swov's own config always wins.
 | `blur` | how soft `--backdrop` is drawn, `0`–`3` |
 | `drop_ghosts` | offer the free numbers while an app is dragged over the backdrop |
 | `cpu`, `cpu_min`, `cpu_full` | the load dot, and the range it covers |
+| `ws_slots` | numbers that always have a tile, `1-10`; `0` for only what exists |
 | `outputs_map`, `outputs_map_w`, `output` | the monitor map, its width, and which screen to start on |
 | `drop_outputs` | show the other screens' workspaces while dragging |
 | `over_fullscreen` | un-fullscreen whatever is in the way, and restore it on exit |
 | `snap_ms` | hold a floating window over another this long to tile it; `0` = at once |
 | `focus_self` | ask sway for the keyboard after mapping |
+| `show_pid` | the process id on every card |
+| `ghost_click` | clicking an empty number switches to it; on by default |
+| `rename_icon` | the pencil that renames; `0` = the middle of the name instead |
 | `map_dwell_ms` | hold a drag over a monitor this long to switch to it; `0` is off |
 | `launcher` | what `d` opens; `swas --replace overview=1` by default |
 | `tab` | `recent` walks the last used apps, `workspace` walks workspaces |
@@ -407,6 +448,11 @@ lists them. The file above is read after it, so swov's own config always wins.
 | `track`, `usage_dots`, `dot_count`, `dot_px` | usage recording and its dot scale |
 | `start_selection` | `workspace`, `none` or `window` |
 | `cols`, `rows` | force the grid; default picks the largest tiles |
+
+`make install` also drops the shipped examples in `/usr/share/swov/`.
+`make link` points your config at one of them, so the next install is the
+config you are running — handy if you want to follow the examples rather than
+keep your own copy. Edits you make there are overwritten on install.
 
 ## Notes
 
