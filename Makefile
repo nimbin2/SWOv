@@ -26,7 +26,7 @@ shdatadir   ?= $(PREFIX)/share/sw
 
 BUILD       := $(shell md5sum swov.c 2>/dev/null | cut -c1-8)
 SRC         := swov.c
-HDR         := sw_theme.h
+HDR         := sw_theme.h nanosvg.h nanosvgrast.h
 BIN         := swov
 PKGS        := sdl3 sdl3-image sdl3-ttf
 

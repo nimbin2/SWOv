@@ -18,6 +18,21 @@
 #include <SDL3_image/SDL_image.h>
 #include <SDL3_ttf/SDL_ttf.h>
 
+/* SVG icons via nanosvg (vendored single-header, the same copy swas uses).
+   SDL_image rasterises an SVG to the box the file declares, which cuts off any
+   icon whose drawing runs outside it; this gives us the box to use. Third
+   party headers, so their warnings are quieted without touching our own. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#define NANOSVG_IMPLEMENTATION
+#define NANOSVG_ALL_COLOR_KEYWORDS
+#include "nanosvg.h"
+#define NANOSVGRAST_IMPLEMENTATION
+#include "nanosvgrast.h"
+#pragma GCC diagnostic pop
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -2131,15 +2146,57 @@ static char *icon_lookup(const char *name, int want_px)
     return NULL;
 }
 
+/* Rasterise an SVG at ~px, aspect preserved and nothing cut off. The box is
+   the declared canvas and the shapes' own bounds together: an icon with
+   deliberate padding keeps it, one whose drawing overflows its own
+   width/height is scaled down instead of losing an edge — which is what
+   SDL_image's sized loader does to it, since it draws only inside the box the
+   file declares. */
+static SDL_Surface *icon_svg_fitted(const char *path, int px)
+{
+    NSVGimage *img = nsvgParseFromFile(path, "px", 96.0f);
+    if (!img) return NULL;
+    float x0 = 0, y0 = 0, x1 = img->width, y1 = img->height;
+    if (x1 <= 0 || y1 <= 0) { x0 = y0 = 1e30f; x1 = y1 = -1e30f; }
+    for (NSVGshape *s = img->shapes; s; s = s->next) {
+        if (!(s->flags & NSVG_FLAGS_VISIBLE)) continue;
+        float m = s->strokeWidth * 0.5f;             /* a stroke sits astride */
+        if (s->bounds[0] - m < x0) x0 = s->bounds[0] - m;
+        if (s->bounds[1] - m < y0) y0 = s->bounds[1] - m;
+        if (s->bounds[2] + m > x1) x1 = s->bounds[2] + m;
+        if (s->bounds[3] + m > y1) y1 = s->bounds[3] + m;
+    }
+    float bw = x1 - x0, bh = y1 - y0;
+    if (!(bw > 0.0f) || !(bh > 0.0f)) { nsvgDelete(img); return NULL; }
+    float sc = (float)px / (bw > bh ? bw : bh);
+    int w = (int)(bw * sc + 0.5f), h = (int)(bh * sc + 0.5f);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+
+    SDL_Surface *surf = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_ABGR8888);
+    NSVGrasterizer *r = surf ? nsvgCreateRasterizer() : NULL;
+    if (!r) { if (surf) SDL_DestroySurface(surf); nsvgDelete(img); return NULL; }
+    SDL_memset(surf->pixels, 0, (size_t)surf->pitch * (size_t)h);
+    nsvgRasterize(r, img, -x0 * sc, -y0 * sc, sc,
+                  (unsigned char *)surf->pixels, w, h, surf->pitch);
+    nsvgDeleteRasterizer(r);
+    nsvgDelete(img);
+    return surf;
+}
+
 static SDL_Texture *icon_load_file(const char *path, int want_px)
 {
     SDL_Surface *surf = NULL;
     size_t n = strlen(path);
     if (n > 4 && ci_cmp(path + n - 4, ".svg") == 0) {
-        SDL_IOStream *io = SDL_IOFromFile(path, "rb");
-        if (io) {
-            surf = IMG_LoadSizedSVG_IO(io, want_px, want_px);
-            SDL_CloseIO(io);
+        surf = icon_svg_fitted(path, want_px);
+        if (!surf) {                               /* nanosvg could not: let
+                                                      SDL_image try instead */
+            SDL_IOStream *io = SDL_IOFromFile(path, "rb");
+            if (io) {
+                surf = IMG_LoadSizedSVG_IO(io, want_px, want_px);
+                SDL_CloseIO(io);
+            }
         }
     }
     if (!surf) surf = IMG_Load(path);
@@ -3615,6 +3672,25 @@ static int match_score(const Win *w)
     return 100;
 }
 
+/* The window a query points at: the lowest match_score, ties broken by title.
+ * Shared, because the selection it sets can be taken away again — pointing at
+ * anything selects it — and enter has to be able to ask a second time. */
+static int query_best_win(void)
+{
+    int best = -1, best_score = 100;
+    for (int i = 0; i < NWIN; ++i) {
+        Win *w = &WINS[i];
+        if (!w->match || w->is_self || !win_visible(w)) continue;
+        int sc = match_score(w);
+        if (sc > 5) continue;
+        if (best < 0 || sc < best_score ||
+            (sc == best_score && strcasecmp(w->title, WINS[best].title) < 0)) {
+            best = i; best_score = sc;
+        }
+    }
+    return best;
+}
+
 static void apply_filter(void)
 {
     for (int i = 0; i < NWIN; ++i) {
@@ -3624,17 +3700,7 @@ static void apply_filter(void)
                    ci_contains(w->ws_name, query);
     }
     if (qlen > 0) {                       /* jump to the best hit, not the first */
-        int best = -1, best_score = 100;
-        for (int i = 0; i < NWIN; ++i) {
-            Win *w = &WINS[i];
-            if (!w->match || w->is_self || !win_visible(w)) continue;
-            int sc = match_score(w);
-            if (sc > 5) continue;
-            if (best < 0 || sc < best_score ||
-                (sc == best_score && strcasecmp(w->title, WINS[best].title) < 0)) {
-                best = i; best_score = sc;
-            }
-        }
+        int best = query_best_win();
         if (best >= 0 && WINS[best].ws >= 0 && WINS[best].ws < NWS) {
             sel_ws = WINS[best].ws;
             WSS[sel_ws].sel = best - WSS[sel_ws].first;
@@ -6000,10 +6066,32 @@ static void handle_key(const SDL_KeyboardEvent *k)
             return;
         case SDLK_RETURN:
         case SDLK_KP_ENTER:
-            /* the same rule as outside a search: a window if one is picked,
-             * otherwise the workspace itself. Tab leaves no window picked,
-             * and enter has to keep working after it. */
+            /* On a query, enter opens what the query found. The selection
+             * alone could not be trusted for that: pointing at anything
+             * selects it, so a pointer resting somewhere else — or merely
+             * passed over on the way to the keyboard — quietly replaced the
+             * hit, and enter opened a workspace nobody searched for. If what
+             * is selected is not itself a match, the query is asked again. */
             if (NWS == 0) { running = false; return; }
+            if (qlen > 0) {
+                Win *w = sel_active ? ws_sel_win(&WSS[sel_ws]) : NULL;
+                if (!w || !w->match) {
+                    int best = query_best_win();
+                    if (best >= 0) {
+                        sel_ws = WINS[best].ws;
+                        WSS[sel_ws].sel = best - WSS[sel_ws].first;
+                        sel_active = true;
+                        w = &WINS[best];
+                    }
+                }
+                if (w) { act_focus_window(w); return; }
+                /* no window matched: a workspace whose own name did will do */
+                for (int i = 0; i < NWS; ++i)
+                    if (ci_contains(WSS[i].name, query)) { act_goto_workspace(&WSS[i]); return; }
+                QUERY_FLASH = now_secs();      /* nothing matched: say so */
+                dirty = true;
+                return;
+            }
             if (ws_sel_win(&WSS[sel_ws])) act_focus_window(ws_sel_win(&WSS[sel_ws]));
             else                          act_goto_workspace(&WSS[sel_ws]);
             return;
@@ -6239,8 +6327,19 @@ static void handle_mouse_press(const SDL_MouseButtonEvent *b)
         }
     }
 
-    if (ws_idx < 0) {                       /* the empty background */
-        if (b->button == SDL_BUTTON_LEFT) running = false;
+    if (ws_idx < 0) {
+        /* An empty number is not the background. The hit test only knows the
+         * workspaces sway actually has, so a free slot looked like a click on
+         * nothing and quit the overview before the release could ever act on
+         * it — which is why clicking one never went anywhere. */
+        if (press_slot >= 0 && b->button == SDL_BUTTON_LEFT) {
+            press_down = true;
+            press_x = mx;
+            press_y = my;
+            press_win = press_ws = -1;
+            return;
+        }
+        if (b->button == SDL_BUTTON_LEFT) running = false;   /* the background */
         return;
     }
 
