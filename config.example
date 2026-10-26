@@ -126,6 +126,9 @@ start_selection=workspace
                    #   workspace = the visible workspace, no window (default)
                    #   none      = nothing at all
                    #   window    = the first window of the visible workspace
+                   # Whichever it is, the cursor is not drawn until you point
+                   # or type: it is where the keyboard starts from, not a
+                   # highlight on something you did not choose
 all_outputs=0      # 1 = show every monitor, not just the focused one
 show_header=1      # the "DP-1  16 windows on 9 workspaces" line
 show_hints=1       # the key hints

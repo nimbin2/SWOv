@@ -1,25 +1,34 @@
-swov: fix enter after a search, clicking a free number, and cropped SVG icons
+swov: enter follows the keyboard, and the cursor waits to be asked
 
-Enter during a search opened whatever the cursor happened to be on. Pointing
-at anything selects it, so a pointer resting elsewhere — or merely passed over
-on the way to the keyboard — replaced the hit the query had chosen, and enter
-focused a workspace nobody searched for. Enter now checks that what is
-selected is itself a match and asks the query again if it is not, falling back
-to a workspace whose own name matched, and flashing the field when nothing
-did. The best-hit pick moved out of apply_filter so it can be asked twice.
+Two faults with one cause: the selection could be set by a pointer that merely
+happened to be resting somewhere, and nothing told that apart from a choice
+someone made. Two flags now do.
 
-Clicking a free number did nothing because it quit instead. The hit test only
-knows the workspaces sway actually has, so a free slot looked like a click on
-the empty background, and the press handler closed the overview before the
-release could act on it. A press on a slot now arms the click like any other.
+sel_by_key — the keyboard put the selection there. Tab and the arrows pick
+exactly one thing, so enter acts on that and nothing else: a workspace when
+that is what was picked, which is how tabbing through hits and pressing enter
+is supposed to work. The previous release made enter re-ask the query whenever
+the selection was not itself a matching window, to stop a resting pointer from
+stealing the hit; tabbing to a workspace leaves no window picked and tripped
+exactly that condition, so enter threw away where you had tabbed to and jumped
+back to the first hit. Only an incidental selection goes back to the query now.
 
-An SVG icon whose drawing runs outside its declared width/height was cut off:
-SDL_image rasterises to the box the file declares and simply does not draw
-past it. nanosvg is vendored here now (the same copy swas uses) and the box is
-the declared canvas and the shapes' own bounds together — an icon with
-deliberate padding keeps it, one that overflows is scaled down instead of
-losing an edge. SDL_image stays as the fallback.
+mouse_moved — the pointer has actually moved since the window opened. Until
+then it selects nothing and no cursor is drawn, so opening the overview no
+longer lights up whatever the mouse was left on top of. A key, a click, a
+relayed pointer from swas, or a query showing its hit all bring the cursor out;
+start_selection still decides where the keyboard starts from.
 
-Checked against a 48x48 icon whose art reaches 88x88: ink running into the
-bottom and right edges drops from 54 pixels to 9, and well-formed icons
-rasterise byte for byte as before.
+Hover had to stop keying off "what is under the pointer changed" for this. A
+new window is sent a motion event for wherever the pointer already is, so that
+position was recorded before movement counted, and moving inside the same tile
+afterwards changed nothing to notice — the cursor only appeared once the
+pointer crossed into a different workspace. Found by the test below, not by
+reading it.
+
+Checked against the real decision with a stand-in sway on a socketpair, ten
+cases: enter after typing a query, after tabbing once, twice and three times,
+onto an empty workspace, onto a workspace matched only by name, with a pointer
+resting somewhere nobody searched, with no query at all, and the cursor's
+visibility across a fresh open, a first motion event, a 1px jitter, a real
+move and a tab.

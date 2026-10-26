@@ -56,6 +56,7 @@ does nothing at all — every key goes to whatever is underneath it.
 | middle click | close that window straight away |
 | `f` | find windows by title, app id or workspace name; the best hit is selected, nothing is while nothing matches |
 | `/` | filter: same search, but hides everything else |
+| `tab` in a search | the next workspace with a hit; `enter` then goes there |
 | `r` | reload |
 | `esc` | cancel a drag, else quit |
 
@@ -64,7 +65,12 @@ Mouse and keyboard share one cursor: pointing at a window selects it, so
 Click the pencil at the right end of a workspace header to rename it; `enter`
 keeps it, `esc` drops it. The rest of the header selects and drags like the
 tile. The name is what `f` and `/` search, next to app ids and titles.
-swov opens with the current workspace selected as a whole, no window picked.
+swov opens with the current workspace selected as a whole, no window picked —
+but the cursor is not drawn until you point or type. The pointer is already
+somewhere when the overview appears, and whatever it was left on top of is not
+a choice anyone made, so it selects nothing until it moves. A key, a click, or
+a query showing its hit brings the cursor out.
+
 Orange is only ever the selection cursor; the workspace sway is showing and the
 window it has focused are marked in teal (`current`), search hits in violet
 (`match`).

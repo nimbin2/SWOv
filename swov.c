@@ -2789,6 +2789,25 @@ static float pos_x(const char *p, float w, float margin)
 
 static int  sel_ws = 0;
 static bool sel_active = true;   /* false: no tile and no window highlighted */
+
+/* Where the selection came from, and whether the pointer has done anything
+ * at all. Pointing at something selects it, which is what makes space, x and
+ * the rest work under the mouse — but it means the selection can also be set
+ * by a pointer that merely happens to be resting somewhere, and that is not a
+ * choice anyone made. Two flags tell the two apart:
+ *   sel_by_key  the keyboard put it there: tab, the arrows, hjkl. Deliberate,
+ *               so enter acts on exactly that, workspace or window.
+ *   mouse_moved the pointer has actually moved since the window opened, so
+ *               where it sits means something. Until then it selects nothing
+ *               and no cursor is drawn: opening the overview must not light
+ *               up whatever the mouse was left on top of. */
+static bool sel_by_key;          /* false until the user does something */
+static bool mouse_moved;
+static float mouse_x0, mouse_y0;
+static bool  mouse_seen;         /* we have a position to compare against */
+
+/* the selection cursor is only drawn once the user has pointed or typed */
+static bool sel_shown(void) { return sel_active && (sel_by_key || mouse_moved); }
 static int  hov_ws = -1, hov_win = -1;
 static bool pencil_hot;          /* the pointer is on a rename pencil */
 static void draw_pencil(SDL_FRect r, SDL_FColor c);
@@ -3471,6 +3490,7 @@ static void select_ws(int idx, bool keep_window);
 static void select_ws(int idx, bool keep_window)
 {
     if (NWS == 0) return;
+    sel_by_key = true;
     sel_ws = (idx % NWS + NWS) % NWS;
     Ws *ws = &WSS[sel_ws];
     if (!keep_window || ws->count == 0) { ws->sel = -1; return; }
@@ -3554,6 +3574,7 @@ static bool step_recent(int dir)
     if (w->ws < 0 || w->ws >= NWS) return false;
     sel_ws = w->ws;
     sel_active = true;
+    sel_by_key = true;
     WSS[sel_ws].sel = (int)(w - &WINS[WSS[sel_ws].first]);
     dirty = true;
     return true;
@@ -3705,6 +3726,7 @@ static void apply_filter(void)
             sel_ws = WINS[best].ws;
             WSS[sel_ws].sel = best - WSS[sel_ws].first;
             sel_active = true;
+            sel_by_key = true;                 /* the query chose it, not the mouse */
             return;
         }
         /* Nothing matched. Leaving the previous selection lit says something
@@ -4522,7 +4544,7 @@ static void draw_card(Win *w, bool tile_selected)
     SDL_FRect r = xf(w->card);
     if (r.w < 4.0f || r.h < 4.0f) return;
 
-    bool selected = tile_selected && sel_active && ws_sel_win(&WSS[w->ws]) == w;
+    bool selected = tile_selected && sel_shown() && ws_sel_win(&WSS[w->ws]) == w;
     bool is_hovered = selected;          /* pointer and keyboard share a cursor */
     bool dimmed   = filtering && !w->match;
     bool is_hit   = searching && qlen > 0 && w->match;
@@ -4817,7 +4839,7 @@ static SDL_FColor output_colour(const char *name);
 static void draw_workspace(int idx)
 {
     Ws *ws = &WSS[idx];
-    bool selected = sel_active && (idx == sel_ws);
+    bool selected = sel_shown() && (idx == sel_ws);
     bool hovered  = false;               /* the selection is the only cursor */
     float rad = C.radius * SC;
 
@@ -6073,7 +6095,12 @@ static void handle_key(const SDL_KeyboardEvent *k)
              * hit, and enter opened a workspace nobody searched for. If what
              * is selected is not itself a match, the query is asked again. */
             if (NWS == 0) { running = false; return; }
-            if (qlen > 0) {
+            /* Tab and the arrows pick exactly one thing, so enter acts on
+             * that and nothing else — a workspace if that is what was picked,
+             * which is how tabbing through hits onto an empty one works. Only
+             * an incidental selection, from a pointer resting on something
+             * nobody searched for, sends the question back to the query. */
+            if (qlen > 0 && !(sel_active && sel_by_key)) {
                 Win *w = sel_active ? ws_sel_win(&WSS[sel_ws]) : NULL;
                 if (!w || !w->match) {
                     int best = query_best_win();
@@ -6081,16 +6108,19 @@ static void handle_key(const SDL_KeyboardEvent *k)
                         sel_ws = WINS[best].ws;
                         WSS[sel_ws].sel = best - WSS[sel_ws].first;
                         sel_active = true;
-                        w = &WINS[best];
+                        sel_by_key = true;
+                    } else {
+                        /* no window matched: a workspace whose own name did */
+                        for (int i = 0; i < NWS; ++i)
+                            if (ci_contains(WSS[i].name, query)) {
+                                act_goto_workspace(&WSS[i]);
+                                return;
+                            }
+                        QUERY_FLASH = now_secs();   /* nothing matched: say so */
+                        dirty = true;
+                        return;
                     }
                 }
-                if (w) { act_focus_window(w); return; }
-                /* no window matched: a workspace whose own name did will do */
-                for (int i = 0; i < NWS; ++i)
-                    if (ci_contains(WSS[i].name, query)) { act_goto_workspace(&WSS[i]); return; }
-                QUERY_FLASH = now_secs();      /* nothing matched: say so */
-                dirty = true;
-                return;
             }
             if (ws_sel_win(&WSS[sel_ws])) act_focus_window(ws_sel_win(&WSS[sel_ws]));
             else                          act_goto_workspace(&WSS[sel_ws]);
@@ -6275,6 +6305,8 @@ static void handle_mouse_press(const SDL_MouseButtonEvent *b)
     int ws_idx = -1;
     int win_idx = hit_test(mx, my, &ws_idx);
 
+    mouse_moved = true;        /* clicking is intent even without moving first */
+
     if (editing) end_edit(true);                   /* a click elsewhere commits */
 
     /* a monitor picked up out of the map: it can be put down against
@@ -6445,6 +6477,19 @@ static void handle_mouse_motion(const SDL_MouseMotionEvent *mo)
     drag_x = mx;
     drag_y = my;
 
+    /* A new window gets a motion event for wherever the pointer already is,
+     * and a hand resting on the mouse sends a stream of them that go nowhere.
+     * Neither is the user pointing at anything, so the first position is only
+     * remembered, and the pointer starts selecting once it has left it. */
+    if (!mouse_moved) {
+        if (!mouse_seen) { mouse_seen = true; mouse_x0 = mx; mouse_y0 = my; }
+        else {
+            float dx = mx - mouse_x0, dy = my - mouse_y0;
+            float slop = 3.0f * SC;
+            if (dx * dx + dy * dy > slop * slop) { mouse_moved = true; dirty = true; }
+        }
+    }
+
     if (press_down && !drag_active) {
         float dx = mx - press_x, dy = my - press_y;
         if (dx * dx + dy * dy > (7.0f * SC) * (7.0f * SC)) {
@@ -6496,20 +6541,31 @@ static void handle_mouse_motion(const SDL_MouseMotionEvent *mo)
     }
     if (ph != pencil_hot) { pencil_hot = ph; dirty = true; }
 
-    if (ws_idx == hov_ws && win_idx == hov_win) return;
-
-    hov_ws = ws_idx;
-    hov_win = win_idx;
-    SDL_SetCursor(ws_idx >= 0 ? CUR_HAND : CUR_ARROW);
-    dirty = true;
+    if (ws_idx != hov_ws || win_idx != hov_win) {
+        hov_ws = ws_idx;
+        hov_win = win_idx;
+        SDL_SetCursor(ws_idx >= 0 ? CUR_HAND : CUR_ARROW);
+        dirty = true;
+    }
 
     /* Pointing at something selects it, so space, x, ctrl+digit and the rest
      * act on whatever is under the pointer, exactly as they do on whatever
-     * the arrow keys picked. */
-    if (ws_idx >= 0) {
-        sel_active = true;
-        sel_ws = ws_idx;
-        WSS[ws_idx].sel = (win_idx >= 0) ? win_idx - WSS[ws_idx].first : -1;
+     * the arrow keys picked.
+     *
+     * This cannot hang off "what is under the pointer changed": the pointer is
+     * already somewhere when the overview opens, so the first event it sends
+     * records that position without selecting anything, and moving inside that
+     * same tile afterwards changed nothing to notice — the cursor only
+     * appeared once the pointer crossed into a different workspace. */
+    if (ws_idx >= 0 && mouse_moved) {
+        int want = (win_idx >= 0) ? win_idx - WSS[ws_idx].first : -1;
+        if (!sel_active || sel_by_key || sel_ws != ws_idx || WSS[ws_idx].sel != want) {
+            sel_active = true;
+            sel_by_key = false;                /* resting here is not a choice */
+            sel_ws = ws_idx;
+            WSS[ws_idx].sel = want;
+            dirty = true;
+        }
     }
 }
 
@@ -6641,6 +6697,8 @@ static void backdrop_reply(const char *fmt, ...)
 static void backdrop_hover(float fx, float fy)
 {
     float x = fx * (float)RW, y = fy * (float)RH;
+
+    mouse_moved = true;        /* a pointer, just relayed from the window in front */
 
     int si = slot_at(x, y);
     if (si >= 0 && SLOTS[si].ws < 0) {            /* a free number */
@@ -7414,7 +7472,13 @@ int main(int argc, char **argv)
     apply_filter();
     rebuild_chrome();
 
+    /* Everything above picked a selection for the keyboard to start from, but
+     * nobody has pressed anything yet, so it is not drawn. start_selection
+     * still decides what the first arrow key moves away from. */
+    sel_by_key = false;
+
     if (SHOT_MX >= 0.0f) {                          /* pretend the pointer is there */
+        mouse_moved = true;                         /* a shot shows the cursor */
         hov_win = hit_test(SHOT_MX * MOUSE_SCALE, SHOT_MY * MOUSE_SCALE, &hov_ws);
     }
 
