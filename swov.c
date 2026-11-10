@@ -121,7 +121,7 @@ static uint64_t now_ms_(void)
 }
 
 #define APP_ID          "swov"
-#define SWOV_VERSION    "1.3.3"
+#define SWOV_VERSION    "1.3.4"
 #ifndef SWOV_BUILD                 /* set by the Makefile: md5 of this file */
 #define SWOV_BUILD "unknown"
 #endif
@@ -958,9 +958,17 @@ static JV *sway_query(uint32_t type)
     return v;
 }
 
+/* When sway was last told to do something by us. Moving or swapping a window
+ * makes sway focus it, which takes the keyboard off this overlay for a moment
+ * — and quitting on that is what closed the overview after a single
+ * rearrangement. Focus lost right after one of our own commands is our own
+ * doing, not the user leaving. */
+static uint64_t SELF_CMD_AT;
+
 static bool sway_cmd(const char *fmt, ...)
 {
     if (!fmt) return false;
+    SELF_CMD_AT = now_ms_();
     va_list ap;
     va_start(ap, fmt);
     int n = vsnprintf(NULL, 0, fmt, ap);
@@ -6831,10 +6839,19 @@ static void handle_event(const SwEvent *e)
 
     case SW_EV_KB_LEAVE:
         /* Losing the keyboard normally means the overview's moment has
-         * passed. Not while we are the backdrop for a launcher we started:
-         * that launcher taking the focus is the whole point, and quitting
-         * here is what made the overview vanish the instant swas appeared. */
-        if (C.quit_on_focus_loss && !SERVING && !BACKDROP) running = false;
+         * passed. Three times it does not: while we are the backdrop for a
+         * launcher we started, where that launcher taking the focus is the
+         * whole point; and in the moment after we moved a window ourselves,
+         * where sway focuses what it moved and hands the keyboard straight
+         * back. Going to a window or a workspace on purpose sets `running`
+         * itself, so nothing here is needed for those. */
+        if (!C.quit_on_focus_loss || SERVING || BACKDROP) break;
+        if (SELF_CMD_AT && now_ms_() - SELF_CMD_AT < 1000) {
+            /* ask for it back, in case sway does not offer */
+            sw_win_keyboard(WIN, SW_KBD_EXCLUSIVE);
+            break;
+        }
+        running = false;
         break;
 
     default:
