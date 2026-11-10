@@ -21,6 +21,8 @@
  * than Shift — and neither types anything.
  *
  * Define SW_KEYMAP_IMPL in exactly one translation unit.
+ *
+ * Written/modified by: Claude Opus 5
  */
 #ifndef SW_KEYMAP_H
 #define SW_KEYMAP_H

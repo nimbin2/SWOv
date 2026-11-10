@@ -13,6 +13,8 @@
  * stb_truetype.h must be on the include path; this header includes it, and
  * emits its implementation unless SW_DRAW_NO_STB_IMPL says otherwise (define
  * that when something else in the program already does).
+ *
+ * Written/modified by: Claude Opus 5
  */
 #ifndef SW_DRAW_H
 #define SW_DRAW_H
@@ -56,10 +58,12 @@ typedef struct {
 
 typedef struct {
     int px;
-    float sc_pri, sc_alt, ascent, lineh;
+    float sc_pri, sc_alt, sc_bold, ascent, lineh;
     Glyph *tab;
     int cap, n;
     bool used;
+    bool bold;        /* ask the bold face for glyphs */
+    bool synth;       /* no bold face: embolden by drawing twice */
 } Font;
 
 /* An image to blit: straight RGBA bytes, as nanosvg and stb_image hand them
@@ -68,6 +72,8 @@ typedef struct {
     const unsigned char *rgba;
     int w, h, stride;
 } Image;
+
+#define SW_WHITE ((Col){ 255, 255, 255, 255 })
 
 /* -------------------------------------------------------------- interface */
 
@@ -78,6 +84,10 @@ Col   sw_col_mix(Col a, Col b, float t);
 void  sw_fonts_init(const char *primary, const char *fallback);
 void  sw_fonts_free(void);
 Font *sw_font(int px);                       /* cached per pixel size */
+/* An optional bold face. Without one, sw_font_bold emboldens the regular
+   face by drawing each glyph twice, a third of a pixel apart. */
+void  sw_fonts_bold(const char *path);
+Font *sw_font_bold(int px);
 float sw_text_width(Font *f, const char *s);
 
 void  sw_canvas_clip(Canvas *cv, int x0, int y0, int x1, int y1);
@@ -98,6 +108,22 @@ void  sw_fill_sector(Canvas *cv, float cx, float cy, float r0, float r1,
 void  sw_blit(Canvas *cv, Image img, float x, float y, float w, float h,
               float alpha);
 void  sw_text(Canvas *cv, Font *f, float x, float baseline, Col c, const char *s);
+float sw_text_width_n(Font *f, const char *s, size_t n);
+float sw_font_descent(Font *f);              /* positive, below the baseline */
+
+/* An offscreen canvas, for a frame that is drawn once and then scaled,
+   faded or blurred as a whole. Same pixel format as a window's canvas. */
+Canvas *sw_canvas_new(int w, int h);
+void    sw_canvas_free(Canvas *cv);
+void    sw_canvas_clear(Canvas *cv);         /* to nothing, ignoring the clip */
+/* Scale `src` into `dst`, box-filtered when it shrinks. `tint` multiplies the
+   colour (use SW_WHITE for none); `alpha` the whole thing. */
+void    sw_blit_canvas(Canvas *dst, const Canvas *src, float x, float y,
+                       float w, float h, Col tint, float alpha);
+
+/* Write a canvas out as a PNG. Stored (uncompressed) deflate: no zlib, and
+   a big file, which is fine for the one frame a --shot asks for. */
+bool    sw_write_png(const char *path, const Canvas *cv);
 
 #ifdef __cplusplus
 }
@@ -164,7 +190,7 @@ Col sw_col_mix(Col a, Col b, float t)
  * cached per size on first use, so any codepoint works — a status line is
  * full of box drawing characters and symbols. */
 
-static FontFile sw_font_pri, sw_font_alt;
+static FontFile sw_font_pri, sw_font_alt, sw_font_bld;
 
 #define SW_FONT_CACHE 12
 static Font sw_font_cache[SW_FONT_CACHE];
@@ -271,6 +297,16 @@ void sw_fonts_init(const char *primary, const char *fallback)
     if (sw_file_exists(alt) && strcmp(alt, path)) sw_font_file_load(&sw_font_alt, alt);
 }
 
+void sw_fonts_bold(const char *path)
+{
+    char p[SW_PATHMAX] = "";
+    if (!path || !*path) return;
+    snprintf(p, sizeof(p), "%s", path);
+    if (!sw_file_exists(p) && !sw_fc_match(path, p, sizeof(p))) return;
+    if (!sw_file_exists(p)) return;
+    sw_font_file_load(&sw_font_bld, p);
+}
+
 void sw_fonts_free(void)
 {
     for (int i = 0; i < SW_FONT_CACHE; ++i) {
@@ -283,8 +319,10 @@ void sw_fonts_free(void)
     }
     free(sw_font_pri.data);
     free(sw_font_alt.data);
+    free(sw_font_bld.data);
     memset(&sw_font_pri, 0, sizeof(sw_font_pri));
     memset(&sw_font_alt, 0, sizeof(sw_font_alt));
+    memset(&sw_font_bld, 0, sizeof(sw_font_bld));
 }
 
 static void sw_glyph_tab_init(Font *f, int cap)
@@ -324,9 +362,13 @@ static Glyph *sw_glyph_get(Font *f, unsigned cp)
     Glyph *g = glyph_slot(f, cp);
     if (g->cp == cp) return g;
 
-    FontFile *ff = &sw_font_pri;
-    float sc = f->sc_pri;
-    int gi = sw_font_pri.ok ? stbtt_FindGlyphIndex(&sw_font_pri.info, (int)cp) : 0;
+    FontFile *ff = (f->bold && sw_font_bld.ok) ? &sw_font_bld : &sw_font_pri;
+    float sc = (f->bold && sw_font_bld.ok) ? f->sc_bold : f->sc_pri;
+    int gi = ff->ok ? stbtt_FindGlyphIndex(&ff->info, (int)cp) : 0;
+    if (!gi && ff != &sw_font_pri && sw_font_pri.ok) {
+        int gi0 = stbtt_FindGlyphIndex(&sw_font_pri.info, (int)cp);
+        if (gi0) { ff = &sw_font_pri; sc = f->sc_pri; gi = gi0; }
+    }
     if (!gi && sw_font_alt.ok) {
         int gi2 = stbtt_FindGlyphIndex(&sw_font_alt.info, (int)cp);
         if (gi2) { ff = &sw_font_alt; sc = f->sc_alt; gi = gi2; }
@@ -353,11 +395,12 @@ static Glyph *sw_glyph_get(Font *f, unsigned cp)
 }
 
 /* One Font per pixel size (and therefore per output scale). */
-Font *sw_font(int px)
+static Font *sw_font_get(int px, bool bold)
 {
     if (px < 4) px = 4;
     for (int i = 0; i < SW_FONT_CACHE; ++i)
-        if (sw_font_cache[i].used && sw_font_cache[i].px == px) return &sw_font_cache[i];
+        if (sw_font_cache[i].used && sw_font_cache[i].px == px &&
+            sw_font_cache[i].bold == bold) return &sw_font_cache[i];
 
     int slot = -1;
     for (int i = 0; i < SW_FONT_CACHE; ++i) if (!sw_font_cache[i].used) { slot = i; break; }
@@ -370,16 +413,26 @@ Font *sw_font(int px)
     }
     f->used = true;
     f->px = px;
+    f->bold = bold;
+    f->synth = bold && !sw_font_bld.ok;
     f->sc_pri = sw_font_pri.ok ? stbtt_ScaleForPixelHeight(&sw_font_pri.info, (float)px) : 1.0f;
     f->sc_alt = sw_font_alt.ok ? stbtt_ScaleForPixelHeight(&sw_font_alt.info, (float)px) : 1.0f;
-    int asc = 0, desc = 0, gap = 0;
-    if (sw_font_pri.ok) stbtt_GetFontVMetrics(&sw_font_pri.info, &asc, &desc, &gap);
-    f->ascent = (float)asc * f->sc_pri;
-    f->lineh = (float)(asc - desc) * f->sc_pri;
+    f->sc_bold = sw_font_bld.ok ? stbtt_ScaleForPixelHeight(&sw_font_bld.info, (float)px) : 1.0f;
+    {
+        FontFile *mf = (bold && sw_font_bld.ok) ? &sw_font_bld : &sw_font_pri;
+        float msc = (bold && sw_font_bld.ok) ? f->sc_bold : f->sc_pri;
+        int asc = 0, desc = 0, gap = 0;
+        if (mf->ok) stbtt_GetFontVMetrics(&mf->info, &asc, &desc, &gap);
+        f->ascent = (float)asc * msc;
+        f->lineh = (float)(asc - desc) * msc;
+    }
     if (f->ascent <= 0) { f->ascent = (float)px * 0.8f; f->lineh = (float)px; }
     sw_glyph_tab_init(f, 256);
     return f;
 }
+
+Font *sw_font(int px)      { return sw_font_get(px, false); }
+Font *sw_font_bold(int px) { return sw_font_get(px, true); }
 
 static unsigned sw_utf8_next(const char **p)
 {
@@ -405,7 +458,7 @@ float sw_text_width(Font *f, const char *s)
     while (*p) {
         unsigned cp = sw_utf8_next(&p);
         if (cp == 0xFE0F || cp == 0x200D) continue;   /* variation selectors */
-        w += sw_glyph_get(f, cp)->adv;
+        w += sw_glyph_get(f, cp)->adv + (f->synth ? 0.35f : 0.0f);
     }
     return w;
 }
@@ -526,17 +579,20 @@ void sw_text(Canvas *cv, Font *f, float x, float baseline, Col c, const char *s)
         if (g->bmp) {
             int gx = (int)lroundf(pen) + g->x0;
             int gy = (int)lroundf(baseline) + g->y0;
-            for (int yy = 0; yy < g->h; ++yy) {
-                int ty = gy + yy;
-                if (ty < cv->cy0 || ty >= cv->cy1) continue;
-                const unsigned char *row = g->bmp + (size_t)yy * (size_t)g->w;
-                for (int xx = 0; xx < g->w; ++xx) {
-                    unsigned char a = row[xx];
-                    if (a) sw_blend(cv, gx + xx, ty, c, (float)a / 255.0f);
+            int pass, passes = f->synth ? 2 : 1;
+            for (pass = 0; pass < passes; ++pass) {
+                for (int yy = 0; yy < g->h; ++yy) {
+                    int ty = gy + yy;
+                    if (ty < cv->cy0 || ty >= cv->cy1) continue;
+                    const unsigned char *row = g->bmp + (size_t)yy * (size_t)g->w;
+                    for (int xx = 0; xx < g->w; ++xx) {
+                        unsigned char a = row[xx];
+                        if (a) sw_blend(cv, gx + pass + xx, ty, c, (float)a / 255.0f);
+                    }
                 }
             }
         }
-        pen += g->adv;
+        pen += g->adv + (f->synth ? 0.35f : 0.0f);
     }
 }
 
@@ -672,6 +728,256 @@ void sw_blit(Canvas *cv, Image img, float x, float y, float w, float h,
             sw_blend(cv, dx, dy, c, (float)(as / n) / 255.0f * alpha);
         }
     }
+}
+
+
+float sw_text_width_n(Font *f, const char *s, size_t n)
+{
+    char buf[512];
+    if (!f || !s || n == 0) return 0.0f;
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    memcpy(buf, s, n);
+    buf[n] = 0;
+    return sw_text_width(f, buf);
+}
+
+float sw_font_descent(Font *f)
+{
+    if (!f) return 0.0f;
+    float d = f->lineh - f->ascent;
+    return d > 0.0f ? d : 0.0f;
+}
+
+Canvas *sw_canvas_new(int w, int h)
+{
+    Canvas *cv;
+    if (w <= 0 || h <= 0) return NULL;
+    cv = (Canvas *)calloc(1, sizeof *cv);
+    if (!cv) return NULL;
+    cv->px = (uint32_t *)calloc((size_t)w * (size_t)h, 4);
+    if (!cv->px) { free(cv); return NULL; }
+    cv->w = w; cv->h = h;
+    sw_canvas_clip_all(cv);
+    return cv;
+}
+
+void sw_canvas_free(Canvas *cv)
+{
+    if (!cv) return;
+    free(cv->px);
+    free(cv);
+}
+
+void sw_canvas_clear(Canvas *cv)
+{
+    if (!cv || !cv->px) return;
+    memset(cv->px, 0, (size_t)cv->w * (size_t)cv->h * 4);
+}
+
+void sw_blit_canvas(Canvas *dst, const Canvas *src, float x, float y,
+                    float w, float h, Col tint, float alpha)
+{
+    int ix0, iy0, ix1, iy1, dx, dy, bx, by;
+    float sx, sy;
+    if (!dst || !src || !src->px || w <= 0.0f || h <= 0.0f || alpha <= 0.0f) return;
+
+    ix0 = sw_clampi((int)floorf(x),     dst->cx0, dst->cx1);
+    iy0 = sw_clampi((int)floorf(y),     dst->cy0, dst->cy1);
+    ix1 = sw_clampi((int)ceilf(x + w),  dst->cx0, dst->cx1);
+    iy1 = sw_clampi((int)ceilf(y + h),  dst->cy0, dst->cy1);
+
+    /* 1:1 and aligned: a straight premultiplied-over copy, no resampling */
+    if (tint.r == 255 && tint.g == 255 && tint.b == 255 &&
+        (int)w == src->w && (int)h == src->h &&
+        x == floorf(x) && y == floorf(y)) {
+        int ox = (int)x, oy = (int)y;
+        for (dy = iy0; dy < iy1; ++dy) {
+            const uint32_t *srow;
+            int sy1 = dy - oy;
+            if (sy1 < 0 || sy1 >= src->h) continue;
+            srow = src->px + (size_t)sy1 * (size_t)src->w;
+            for (dx = ix0; dx < ix1; ++dx) {
+                uint32_t p;
+                unsigned av;
+                Col c;
+                int sx1 = dx - ox;
+                if (sx1 < 0 || sx1 >= src->w) continue;
+                p = srow[sx1];
+                av = (p >> 24) & 0xff;
+                if (!av) continue;
+                c.r = (uint8_t)sw_clampi((int)((p >> 16 & 0xff) * 255 / av), 0, 255);
+                c.g = (uint8_t)sw_clampi((int)((p >> 8 & 0xff) * 255 / av), 0, 255);
+                c.b = (uint8_t)sw_clampi((int)((p & 0xff) * 255 / av), 0, 255);
+                c.a = 255;
+                sw_blend(dst, dx, dy, c, (float)av / 255.0f * alpha);
+            }
+        }
+        return;
+    }
+
+    sx = (float)src->w / w;
+    sy = (float)src->h / h;
+    bx = (int)sx; if (bx < 1) bx = 1;
+    by = (int)sy; if (by < 1) by = 1;
+
+    for (dy = iy0; dy < iy1; ++dy) {
+        for (dx = ix0; dx < ix1; ++dx) {
+            float u = ((float)dx + 0.5f - x) * sx;
+            float v = ((float)dy + 0.5f - y) * sy;
+            int u0 = (int)u, v0 = (int)v, i, j;
+            unsigned as = 0, rs = 0, gs = 0, bs = 0, n = 0;
+            Col c;
+            float a;
+            if (u0 < 0 || v0 < 0 || u0 >= src->w || v0 >= src->h) continue;
+            for (j = 0; j < by; ++j) {
+                int vv = v0 + j;
+                const uint32_t *row;
+                if (vv >= src->h) break;
+                row = src->px + (size_t)vv * (size_t)src->w;
+                for (i = 0; i < bx; ++i) {
+                    uint32_t p;
+                    int uu = u0 + i;
+                    if (uu >= src->w) break;
+                    p = row[uu];
+                    as += (p >> 24) & 0xff;
+                    rs += (p >> 16) & 0xff;
+                    gs += (p >> 8) & 0xff;
+                    bs += p & 0xff;
+                    n++;
+                }
+            }
+            if (!n || !as) continue;
+            a = (float)(as / n) / 255.0f;
+            /* the source is premultiplied; sw_blend wants straight colour */
+            c.r = (uint8_t)sw_clampi((int)((float)(rs / n) / a + 0.5f), 0, 255);
+            c.g = (uint8_t)sw_clampi((int)((float)(gs / n) / a + 0.5f), 0, 255);
+            c.b = (uint8_t)sw_clampi((int)((float)(bs / n) / a + 0.5f), 0, 255);
+            c.a = 255;
+            if (tint.r != 255 || tint.g != 255 || tint.b != 255) {
+                c.r = (uint8_t)(c.r * tint.r / 255);
+                c.g = (uint8_t)(c.g * tint.g / 255);
+                c.b = (uint8_t)(c.b * tint.b / 255);
+            }
+            sw_blend(dst, dx, dy, c, a * alpha);
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ PNG */
+
+static uint32_t sw_crc32(const unsigned char *p, size_t n, uint32_t crc)
+{
+    static uint32_t tab[256];
+    static int built = 0;
+    size_t i;
+    if (!built) {
+        uint32_t k, c;
+        int b;
+        for (k = 0; k < 256; ++k) {
+            c = k;
+            for (b = 0; b < 8; ++b) c = (c & 1) ? 0xedb88320u ^ (c >> 1) : c >> 1;
+            tab[k] = c;
+        }
+        built = 1;
+    }
+    crc ^= 0xffffffffu;
+    for (i = 0; i < n; ++i) crc = tab[(crc ^ p[i]) & 0xff] ^ (crc >> 8);
+    return crc ^ 0xffffffffu;
+}
+
+static void sw_png_chunk(FILE *f, const char *tag, const unsigned char *d, size_t n)
+{
+    unsigned char hdr[8];
+    uint32_t crc;
+    unsigned char cb[4];
+    hdr[0] = (unsigned char)(n >> 24); hdr[1] = (unsigned char)(n >> 16);
+    hdr[2] = (unsigned char)(n >> 8);  hdr[3] = (unsigned char)n;
+    memcpy(hdr + 4, tag, 4);
+    fwrite(hdr, 1, 8, f);
+    if (n) fwrite(d, 1, n, f);
+    crc = sw_crc32((const unsigned char *)tag, 4, 0);
+    if (n) crc = sw_crc32(d, n, crc);
+    cb[0] = (unsigned char)(crc >> 24); cb[1] = (unsigned char)(crc >> 16);
+    cb[2] = (unsigned char)(crc >> 8);  cb[3] = (unsigned char)crc;
+    fwrite(cb, 1, 4, f);
+}
+
+bool sw_write_png(const char *path, const Canvas *cv)
+{
+    FILE *f;
+    unsigned char ihdr[13];
+    unsigned char *raw, *z;
+    size_t rawn, zn, pos, off;
+    uint32_t a = 1, b = 0;
+    int y, x;
+    static const unsigned char sig[8] = { 137, 80, 78, 71, 13, 10, 26, 10 };
+
+    if (!path || !cv || !cv->px) return false;
+    rawn = ((size_t)cv->w * 4 + 1) * (size_t)cv->h;
+    raw = (unsigned char *)malloc(rawn);
+    if (!raw) return false;
+
+    /* un-premultiply back to straight RGBA, one filter byte a row */
+    pos = 0;
+    for (y = 0; y < cv->h; ++y) {
+        raw[pos++] = 0;
+        for (x = 0; x < cv->w; ++x) {
+            uint32_t p = cv->px[(size_t)y * (size_t)cv->w + x];
+            unsigned av = (p >> 24) & 0xff;
+            unsigned rv = (p >> 16) & 0xff, gv = (p >> 8) & 0xff, bv = p & 0xff;
+            if (av && av < 255) {
+                rv = rv * 255u / av; if (rv > 255) rv = 255;
+                gv = gv * 255u / av; if (gv > 255) gv = 255;
+                bv = bv * 255u / av; if (bv > 255) bv = 255;
+            }
+            raw[pos++] = (unsigned char)rv;
+            raw[pos++] = (unsigned char)gv;
+            raw[pos++] = (unsigned char)bv;
+            raw[pos++] = (unsigned char)av;
+        }
+    }
+
+    /* zlib stream, stored deflate blocks of at most 65535 bytes */
+    zn = 2 + 4 + rawn + 5 * ((rawn + 65534) / 65535) + 1;
+    z = (unsigned char *)malloc(zn);
+    if (!z) { free(raw); return false; }
+    pos = 0;
+    z[pos++] = 0x78; z[pos++] = 0x01;
+    for (off = 0; off < rawn; ) {
+        size_t n = rawn - off > 65535 ? 65535 : rawn - off;
+        z[pos++] = (off + n >= rawn) ? 1 : 0;
+        z[pos++] = (unsigned char)n;         z[pos++] = (unsigned char)(n >> 8);
+        z[pos++] = (unsigned char)(~n);      z[pos++] = (unsigned char)((~n) >> 8);
+        memcpy(z + pos, raw + off, n);
+        pos += n;
+        off += n;
+    }
+    for (off = 0; off < rawn; ++off) {       /* adler32 */
+        a = (a + raw[off]) % 65521u;
+        b = (b + a) % 65521u;
+    }
+    z[pos++] = (unsigned char)(b >> 8); z[pos++] = (unsigned char)b;
+    z[pos++] = (unsigned char)(a >> 8); z[pos++] = (unsigned char)a;
+    free(raw);
+
+    f = fopen(path, "wb");
+    if (!f) { free(z); return false; }
+    fwrite(sig, 1, 8, f);
+    ihdr[0] = (unsigned char)((unsigned)cv->w >> 24);
+    ihdr[1] = (unsigned char)((unsigned)cv->w >> 16);
+    ihdr[2] = (unsigned char)((unsigned)cv->w >> 8);
+    ihdr[3] = (unsigned char)cv->w;
+    ihdr[4] = (unsigned char)((unsigned)cv->h >> 24);
+    ihdr[5] = (unsigned char)((unsigned)cv->h >> 16);
+    ihdr[6] = (unsigned char)((unsigned)cv->h >> 8);
+    ihdr[7] = (unsigned char)cv->h;
+    ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+    sw_png_chunk(f, "IHDR", ihdr, 13);
+    sw_png_chunk(f, "IDAT", z, pos);
+    sw_png_chunk(f, "IEND", NULL, 0);
+    free(z);
+    fclose(f);
+    return true;
 }
 
 #endif /* SW_DRAW_IMPL_ONCE */

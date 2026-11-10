@@ -1,47 +1,30 @@
-shared: the Wayland and drawing layer swas and swov will stand on
+shared: bold faces, offscreen canvases and a PNG writer
 
-The first half of taking SDL out. swbr has never linked it — one surface on
-the layer shell, a shm buffer pool, and everything drawn by hand into ARGB —
-so the stack is proven; this lifts it out of swbr into three headers the other
-two can use. Nothing is ported yet: swas and swov still link SDL3 after this
-commit.
+What swov needed from the layer that swas and swbr already use, added
+without changing anything the two of them do.
 
-sw_draw.h is a Canvas: a pixel buffer and a clip rectangle. Rounded
-rectangles and strokes come out of a signed distance field, text out of
-stb_truetype with a per-size glyph cache, images out of a box filter, plus the
-triangle, circle and annulus sector a radial menu is made of. It needs no
-compositor and no GPU, which is the point as much as the short link line: a
-whole frame can be drawn and then measured in a test.
+sw_draw.h
+  - sw_fonts_bold() / sw_font_bold(): a second face for headings. Without
+    one the regular face is emboldened by drawing each glyph twice, a
+    third of a pixel apart, so bold still reads as bold on a desktop that
+    ships only one weight. The cache is keyed on size and weight together.
+  - sw_canvas_new/free/clear and sw_blit_canvas(): an offscreen canvas
+    that can be scaled, tinted and faded onto another. Shrinking box-
+    filters; a 1:1 aligned blit is a straight premultiplied-over copy.
+    This is what swov's backdrop fade and its full -> half -> small blur
+    chain are made of.
+  - sw_write_png(): one canvas to a PNG, stored (uncompressed) deflate,
+    for swov --shot. No zlib, a big file, which is fine for one frame.
+  - sw_text_width_n() and sw_font_descent(), for measuring part of a
+    string and centring a line in a box.
 
-sw_wl.h is a layer-shell window with that canvas in it — pointer, keyboard,
-cursor-shape, two buffers, one event loop. The protocol marshalling is
-swbr's hand-written glue, so there is still no wayland-scanner step.
+sw_wl.h
+  - SwEvent.code carries the raw evdev keycode, so a program can read a
+    key by its place on the board rather than by what it types. swov's
+    number row needs that on a layout where the digits take shift.
+  - sw_win_create() accepts a NULL SwApp: a program that drives its own
+    frames with sw_win_begin/end has no callbacks to give, and passing
+    NULL used to dereference it.
 
-sw_keymap.h reads the keymap the compositor sends over wl_keyboard.keymap and
-answers what a key types. That is the piece that would otherwise be
-libxkbcommon. It handles the four shift levels, AltGr, caps lock and the
-keypad's NumLock; it does not handle dead keys, compose or layout groups,
-which a search box does not need.
-
-Checked, not assumed:
-
-- Drawing, by rendering frames and counting pixels: a 20x20 rect covers 400
-  and half that when clipped; r=10 corners lose their pixels and the centre
-  stays solid; a stroke is a ring with an empty middle; a quarter annulus
-  covers a quarter of the ring and r0 leaves the hole; a 2x2 image fills its
-  box at the right colour, at half alpha, and a 64x64 checkerboard shrunk to
-  8x8 averages to 127 rather than picking a pixel.
-- The keymap, against libxkbcommon on the stock us, de, fr, es, gb, it, se,
-  no, dk, pl, cz and ru layouts — every keycode at every modifier
-  combination. The characters typed match exactly on all twelve. Two keysyms
-  differ, PrintScreen and Pause, whose second level is selected by Control
-  rather than Shift; neither types anything.
-- The window, by running a demo on it under a headless sway and looking at
-  the screenshot: rounded surface on the overlay layer, border, text at three
-  sizes, shapes, all correct.
-
-Three bugs the tests found rather than review: each key line in an xkb keymap
-ends in "};", so scanning for that as the end of the symbols block stopped
-after the first key; a key's symbol list is not the first bracket on the line,
-because type[Group1] comes first; and uint16_t silently truncated the XF86
-media keysyms.
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01SuAfijAAYjLpcVwhCq3AF4

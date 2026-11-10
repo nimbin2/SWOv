@@ -3,10 +3,10 @@
 # Copy to ${XDG_CONFIG_HOME:-~/.config}/swov/config and edit.
 # Every value below is the built-in default, so an empty file behaves the same.
 # Single settings can also be overridden on the command line:
-#     swov ui_scale=1.2 ssaa=1        (or --ui_scale=1.2, or -s ui_scale=1.2)
+#     swov ui_scale=1.2 blur=2        (or --ui_scale=1.2, or -s ui_scale=1.2)
 
 # --- rendering ---
-ssaa=2             # full-scene supersampling 1..4 (smooths edges *and* text)
+ssaa=2             # ignored: every shape is antialiased as it is drawn
                    # alias: aa.  automatically reduced on very large screens
 icons=1            # show .desktop icons (PNG/SVG/XPM); 0 = text only
 icon_px=40         # icon edge length; shrinks by itself on small cards

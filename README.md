@@ -1,8 +1,11 @@
 # swov
 
-A window and workspace overview for [Sway](https://swaywm.org), drawn with SDL3.
-Each workspace is a tile; inside it, windows sit where they sit on the real
-screen. Click one to focus it, or drag it somewhere else.
+A window and workspace overview for [Sway](https://swaywm.org). Each workspace
+is a tile; inside it, windows sit where they sit on the real screen. Click one
+to focus it, or drag it somewhere else.
+
+No toolkit. swov draws itself on a Wayland layer-shell surface and links only
+`libwayland-client`.
 
 ![swov](screenshot.png)
 
@@ -13,7 +16,7 @@ screen. Click one to focus it, or drag it somewhere else.
 Debian trixie and newer:
 
 ```sh
-sudo apt install build-essential pkg-config libsdl3-dev libsdl3-image-dev libsdl3-ttf-dev
+sudo apt install build-essential pkg-config libwayland-dev
 make
 sudo make install     # /usr/bin, examples in /usr/share/swov
 make config           # optional: config.example -> ~/.config/swov/config
@@ -21,9 +24,6 @@ make link             # or: config -> the installed example, kept in sync
 ```
 
 `make debug` builds `swov-debug` with the address and UB sanitizers.
-
-On bookworm the SDL3 packages do not exist yet; build SDL, SDL_image and
-SDL_ttf 3.2+ from source and set `PKG_CONFIG_PATH`.
 
 Needs a running sway session (`$SWAYSOCK`) and any TTF font.
 
@@ -384,7 +384,7 @@ feels slow:
 
 ```
 swov: sway socket    0.1 ms   (  0.1 total)
-swov: SDL_Init       1.8 ms   (  1.9 total)
+swov: wayland connect 1.8 ms  (  1.9 total)
 swov: font lookup  114.0 ms   (123.6 total)   <- fc-match, once per font
 ```
 
@@ -422,7 +422,7 @@ key is also a command line option:
 
 ```sh
 swov ui_scale=1.2 hl=ff8800
-swov --ssaa=1 --header_pos=top-left
+swov --header_pos=top-left
 swov --shot /tmp/o.png     # one frame to a PNG, for tuning colours
 ```
 
@@ -436,7 +436,6 @@ lists them. The file above is read after it, so swov's own config always wins.
 | key | |
 | --- | --- |
 | `ui_scale` | scales all text at once |
-| `ssaa` | supersampling 1–4; drops to 1 by itself on very large screens |
 | `bg` | the scrim over the desktop; `0d111700` for none |
 | `float_alpha` | how see-through floating and fullscreen windows are |
 | `win_gap`, `screen_pad` | space between windows, and around them |
@@ -478,9 +477,14 @@ keep your own copy. Edits you make there are overwritten on install.
 - Reordering workspaces renames them, which is all sway offers. Swaps go through
   a temporary name.
 - Scratchpad windows are not shown.
-- The overlay opens on the focused output, found by matching sway's output
-  geometry against the display list — SDL often reports a monitor model where
-  sway reports the connector, so names alone are not enough.
+- The overlay opens on the focused output: sway and Wayland both name outputs
+  by connector, so the name sway gives is the one the layer surface asks for.
+- The window is a layer-shell overlay, not a real window: nothing underneath
+  is resized, unmapped or restacked while it is up.
+- Keyboard layout comes from the compositor's own keymap, so dead keys, AltGr
+  and non-US layouts type correctly. There is no `libxkbcommon` to install.
+- `ssaa` is accepted and ignored. Every shape is antialiased as it is drawn,
+  so there is nothing left to supersample.
 - Tabbed and stacked containers are drawn the way sway draws them: a tab strip
   across the top, the visible window's contents below. Each tab is clickable.
 - Only the name plate of a floating or fullscreen window takes the mouse; clicks

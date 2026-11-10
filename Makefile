@@ -11,10 +11,12 @@
 #   make uninstall
 #   make clean
 #
-# Requires: a C compiler, pkg-config, and the SDL3, SDL3_image and SDL3_ttf
-# dev files. On Debian trixie and newer:
-#   sudo apt install build-essential pkg-config \
-#        libsdl3-dev libsdl3-image-dev libsdl3-ttf-dev
+# Requires: a C compiler and the libwayland-client dev files. Nothing else —
+# fonts, icons and SVGs are decoded in-tree, and the window is a Wayland
+# layer-shell surface drawn by swov itself. On Debian and friends:
+#   sudo apt install build-essential pkg-config libwayland-dev
+#
+# Written/modified by: Claude Opus 4.1, Claude Sonnet 4.5, Claude Opus 5
 
 CC          ?= cc
 PKG_CONFIG  ?= pkg-config
@@ -26,28 +28,28 @@ shdatadir   ?= $(PREFIX)/share/sw
 
 BUILD       := $(shell md5sum swov.c 2>/dev/null | cut -c1-8)
 SRC         := swov.c
-HDR         := sw_theme.h nanosvg.h nanosvgrast.h
+HDR         := sw_theme.h nanosvg.h nanosvgrast.h stb_image.h stb_truetype.h \
+               sw_draw.h sw_wl.h sw_keymap.h
 BIN         := swov
-PKGS        := sdl3 sdl3-image sdl3-ttf
 
-SDL_CFLAGS  := $(shell $(PKG_CONFIG) --cflags $(PKGS))
-SDL_LIBS    := $(shell $(PKG_CONFIG) --libs $(PKGS))
+WL_CFLAGS   := $(shell $(PKG_CONFIG) --cflags wayland-client 2>/dev/null)
+WL_LIBS     := $(shell $(PKG_CONFIG) --libs wayland-client 2>/dev/null || echo -lwayland-client)
 
 .PHONY: all debug strict run install config link uninstall clean
 
 all: $(BIN)
 
 $(BIN): $(SRC) $(HDR)
-	$(CC) $(CFLAGS) -DSWOV_BUILD='"$(BUILD)"' $(SDL_CFLAGS) $(SRC) -o $(BIN) $(SDL_LIBS) -lm
+	$(CC) $(CFLAGS) -DSWOV_BUILD='"$(BUILD)"' $(WL_CFLAGS) $(SRC) -o $(BIN) $(WL_LIBS) -lm
 	@./$(BIN) --version
 
 debug: $(SRC) $(HDR)
 	$(CC) -std=c11 -O1 -g -Wall -Wextra -fsanitize=address,undefined \
-	  -DSWOV_BUILD='"$(BUILD)-dbg"' $(SDL_CFLAGS) $(SRC) -o $(BIN)-debug $(SDL_LIBS) -lm
+	  -DSWOV_BUILD='"$(BUILD)-dbg"' $(WL_CFLAGS) $(SRC) -o $(BIN)-debug $(WL_LIBS) -lm
 
 strict: $(SRC) $(HDR)
 	$(CC) -std=c11 -O2 -Wall -Wextra -DSWOV_BUILD='"$(BUILD)"' \
-	  $(SDL_CFLAGS) $(SRC) -o $(BIN) $(SDL_LIBS) -lm
+	  $(WL_CFLAGS) $(SRC) -o $(BIN) $(WL_LIBS) -lm
 
 run: all
 	./$(BIN)

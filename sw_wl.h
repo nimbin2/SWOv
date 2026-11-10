@@ -15,6 +15,8 @@
  *
  * Define SW_WL_IMPL in exactly one translation unit. sw_draw.h must be
  * included (with its implementation) by the same program.
+ *
+ * Written/modified by: Claude Opus 5
  */
 #ifndef SW_WL_H
 #define SW_WL_H
@@ -55,6 +57,33 @@ typedef struct {
     const char *output;          /* connector name, NULL = compositor picks   */
 } SwWinOpts;
 
+/* Input as a queue, for a program with its own loop. The callbacks below
+ * still fire; this is the same events, kept so an immediate-mode draw loop
+ * can read them where it already reads everything else. Button numbers are
+ * the Linux input codes Wayland uses. */
+enum { SW_BTN_LEFT = 0x110, SW_BTN_RIGHT = 0x111, SW_BTN_MIDDLE = 0x112 };
+
+typedef enum {
+    SW_EV_NONE = 0, SW_EV_MOTION, SW_EV_BUTTON, SW_EV_AXIS, SW_EV_KEY,
+    SW_EV_LEAVE, SW_EV_KB_ENTER, SW_EV_KB_LEAVE, SW_EV_CONFIGURE, SW_EV_CLOSED
+} SwEvType;
+
+typedef struct {
+    SwEvType type;
+    float    x, y;            /* motion, button */
+    int      button;
+    bool     pressed;         /* button, key */
+    float    ax, ay;          /* axis, in surface units */
+    uint32_t keysym;          /* key */
+    uint32_t code;            /* key: the raw evdev keycode, for the key's
+                                 place on the board rather than what it types */
+    unsigned mods;
+    char     text[8];         /* what the key typed, "" for none */
+    int      w, h;            /* configure */
+} SwEvent;
+
+bool sw_poll(SwEvent *out);   /* false when the queue is empty */
+
 typedef struct {
     void *user;
     /* Draw a frame. The canvas is already cleared to nothing. */
@@ -85,6 +114,14 @@ void    sw_win_cursor(SwWin *w, unsigned shape);
 int     sw_win_width(const SwWin *w);
 int     sw_win_height(const SwWin *w);
 float   sw_win_scale(const SwWin *w);
+
+/* For a program that drives its own frames — an animation loop rather than
+ * a repaint on change. Begin hands back the canvas for the next buffer, or
+ * NULL when the surface is not ready or both buffers are still on screen;
+ * end attaches and commits it. Between the two, draw. A program that uses
+ * these leaves app.paint NULL. */
+Canvas *sw_win_begin(SwWin *w);
+void    sw_win_end(SwWin *w);
 
 int     sw_fd(void);                   /* the display fd, for your own poll() */
 bool    sw_flush(void);
@@ -359,9 +396,32 @@ struct SwWin {
     int    bw, bh, stride;
 
     unsigned cursor;
+    int    slot;                 /* the buffer sw_win_begin handed out */
 };
 
 const char *sw_error(void) { return SWERR; }
+
+/* A ring, deliberately small: these are human-speed events and a frame drains
+ * it. Dropping the oldest on overflow is better than growing without bound. */
+#define SW_EVQ 128
+static SwEvent SW_Q[SW_EVQ];
+static int     SW_QH, SW_QT;
+
+static void sw_push(const SwEvent *e)
+{
+    int next = (SW_QT + 1) % SW_EVQ;
+    if (next == SW_QH) SW_QH = (SW_QH + 1) % SW_EVQ;   /* drop the oldest */
+    SW_Q[SW_QT] = *e;
+    SW_QT = next;
+}
+
+bool sw_poll(SwEvent *out)
+{
+    if (SW_QH == SW_QT) return false;
+    *out = SW_Q[SW_QH];
+    SW_QH = (SW_QH + 1) % SW_EVQ;
+    return true;
+}
 
 /* -------------------------------------------------------------- buffers */
 
@@ -453,6 +513,35 @@ static void sw_repaint(SwWin *w)
     w->dirty = false;
 }
 
+Canvas *sw_win_begin(SwWin *w)
+{
+    static Canvas cv;
+    if (!w || !w->configured || w->closed) return NULL;
+    if (!sw_alloc(w)) return NULL;
+    int slot = -1;
+    for (int i = 0; i < 2; ++i) if (!w->busy[i]) { slot = i; break; }
+    if (slot < 0) return NULL;                /* both in flight; skip a frame */
+    w->slot = slot;
+    cv.px = (uint32_t *)w->bufmem[slot];
+    cv.w = w->bw;
+    cv.h = w->bh;
+    cv.cx0 = 0; cv.cy0 = 0; cv.cx1 = w->bw; cv.cy1 = w->bh;
+    memset(cv.px, 0, (size_t)w->stride * (size_t)w->bh);
+    return &cv;
+}
+
+void sw_win_end(SwWin *w)
+{
+    if (!w || w->slot < 0) return;
+    wl_surface_set_buffer_scale(w->surf, w->scale);
+    wl_surface_attach(w->surf, w->buf[w->slot], 0, 0);
+    wl_surface_damage_buffer(w->surf, 0, 0, w->bw, w->bh);
+    wl_surface_commit(w->surf);
+    w->busy[w->slot] = true;
+    w->slot = -1;
+    w->dirty = false;
+}
+
 void sw_win_damage(SwWin *w) { if (w) w->dirty = true; }
 int   sw_win_width(const SwWin *w)  { return w ? w->w : 0; }
 int   sw_win_height(const SwWin *w) { return w ? w->h : 0; }
@@ -471,6 +560,8 @@ static void sw_ls_configure(void *data, struct zwlr_layer_surface_v1 *ls,
     if (height) w->h = (int)height;
     w->configured = true;
     if (!changed) return;
+    SwEvent e = { .type = SW_EV_CONFIGURE, .w = w->w, .h = w->h };
+    sw_push(&e);
     if (w->app.configured) w->app.configured(w->app.user, w->w, w->h, (float)w->scale);
     w->dirty = true;
     sw_repaint(w);
@@ -481,6 +572,8 @@ static void sw_ls_closed(void *data, struct zwlr_layer_surface_v1 *ls)
     (void)ls;
     SwWin *w = (SwWin *)data;
     w->closed = true;
+    SwEvent e = { .type = SW_EV_CLOSED };
+    sw_push(&e);
     if (w->app.closed) w->app.closed(w->app.user);
 }
 
@@ -517,8 +610,9 @@ SwWin *sw_win_create(const SwWinOpts *opts, const SwApp *app)
     SwWin *w = (SwWin *)calloc(1, sizeof(*w));
     if (!w) return NULL;
     w->opts = *opts;
-    w->app = *app;
+    if (app) w->app = *app;      /* NULL: the program drives its own frames */
     w->scale = 1;
+    w->slot = -1;
     w->w = opts->w;
     w->h = opts->h;
     w->cursor = SW_CURSOR_DEFAULT;
@@ -593,6 +687,8 @@ static SwWin *sw_win_of(struct wl_surface *s)
 
 static double SW_PX, SW_PY;
 
+
+
 static void sw_ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
                          struct wl_surface *s, wl_fixed_t x, wl_fixed_t y)
 {
@@ -604,6 +700,8 @@ static void sw_ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
     SW_PX = wl_fixed_to_double(x);
     SW_PY = wl_fixed_to_double(y);
     if (SWCSD) wp_cursor_shape_device_v1_set_shape(SWCSD, serial, w->cursor);
+    SwEvent e = { .type = SW_EV_MOTION, .x = (float)SW_PX, .y = (float)SW_PY };
+    sw_push(&e);
     if (w->app.pointer_motion) w->app.pointer_motion(w->app.user, (float)SW_PX, (float)SW_PY);
 }
 
@@ -616,6 +714,8 @@ static void sw_ptr_leave(void *d, struct wl_pointer *p, uint32_t serial,
     /* A leave for a surface we already left, arriving after the enter for
        another, must not clear the pointer from the one we are on. */
     if (SW_PTR_WIN == w) SW_PTR_WIN = NULL;
+    SwEvent e = { .type = SW_EV_LEAVE };
+    sw_push(&e);
     if (w->app.pointer_leave) w->app.pointer_leave(w->app.user);
 }
 
@@ -626,6 +726,8 @@ static void sw_ptr_motion(void *d, struct wl_pointer *p, uint32_t t,
     SW_PX = wl_fixed_to_double(x);
     SW_PY = wl_fixed_to_double(y);
     SwWin *w = SW_PTR_WIN;
+    SwEvent e = { .type = SW_EV_MOTION, .x = (float)SW_PX, .y = (float)SW_PY };
+    sw_push(&e);
     if (w && w->app.pointer_motion)
         w->app.pointer_motion(w->app.user, (float)SW_PX, (float)SW_PY);
 }
@@ -636,6 +738,9 @@ static void sw_ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
     (void)d; (void)p; (void)t;
     SWPTR_SERIAL = serial;
     SwWin *w = SW_PTR_WIN;
+    SwEvent e = { .type = SW_EV_BUTTON, .x = (float)SW_PX, .y = (float)SW_PY,
+                  .button = (int)button, .pressed = state != 0 };
+    sw_push(&e);
     if (w && w->app.pointer_button)
         w->app.pointer_button(w->app.user, (int)button, state != 0,
                               (float)SW_PX, (float)SW_PY);
@@ -646,8 +751,11 @@ static void sw_ptr_axis(void *d, struct wl_pointer *p, uint32_t t,
 {
     (void)d; (void)p; (void)t;
     SwWin *w = SW_PTR_WIN;
-    if (!w || !w->app.pointer_axis) return;
     double v = wl_fixed_to_double(value);
+    SwEvent e = { .type = SW_EV_AXIS };
+    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) e.ay = (float)v; else e.ax = (float)v;
+    sw_push(&e);
+    if (!w || !w->app.pointer_axis) return;
     if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL) w->app.pointer_axis(w->app.user, 0.0f, (float)v);
     else                                         w->app.pointer_axis(w->app.user, (float)v, 0.0f);
 }
@@ -692,6 +800,8 @@ static void sw_kbd_enter(void *d, struct wl_keyboard *k, uint32_t serial,
 {
     (void)d; (void)k; (void)serial; (void)keys;
     SW_KBD_WIN = sw_win_of(s);
+    SwEvent e = { .type = SW_EV_KB_ENTER };
+    sw_push(&e);
 }
 
 static void sw_kbd_leave(void *d, struct wl_keyboard *k, uint32_t serial,
@@ -699,6 +809,8 @@ static void sw_kbd_leave(void *d, struct wl_keyboard *k, uint32_t serial,
 {
     (void)d; (void)k; (void)serial;
     SwWin *w = sw_win_of(s);
+    SwEvent e = { .type = SW_EV_KB_LEAVE };
+    sw_push(&e);
     if (w && w->app.keyboard_leave) w->app.keyboard_leave(w->app.user);
     if (SW_KBD_WIN == w) SW_KBD_WIN = NULL;
 }
@@ -708,9 +820,13 @@ static void sw_kbd_key(void *d, struct wl_keyboard *k, uint32_t serial,
 {
     (void)d; (void)k; (void)serial; (void)time;
     SwWin *w = SW_KBD_WIN;
-    if (!w || !w->app.key) return;
     char utf8[8] = "";
     uint32_t sym = sw_keymap_lookup(&SW_KEYMAP, key + 8, SW_MODS, utf8, sizeof(utf8));
+    SwEvent e = { .type = SW_EV_KEY, .keysym = sym, .code = key, .mods = SW_MODS,
+                  .pressed = state != 0 };
+    memcpy(e.text, utf8, sizeof(e.text));
+    sw_push(&e);
+    if (!w || !w->app.key) return;
     w->app.key(w->app.user, sym, utf8, SW_MODS, state != 0);
 }
 

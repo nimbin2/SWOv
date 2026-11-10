@@ -1,27 +1,27 @@
-/* swov — a fast window/workspace overview for Sway (SDL3)
+/* swov — a fast window/workspace overview for Sway.
+ *
+ * Written/modified by: Claude Opus 4.1, Claude Sonnet 4.5, Claude Opus 5
  *
  * Build:
- *   cc -std=c11 -O2 -Wall -Wextra -o swov swov.c \
- *      $(pkg-config --cflags --libs sdl3 sdl3-image sdl3-ttf)
+ *   cc -std=c11 -O2 -Wall -Wextra -o swov swov.c -lwayland-client -lm
  *
  * Runtime deps: a running Sway session ($SWAYSOCK). No jq, no shell-outs:
  * the program talks to the Sway IPC socket directly. fontconfig (fc-match)
  * is used if present to pick the desktop font, otherwise a few well known
  * font paths are tried.
  *
+ * The window is a wlr-layer-shell surface and every pixel is drawn here:
+ * sw_wl.h carries the surface and the input, sw_draw.h the rasteriser,
+ * sw_keymap.h the keyboard layout. All three are shared with swas and swbr.
+ *
  * See README.md for configuration and key bindings.
  */
 
 #define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
-#include <SDL3/SDL.h>
-#include <SDL3_image/SDL_image.h>
-#include <SDL3_ttf/SDL_ttf.h>
-
-/* SVG icons via nanosvg (vendored single-header, the same copy swas uses).
-   SDL_image rasterises an SVG to the box the file declares, which cuts off any
-   icon whose drawing runs outside it; this gives us the box to use. Third
-   party headers, so their warnings are quieted without touching our own. */
+/* Vendored single-header decoders and the shared drawing layer. Third party
+   headers, so their warnings are quieted without touching our own. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
@@ -31,6 +31,13 @@
 #include "nanosvg.h"
 #define NANOSVGRAST_IMPLEMENTATION
 #include "nanosvgrast.h"
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_PNG
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_BMP
+#include "stb_image.h"
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "stb_truetype.h"
 #pragma GCC diagnostic pop
 
 #include <ctype.h>
@@ -60,8 +67,61 @@
 
 #include "sw_theme.h"
 
+#define SW_DRAW_IMPL
+#include "sw_draw.h"
+#define SW_KEYMAP_IMPL
+#include "sw_keymap.h"
+#define SW_WL_IMPL
+#include "sw_wl.h"
+
+/* ------------------------------------------------- small shared shapes
+ * Rect is a float rectangle, IRect an integer one, FCol a colour with
+ * 0..1 components — which is how the whole drawing code below is written.
+ * sw_draw takes 8-bit colours, so the wrappers convert at the edge. */
+typedef struct { float x, y, w, h; } Rect;
+typedef struct { int   x, y, w, h; } IRect;
+typedef struct { float r, g, b, a; } FCol;
+
+#define SW_MAX(a, b)      ((a) > (b) ? (a) : (b))
+#define SW_MIN(a, b)      ((a) < (b) ? (a) : (b))
+#define SW_CLAMP(x, a, b) ((x) < (a) ? (a) : ((x) > (b) ? (b) : (x)))
+#define SW_ARRSZ(a)       ((int)(sizeof(a) / sizeof((a)[0])))
+
+static Col fcol(FCol c)
+{
+    Col o;
+    o.r = (uint8_t)SW_CLAMP((int)(c.r * 255.0f + 0.5f), 0, 255);
+    o.g = (uint8_t)SW_CLAMP((int)(c.g * 255.0f + 0.5f), 0, 255);
+    o.b = (uint8_t)SW_CLAMP((int)(c.b * 255.0f + 0.5f), 0, 255);
+    o.a = (uint8_t)SW_CLAMP((int)(c.a * 255.0f + 0.5f), 0, 255);
+    return o;
+}
+
+/* A key, as swov wants it: what it typed (an X keysym, letters always
+   lower case), the modifiers, and its place on the board. */
+typedef struct { uint32_t key; unsigned mod; uint32_t code; } KeyEv;
+typedef struct { float x, y; int button; } MouseEv;
+
+enum {
+    K_A = 'a', K_C = 'c', K_D = 'd', K_F = 'f', K_H = 'h', K_J = 'j',
+    K_K = 'k', K_L = 'l', K_Q = 'q', K_R = 'r', K_W = 'w', K_X = 'x',
+    K_SLASH = '/', K_SPACE = ' ',
+    K_RETURN    = SW_KEY_RETURN,    K_KP_ENTER = SW_KEY_KP_ENTER,
+    K_ESCAPE    = SW_KEY_ESCAPE,    K_BACKSPACE = SW_KEY_BACKSPACE,
+    K_DELETE    = SW_KEY_DELETE,    K_TAB      = SW_KEY_TAB,
+    K_LEFT      = SW_KEY_LEFT,      K_RIGHT    = SW_KEY_RIGHT,
+    K_UP        = SW_KEY_UP,        K_DOWN     = SW_KEY_DOWN
+};
+
+static uint64_t now_ms_(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
 #define APP_ID          "swov"
-#define SWOV_VERSION    "1.2"
+#define SWOV_VERSION    "1.3"
 #ifndef SWOV_BUILD                 /* set by the Makefile: md5 of this file */
 #define SWOV_BUILD "unknown"
 #endif
@@ -195,15 +255,15 @@ static bool str_all_digits(const char *s)
 
 /* ---------------------------------------------------------------- colors */
 
-static SDL_FColor rgba(uint32_t v)
+static FCol rgba(uint32_t v)
 {
-    return (SDL_FColor){ ((v >> 24) & 0xff) / 255.0f,
+    return (FCol){ ((v >> 24) & 0xff) / 255.0f,
                          ((v >> 16) & 0xff) / 255.0f,
                          ((v >>  8) & 0xff) / 255.0f,
                          ((v      ) & 0xff) / 255.0f };
 }
 
-static bool parse_color(const char *s, SDL_FColor *out)
+static bool parse_color(const char *s, FCol *out)
 {
     if (!s) return false;
     while (*s == '#' || *s == ' ') s++;
@@ -221,21 +281,21 @@ static bool parse_color(const char *s, SDL_FColor *out)
 }
 
 /* c blended towards `to` by t (0..1); alpha kept from c */
-static SDL_FColor mix(SDL_FColor c, SDL_FColor to, float t)
+static FCol mix(FCol c, FCol to, float t)
 {
-    return (SDL_FColor){ c.r + (to.r - c.r) * t,
+    return (FCol){ c.r + (to.r - c.r) * t,
                          c.g + (to.g - c.g) * t,
                          c.b + (to.b - c.b) * t,
                          c.a + (to.a - c.a) * t };
 }
 
-static SDL_FColor with_alpha(SDL_FColor c, float a) { c.a = a; return c; }
+static FCol with_alpha(FCol c, float a) { c.a = a; return c; }
 
 /* ---------------------------------------------------------------- config */
 
 typedef struct {
     /* rendering */
-    int   ssaa;              /* 1..4 full scene supersampling */
+    int   ssaa;              /* accepted and ignored: see create_target */
     int   icons;             /* show .desktop icons */
     int   icon_px;           /* icon edge length (logical px, before ui_scale) */
     int   shadow;
@@ -299,11 +359,11 @@ typedef struct {
     int   quit_after_action;
 
     /* colors */
-    SDL_FColor bg, tile, tile_sel, tile_hover, mini_bg;
-    SDL_FColor card, card_hover, card_focus;
-    SDL_FColor hl, text, subtext, dim, accent, hltext, shadow_col, outline, urgent, hint;
-    SDL_FColor current;      /* what sway is showing right now             */
-    SDL_FColor match;        /* windows the search found                   */
+    FCol bg, tile, tile_sel, tile_hover, mini_bg;
+    FCol card, card_hover, card_focus;
+    FCol hl, text, subtext, dim, accent, hltext, shadow_col, outline, urgent, hint;
+    FCol current;      /* what sway is showing right now             */
+    FCol match;        /* windows the search found                   */
 } Cfg;
 
 static Cfg cfg_defaults(void)
@@ -1038,7 +1098,7 @@ static Usage *usage_find(const char *name, bool create)
 {
     for (int i = 0; i < NUSAGE; ++i)
         if (strcmp(USAGE[i].name, name) == 0) return &USAGE[i];
-    if (!create || NUSAGE >= (int)SDL_arraysize(USAGE)) return NULL;
+    if (!create || NUSAGE >= (int)SW_ARRSZ(USAGE)) return NULL;
 
     Usage *u = &USAGE[NUSAGE++];
     memset(u, 0, sizeof(*u));
@@ -1062,7 +1122,7 @@ static void usage_load(void)
     USAGE_SINCE = 0.0;
 
     char line[320];
-    while (fgets(line, sizeof(line), f) && NUSAGE < (int)SDL_arraysize(USAGE)) {
+    while (fgets(line, sizeof(line), f) && NUSAGE < (int)SW_ARRSZ(USAGE)) {
         double v = 0.0, last = 0.0;
         char name[64] = {0}, out[64] = {0};
 
@@ -1380,7 +1440,7 @@ static void collect_view_ids(const JV *node, int *ids, int *n, int cap)
 static int find_new_view(const JV *node, const int *known, int nknown)
 {
     int ids[512], n = 0;
-    collect_view_ids(node, ids, &n, (int)SDL_arraysize(ids));
+    collect_view_ids(node, ids, &n, (int)SW_ARRSZ(ids));
     for (int i = 0; i < n; ++i) {
         bool seen = false;
         for (int j = 0; j < nknown; ++j) if (known[j] == ids[i]) { seen = true; break; }
@@ -1415,7 +1475,7 @@ static int adopt_window(int pid, const char *ws, double timeout, bool focus,
 
     int known[512], nknown = 0;
     JV *first = sway_query(IPC_GET_TREE);
-    if (first) { collect_view_ids(first, known, &nknown, (int)SDL_arraysize(known)); jfree(first); }
+    if (first) { collect_view_ids(first, known, &nknown, (int)SW_ARRSZ(known)); jfree(first); }
     if (ADOPT_LOG) fprintf(stderr, "swov: adopt pid %d -> ws %s (%d views now)\n",
                            pid, ws, nknown);
 
@@ -1430,11 +1490,11 @@ static int adopt_window(int pid, const char *ws, double timeout, bool focus,
         /* Keep putting the rule in front of anything the app starts, for the
          * first few seconds. Every one of these is a pid that could be the
          * one sway ends up seeing. */
-        if (!no_assign && nassigned < (int)SDL_arraysize(assigned) &&
+        if (!no_assign && nassigned < (int)SW_ARRSZ(assigned) &&
             now_secs() - started < 4.0) {
             int kids[64];
-            int nk = sweep_descendants(pid, kids, (int)SDL_arraysize(kids));
-            for (int i = 0; i < nk && nassigned < (int)SDL_arraysize(assigned); ++i) {
+            int nk = sweep_descendants(pid, kids, (int)SW_ARRSZ(kids));
+            for (int i = 0; i < nk && nassigned < (int)SW_ARRSZ(assigned); ++i) {
                 bool seen = false;
                 for (int j = 0; j < nassigned; ++j)
                     if (assigned[j] == kids[i]) { seen = true; break; }
@@ -1548,7 +1608,7 @@ static void cpu_load(void)
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[256];
-    while (NCPU < (int)SDL_arraysize(CPU) && fgets(line, sizeof(line), f)) {
+    while (NCPU < (int)SW_ARRSZ(CPU) && fgets(line, sizeof(line), f)) {
         char *tab = strchr(line, '\t');
         if (!tab) continue;
         *tab = 0;
@@ -1569,16 +1629,16 @@ static float cpu_frac(const char *ws_name)
         if (CPU[i].cores < C.cpu_min)  return 0.0f;    /* a hint, one dot   */
         float span = C.cpu_full - C.cpu_min;
         float f = span > 0.0f ? (CPU[i].cores - C.cpu_min) / span : 1.0f;
-        return SDL_clamp(f, 0.0f, 1.0f);
+        return SW_CLAMP(f, 0.0f, 1.0f);
     }
     return -1.0f;
 }
-static SDL_Renderer *REN;
-static TTF_Font     *F_BADGE;   /* workspace number            */
-static TTF_Font     *F_LABEL;   /* app name on a window card   */
-static TTF_Font     *F_TITLE;   /* window title (small)        */
-static TTF_Font     *F_HINT;    /* header / footer             */
-static TTF_Font     *F_PID;     /* the pid in a card's corner  */
+static Canvas       *REN;   /* where this frame is being drawn */
+static Font         *F_BADGE;   /* workspace number            */
+static Font         *F_LABEL;   /* app name on a window card   */
+static Font         *F_TITLE;   /* window title (small)        */
+static Font         *F_HINT;    /* header / footer             */
+static Font         *F_PID;     /* the pid in a card's corner  */
 static float         SC = 1.0f; /* supersampling scale factor  */
 
 static int px(float logical) { return (int)(logical * SC + 0.5f); }
@@ -1590,62 +1650,62 @@ static int  qlen = 0;
 
 /* ----------------------------------------------------------------- text */
 
-/* The drawn string is kept with the texture: shortening happens here, so this
- * is the only place that knows what the pixels actually say, and a search
- * needs that to underline the part of it that matched. */
-typedef struct { SDL_Texture *t; int w, h; TTF_Font *f; char s[192]; } Tex;
+/* A piece of text, measured but not yet drawn: the string and the font it
+ * was measured with. Nothing is rasterised until it is placed, so one Tex
+ * serves the normal, hovered and selected colours. Keeping the string here
+ * is also what lets a search underline the part of it that matched — this
+ * is the only place that knows what the pixels actually say, because this
+ * is where shortening happens. */
+typedef struct { int t; int w, h; Font *f; char s[192]; } Tex;
 
 static void tex_free(Tex *x)
 {
-    if (x->t) SDL_DestroyTexture(x->t);
-    x->t = NULL;
+    x->t = 0;
     x->w = x->h = 0;
     x->f = NULL;
     x->s[0] = 0;
 }
 
-/* Text is always rendered white and tinted at draw time, so one texture can
- * be reused for normal / hovered / selected states. */
-static Tex text_make(TTF_Font *f, const char *s)
+static Tex text_make(Font *f, const char *s)
 {
     Tex out = {0};
     if (!f || !s || !*s) return out;
-    SDL_Color white = { 255, 255, 255, 255 };
-    SDL_Surface *surf = TTF_RenderText_Blended(f, s, strlen(s), white);
-    if (!surf) return out;
-    out.t = SDL_CreateTextureFromSurface(REN, surf);
-    out.w = surf->w;
-    out.h = surf->h;
-    SDL_DestroySurface(surf);
-    if (out.t) SDL_SetTextureScaleMode(out.t, SDL_SCALEMODE_LINEAR);
+    out.t = 1;
+    out.w = (int)(sw_text_width(f, s) + 0.5f);
+    out.h = (int)(f->lineh + 0.5f);
     out.f = f;
     snprintf(out.s, sizeof(out.s), "%s", s);
     return out;
 }
 
 /* Render `s`, shortened with an ellipsis so that it fits into max_w pixels. */
-static Tex text_make_fit(TTF_Font *f, const char *s, int max_w)
+static Tex text_make_fit(Font *f, const char *s, int max_w)
 {
     Tex out = {0};
-    if (!f || !s || !*s || max_w <= 0) return out;
-
-    int w = 0, h = 0;
-    if (TTF_GetStringSize(f, s, strlen(s), &w, &h) && w <= max_w)
-        return text_make(f, s);
-
     const char *ell = "\xe2\x80\xa6";           /* … */
-    int ew = 0, eh = 0;
-    TTF_GetStringSize(f, ell, strlen(ell), &ew, &eh);
+    float ew, avail;
+    size_t n, fit;
+    char *buf;
 
-    int avail = max_w - ew;
-    if (avail <= 0) return out;
+    if (!f || !s || !*s || max_w <= 0) return out;
+    if (sw_text_width(f, s) <= (float)max_w) return text_make(f, s);
 
-    int mw = 0;
-    size_t fit = 0;
-    if (!TTF_MeasureString(f, s, strlen(s), avail, &mw, &fit) || fit == 0)
-        return out;
+    ew = sw_text_width(f, ell);
+    avail = (float)max_w - ew;
+    if (avail <= 0.0f) return out;
 
-    char *buf = (char *)xmalloc(fit + strlen(ell) + 1);
+    /* grow one code point at a time, so a multi-byte character is never cut */
+    fit = 0;
+    for (n = 0; s[n]; ) {
+        size_t step = 1;
+        while (s[n + step] && ((unsigned char)s[n + step] & 0xc0) == 0x80) step++;
+        if (sw_text_width_n(f, s, n + step) > avail) break;
+        n += step;
+        fit = n;
+    }
+    if (fit == 0) return out;
+
+    buf = (char *)xmalloc(fit + strlen(ell) + 1);
     memcpy(buf, s, fit);
     memcpy(buf + fit, ell, strlen(ell) + 1);
     out = text_make(f, buf);
@@ -1654,11 +1714,16 @@ static Tex text_make_fit(TTF_Font *f, const char *s, int max_w)
 }
 
 /* The part of a drawn string the query matched, as an x offset and a width
- * inside the texture. A violet border around the whole card says something in
+ * inside the text. A violet border around the whole card says something in
  * it matched but not what — with a long title or an app id nobody can see,
  * that reads as swov highlighting windows at random. This marks the letters. */
 static bool tex_match_run(Tex x, float *ox, float *ow)
 {
+    char needle[sizeof(query)];
+    size_t nl = (size_t)qlen, off, len;
+    const char *at;
+    float pre, run;
+
     if (!x.t || !x.f || qlen == 0) return false;
 
     /* The whole query first. Failing that, the longest prefix of it that is
@@ -1666,9 +1731,7 @@ static bool tex_match_run(Tex x, float *ox, float *ow)
      * of what matched, and the card is outlined in violet either way, so
      * marking "Fir" of "firefox" explains the outline where marking nothing
      * leaves it looking arbitrary. */
-    char needle[sizeof(query)];
-    size_t nl = (size_t)qlen;
-    const char *at = ci_find(x.s, query);
+    at = ci_find(x.s, query);
     while (!at && nl > 1) {
         --nl;
         memcpy(needle, query, nl);
@@ -1677,184 +1740,108 @@ static bool tex_match_run(Tex x, float *ox, float *ow)
     }
     if (!at) return false;
 
-    int pre = 0, run = 0, h = 0;
-    size_t off = (size_t)(at - x.s);
-    size_t len = nl;
+    off = (size_t)(at - x.s);
+    len = nl;
     if (off + len > strlen(x.s)) len = strlen(x.s) - off;   /* clipped by the … */
     if (len == 0) return false;
-    if (off > 0 && !TTF_GetStringSize(x.f, x.s, off, &pre, &h)) return false;
-    if (!TTF_GetStringSize(x.f, at, len, &run, &h) || run <= 0) return false;
-    *ox = (float)pre;
-    *ow = (float)run;
+    pre = off > 0 ? sw_text_width_n(x.f, x.s, off) : 0.0f;
+    run = sw_text_width_n(x.f, at, len);
+    if (run <= 0.0f) return false;
+    *ox = pre;
+    *ow = run;
     return true;
 }
 
-static void tex_draw(Tex x, float dx, float dy, SDL_FColor col)
+static void tex_draw(Tex x, float dx, float dy, FCol col)
 {
-    if (!x.t) return;
-    SDL_SetTextureColorModFloat(x.t, col.r, col.g, col.b);
-    SDL_SetTextureAlphaModFloat(x.t, col.a);
-    SDL_FRect dst = { dx, dy, (float)x.w, (float)x.h };
-    SDL_RenderTexture(REN, x.t, NULL, &dst);
+    if (!x.t || !x.f) return;
+    sw_text(REN, x.f, dx, dy + x.f->ascent, fcol(col), x.s);
 }
 
-static void tex_draw_center(Tex x, float cx, float dy, SDL_FColor col)
+static void tex_draw_center(Tex x, float cx, float dy, FCol col)
 {
     tex_draw(x, cx - x.w * 0.5f, dy, col);
 }
 
-/* Centre a line inside a box. A text texture is a full line box: it reserves
+/* Centre a line inside a box. A line of text is a full line box: it reserves
  * room for descenders even when the string has none, so plain centring makes
  * digits and capitals look too high. Half the descent puts them right. */
-static void tex_draw_in_box(Tex x, SDL_FRect box, TTF_Font *f, SDL_FColor col)
+static void tex_draw_in_box(Tex x, Rect box, Font *f, FCol col)
 {
+    float desc, y;
     if (!x.t) return;
-    float desc = f ? (float)-TTF_GetFontDescent(f) : 0.0f;
-    float y = box.y + (box.h - (float)x.h) * 0.5f - desc * 0.5f;
+    desc = sw_font_descent(f);
+    y = box.y + (box.h - (float)x.h) * 0.5f - desc * 0.5f;
     tex_draw(x, box.x + (box.w - (float)x.w) * 0.5f, y, col);
 }
 
-/* ------------------------------------------------------------- primitives */
+/* -------------------------------------------------------------- primitives
+ * Thin wrappers over sw_draw, keeping the shapes the drawing code below asks
+ * for. Everything is antialiased as it is drawn: the rounded corners come
+ * out of a signed distance field, so there is no stair-stepping to hide. */
 
-static void set_col(SDL_FColor c)
+static void fill_rect_c(Rect r, FCol c)
 {
-    SDL_SetRenderDrawColorFloat(REN, c.r, c.g, c.b, c.a);
+    sw_fill_rect(REN, r.x, r.y, r.w, r.h, fcol(c));
 }
 
-static void fill_round_rect(SDL_FRect r, float rad, SDL_FColor c)
+static void fill_round_rect(Rect r, float rad, FCol c)
 {
     if (r.w <= 0.0f || r.h <= 0.0f) return;
-    rad = SDL_min(rad, SDL_min(r.w, r.h) * 0.5f);
-    set_col(c);
-    if (rad <= 0.5f) { SDL_RenderFillRect(REN, &r); return; }
-
-    SDL_FRect mid = { r.x, r.y + rad, r.w, r.h - 2.0f * rad };
-    SDL_RenderFillRect(REN, &mid);
-
-    int steps = (int)SDL_ceilf(rad);
-    for (int i = 0; i < steps; ++i) {
-        float dy = rad - (float)i - 0.5f;
-        float dx = SDL_sqrtf(SDL_max(0.0f, rad * rad - dy * dy));
-        float x0 = r.x + rad - dx;
-        float w  = r.w - 2.0f * rad + 2.0f * dx;
-        SDL_FRect top = { x0, r.y + (float)i, w, 1.0f };
-        SDL_FRect bot = { x0, r.y + r.h - (float)i - 1.0f, w, 1.0f };
-        SDL_RenderFillRect(REN, &top);
-        SDL_RenderFillRect(REN, &bot);
-    }
+    rad = SW_MIN(rad, SW_MIN(r.w, r.h) * 0.5f);
+    if (rad <= 0.5f) { fill_rect_c(r, c); return; }
+    sw_fill_round(REN, r.x, r.y, r.w, r.h, rad, rad, rad, rad, fcol(c));
 }
 
 /* Lay that run under the text, as a soft bar in the match colour. */
 static void draw_match_run(Tex x, float dx, float dy)
 {
-    float mx = 0, mw = 0;
+    float mx = 0, mw = 0, pad;
+    Rect r, u;
     if (!tex_match_run(x, &mx, &mw)) return;
-    float pad = 1.0f * SC;
-    SDL_FRect r = { dx + mx - pad, dy - pad * 0.5f,
-                    mw + 2.0f * pad, (float)x.h + pad };
+    pad = 1.0f * SC;
+    r.x = dx + mx - pad; r.y = dy - pad * 0.5f;
+    r.w = mw + 2.0f * pad; r.h = (float)x.h + pad;
     fill_round_rect(r, 2.0f * SC, with_alpha(C.match, 0.30f));
-    SDL_FRect u = { dx + mx, dy + (float)x.h - 1.0f * SC, mw, SDL_max(1.0f, 1.5f * SC) };
+    u.x = dx + mx; u.y = dy + (float)x.h - 1.0f * SC;
+    u.w = mw; u.h = SW_MAX(1.0f, 1.5f * SC);
     fill_round_rect(u, 0.0f, with_alpha(C.match, 0.95f));
 }
-
 
 /* The same, with the top or the bottom left square.
  *
  * A tab meets the panel below it and a panel meets the tab above it: rounding
  * both sides of that join leaves a pinch of background showing through, which
  * is what made a tabbed workspace look wrong. */
-static void fill_round_side(SDL_FRect r, float rad, bool round_top,
-                            bool round_bot, SDL_FColor c)
+static void fill_round_side(Rect r, float rad, bool round_top,
+                            bool round_bot, FCol c)
 {
+    float rt, rb;
     if (r.w <= 0.0f || r.h <= 0.0f) return;
-    if (round_top && round_bot) { fill_round_rect(r, rad, c); return; }
-
-    rad = SDL_min(rad, SDL_min(r.w, r.h) * 0.5f);
-    if (rad <= 0.5f) { set_col(c); SDL_RenderFillRect(REN, &r); return; }
-
-    set_col(c);
-    SDL_FRect mid = { r.x, r.y + (round_top ? rad : 0.0f), r.w,
-                      r.h - (round_top ? rad : 0.0f) - (round_bot ? rad : 0.0f) };
-    SDL_RenderFillRect(REN, &mid);
-
-    int steps = (int)SDL_ceilf(rad);
-    for (int i = 0; i < steps; ++i) {
-        float dy = rad - (float)i - 0.5f;
-        float dx = SDL_sqrtf(SDL_max(0.0f, rad * rad - dy * dy));
-        float x0 = r.x + rad - dx;
-        float w  = r.w - 2.0f * rad + 2.0f * dx;
-        if (round_top) {
-            SDL_FRect t = { x0, r.y + (float)i, w, 1.0f };
-            SDL_RenderFillRect(REN, &t);
-        }
-        if (round_bot) {
-            SDL_FRect b = { x0, r.y + r.h - (float)i - 1.0f, w, 1.0f };
-            SDL_RenderFillRect(REN, &b);
-        }
-    }
+    rad = SW_MIN(rad, SW_MIN(r.w, r.h) * 0.5f);
+    if (rad <= 0.5f) { fill_rect_c(r, c); return; }
+    rt = round_top ? rad : 0.0f;
+    rb = round_bot ? rad : 0.0f;
+    sw_fill_round(REN, r.x, r.y, r.w, r.h, rt, rt, rb, rb, fcol(c));
 }
 
 /* rounded rectangle outline of thickness t, drawn inside r */
-static void stroke_round_rect(SDL_FRect r, float rad, float t, SDL_FColor c)
+static void stroke_round_rect(Rect r, float rad, float t, FCol c)
 {
     if (t <= 0.0f || r.w <= 0.0f || r.h <= 0.0f) return;
-    rad = SDL_min(rad, SDL_min(r.w, r.h) * 0.5f);
-    t   = SDL_min(t, SDL_min(r.w, r.h) * 0.5f);
-    set_col(c);
-
-    if (rad <= 0.5f) {
-        SDL_FRect e[4] = {
-            { r.x, r.y, r.w, t },
-            { r.x, r.y + r.h - t, r.w, t },
-            { r.x, r.y + t, t, r.h - 2.0f * t },
-            { r.x + r.w - t, r.y + t, t, r.h - 2.0f * t }
-        };
-        SDL_RenderFillRects(REN, e, 4);
-        return;
-    }
-
-    SDL_FRect edges[4] = {
-        { r.x + rad, r.y, r.w - 2.0f * rad, t },                        /* top    */
-        { r.x + rad, r.y + r.h - t, r.w - 2.0f * rad, t },              /* bottom */
-        { r.x, r.y + rad, t, r.h - 2.0f * rad },                        /* left   */
-        { r.x + r.w - t, r.y + rad, t, r.h - 2.0f * rad }               /* right  */
-    };
-    SDL_RenderFillRects(REN, edges, 4);
-
-    float ri = rad - t;
-    int steps = (int)SDL_ceilf(rad);
-    for (int i = 0; i < steps; ++i) {
-        float dy  = rad - (float)i - 0.5f;
-        float dxo = SDL_sqrtf(SDL_max(0.0f, rad * rad - dy * dy));
-        float dxi = (ri > 0.0f && SDL_fabsf(dy) < ri)
-                        ? SDL_sqrtf(SDL_max(0.0f, ri * ri - dy * dy)) : 0.0f;
-        float seg = dxo - dxi;
-        if (seg <= 0.0f) continue;
-
-        float lx = r.x + rad - dxo;
-        float rx = r.x + r.w - rad + dxi;
-        float ty = r.y + (float)i;
-        float by = r.y + r.h - (float)i - 1.0f;
-
-        SDL_FRect q[4] = {
-            { lx, ty, seg, 1.0f },
-            { rx, ty, seg, 1.0f },
-            { lx, by, seg, 1.0f },
-            { rx, by, seg, 1.0f }
-        };
-        SDL_RenderFillRects(REN, q, 4);
-    }
+    rad = SW_MIN(rad, SW_MIN(r.w, r.h) * 0.5f);
+    t   = SW_MIN(t, SW_MIN(r.w, r.h) * 0.5f);
+    sw_stroke_round(REN, r.x, r.y, r.w, r.h, rad, rad, rad, rad, t, fcol(c));
 }
 
-/* soft drop shadow: a few expanded, fading rounded rects */
-static void drop_shadow(SDL_FRect r, float rad, float size, SDL_FColor c)
+static void drop_shadow(Rect r, float rad, float size, FCol c)
 {
     if (!C.shadow || size <= 0.0f) return;
     int layers = C.shadow_layers > 0 ? C.shadow_layers : 3;
     for (int i = layers; i >= 1; --i) {
         float g = size * (float)i / (float)layers;
-        SDL_FRect s = { r.x - g, r.y - g, r.w + 2.0f * g, r.h + 2.0f * g };
-        SDL_FColor col = with_alpha(c, c.a / (float)(layers * 2));
+        Rect s = { r.x - g, r.y - g, r.w + 2.0f * g, r.h + 2.0f * g };
+        FCol col = with_alpha(c, c.a / (float)(layers * 2));
         fill_round_rect(s, rad + g, col);
     }
 }
@@ -1968,7 +1955,7 @@ static const char *short_app_name(const char *app_id)
     const char *dot = strrchr(app_id, '.');
     if (!dot || !dot[1] || strchr(app_id, '.') == dot) return app_id;
 
-    for (size_t i = 0; i < SDL_arraysize(generic); ++i) {
+    for (size_t i = 0; i < SW_ARRSZ(generic); ++i) {
         if (ci_cmp(dot + 1, generic[i]) != 0) continue;
         /* the last part says nothing: use the one before it */
         static char buf[128];
@@ -2017,7 +2004,7 @@ static bool app_id_is_useless(const char *id)
         "xwayland", "electron", "toplevel", "window", "main", "app"
     };
     if (!id) return true;
-    for (size_t i = 0; i < SDL_arraysize(bad); ++i)
+    for (size_t i = 0; i < SW_ARRSZ(bad); ++i)
         if (ci_cmp(id, bad[i]) == 0) return true;
     return false;
 }
@@ -2028,7 +2015,7 @@ static bool is_interpreter(const char *name)
         "electron", "node", "python", "python3", "java", "sh", "bash", "zsh",
         "wine", "wine64", "wine-preloader", "flatpak", "snap", "env", "steam"
     };
-    for (size_t i = 0; i < SDL_arraysize(interp); ++i)
+    for (size_t i = 0; i < SW_ARRSZ(interp); ++i)
         if (ci_cmp(name, interp[i]) == 0) return true;
     return false;
 }
@@ -2172,7 +2159,7 @@ static void icon_dirs_build(void)
     const char *cats[]   = { "apps", "applications" };
 
     for (int r = 0; r < nr; ++r) {
-        for (size_t t = 0; t < SDL_arraysize(themes); ++t) {
+        for (size_t t = 0; t < SW_ARRSZ(themes); ++t) {
             if (!themes[t] || !*themes[t]) continue;
             char *tdir = fmt_alloc("%s/%s", roots[r], themes[t]);
             DIR *d = opendir(tdir);
@@ -2187,7 +2174,7 @@ static void icon_dirs_build(void)
                 else if (isdigit((unsigned char)n[0])) size = atoi(n);   /* 48x48 */
                 if (size < 0) continue;
                 if (strstr(n, "@2x")) continue;                          /* skip hidpi */
-                for (size_t c = 0; c < SDL_arraysize(cats); ++c) {
+                for (size_t c = 0; c < SW_ARRSZ(cats); ++c) {
                     char *p = fmt_alloc("%s/%s/%s", tdir, n, cats[c]);
                     icon_dir_add(p, size);
                     free(p);
@@ -2215,7 +2202,7 @@ static char *icon_lookup(const char *name, int want_px)
     bool has_ext = strstr(name, ".png") || strstr(name, ".svg") || strstr(name, ".xpm");
 
     for (int d = 0; d < g_icon_dir_count; ++d) {
-        for (size_t e = 0; e < SDL_arraysize(exts); ++e) {
+        for (size_t e = 0; e < SW_ARRSZ(exts); ++e) {
             char *p = fmt_alloc("%s/%s%s", g_icon_dirs[d].path, name, has_ext ? "" : exts[e]);
             if (file_readable(p)) return p;
             free(p);
@@ -2228,148 +2215,194 @@ static char *icon_lookup(const char *name, int want_px)
 /* Rasterise an SVG at ~px, aspect preserved and nothing cut off. The box is
    the declared canvas and the shapes' own bounds together: an icon with
    deliberate padding keeps it, one whose drawing overflows its own
-   width/height is scaled down instead of losing an edge — which is what
-   SDL_image's sized loader does to it, since it draws only inside the box the
-   file declares. */
-static SDL_Surface *icon_svg_fitted(const char *path, int px)
+   width/height is scaled down instead of losing an edge. */
+
+/* Straight RGBA, which is what sw_blit wants. */
+typedef struct { unsigned char *px; int w, h; } Icon;
+
+static void icon_free(Icon *ic)
 {
+    free(ic->px);
+    ic->px = NULL;
+    ic->w = ic->h = 0;
+}
+
+static Image icon_img(const Icon *ic)
+{
+    Image im = { NULL, 0, 0, 0 };
+    if (ic && ic->px) { im.rgba = ic->px; im.w = ic->w; im.h = ic->h; im.stride = ic->w * 4; }
+    return im;
+}
+
+static Icon icon_svg_fitted(const char *path, int px)
+{
+    Icon out = { NULL, 0, 0 };
     NSVGimage *img = nsvgParseFromFile(path, "px", 96.0f);
-    if (!img) return NULL;
-    float x0 = 0, y0 = 0, x1 = img->width, y1 = img->height;
+    NSVGrasterizer *r;
+    float x0 = 0, y0 = 0, x1, y1, bw, bh, sc;
+    int w, h;
+    if (!img) return out;
+    x1 = img->width;
+    y1 = img->height;
     if (x1 <= 0 || y1 <= 0) { x0 = y0 = 1e30f; x1 = y1 = -1e30f; }
-    for (NSVGshape *s = img->shapes; s; s = s->next) {
-        if (!(s->flags & NSVG_FLAGS_VISIBLE)) continue;
-        float m = s->strokeWidth * 0.5f;             /* a stroke sits astride */
-        if (s->bounds[0] - m < x0) x0 = s->bounds[0] - m;
-        if (s->bounds[1] - m < y0) y0 = s->bounds[1] - m;
-        if (s->bounds[2] + m > x1) x1 = s->bounds[2] + m;
-        if (s->bounds[3] + m > y1) y1 = s->bounds[3] + m;
+    for (NSVGshape *sh = img->shapes; sh; sh = sh->next) {
+        float m;
+        if (!(sh->flags & NSVG_FLAGS_VISIBLE)) continue;
+        m = sh->strokeWidth * 0.5f;                  /* a stroke sits astride */
+        if (sh->bounds[0] - m < x0) x0 = sh->bounds[0] - m;
+        if (sh->bounds[1] - m < y0) y0 = sh->bounds[1] - m;
+        if (sh->bounds[2] + m > x1) x1 = sh->bounds[2] + m;
+        if (sh->bounds[3] + m > y1) y1 = sh->bounds[3] + m;
     }
-    float bw = x1 - x0, bh = y1 - y0;
-    if (!(bw > 0.0f) || !(bh > 0.0f)) { nsvgDelete(img); return NULL; }
-    float sc = (float)px / (bw > bh ? bw : bh);
-    int w = (int)(bw * sc + 0.5f), h = (int)(bh * sc + 0.5f);
+    bw = x1 - x0;
+    bh = y1 - y0;
+    if (!(bw > 0.0f) || !(bh > 0.0f)) { nsvgDelete(img); return out; }
+    sc = (float)px / (bw > bh ? bw : bh);
+    w = (int)(bw * sc + 0.5f);
+    h = (int)(bh * sc + 0.5f);
     if (w < 1) w = 1;
     if (h < 1) h = 1;
 
-    SDL_Surface *surf = SDL_CreateSurface(w, h, SDL_PIXELFORMAT_ABGR8888);
-    NSVGrasterizer *r = surf ? nsvgCreateRasterizer() : NULL;
-    if (!r) { if (surf) SDL_DestroySurface(surf); nsvgDelete(img); return NULL; }
-    SDL_memset(surf->pixels, 0, (size_t)surf->pitch * (size_t)h);
-    nsvgRasterize(r, img, -x0 * sc, -y0 * sc, sc,
-                  (unsigned char *)surf->pixels, w, h, surf->pitch);
+    out.px = (unsigned char *)calloc((size_t)w * (size_t)h, 4);
+    r = out.px ? nsvgCreateRasterizer() : NULL;
+    if (!r) { free(out.px); out.px = NULL; nsvgDelete(img); return out; }
+    nsvgRasterize(r, img, -x0 * sc, -y0 * sc, sc, out.px, w, h, w * 4);
     nsvgDeleteRasterizer(r);
     nsvgDelete(img);
-    return surf;
+    out.w = w;
+    out.h = h;
+    return out;
 }
 
-static SDL_Texture *icon_load_file(const char *path, int want_px)
+static Icon icon_load_file(const char *path, int want_px)
 {
-    SDL_Surface *surf = NULL;
+    Icon out = { NULL, 0, 0 };
     size_t n = strlen(path);
+    int w = 0, h = 0, comp = 0;
+
     if (n > 4 && ci_cmp(path + n - 4, ".svg") == 0) {
-        surf = icon_svg_fitted(path, want_px);
-        if (!surf) {                               /* nanosvg could not: let
-                                                      SDL_image try instead */
-            SDL_IOStream *io = SDL_IOFromFile(path, "rb");
-            if (io) {
-                surf = IMG_LoadSizedSVG_IO(io, want_px, want_px);
-                SDL_CloseIO(io);
+        out = icon_svg_fitted(path, want_px);
+        if (out.px) return out;
+        return out;                       /* an SVG nanosvg cannot read */
+    }
+    out.px = stbi_load(path, &w, &h, &comp, 4);
+    if (!out.px) return out;
+    out.w = w;
+    out.h = h;
+    return out;
+}
+
+/* The canvas is premultiplied ARGB; an Icon is straight RGBA. */
+static Icon icon_from_canvas(const Canvas *cv)
+{
+    Icon out = { NULL, 0, 0 };
+    int x, y;
+    if (!cv || !cv->px) return out;
+    out.px = (unsigned char *)malloc((size_t)cv->w * (size_t)cv->h * 4);
+    if (!out.px) return out;
+    for (y = 0; y < cv->h; ++y) {
+        for (x = 0; x < cv->w; ++x) {
+            uint32_t p = cv->px[(size_t)y * (size_t)cv->w + x];
+            unsigned a = (p >> 24) & 0xff;
+            unsigned rv = (p >> 16) & 0xff, gv = (p >> 8) & 0xff, bv = p & 0xff;
+            unsigned char *d = out.px + ((size_t)y * (size_t)cv->w + x) * 4;
+            if (a && a < 255) {
+                rv = rv * 255u / a; if (rv > 255) rv = 255;
+                gv = gv * 255u / a; if (gv > 255) gv = 255;
+                bv = bv * 255u / a; if (bv > 255) bv = 255;
             }
+            d[0] = (unsigned char)rv; d[1] = (unsigned char)gv;
+            d[2] = (unsigned char)bv; d[3] = (unsigned char)a;
         }
     }
-    if (!surf) surf = IMG_Load(path);
-    if (!surf) return NULL;
-
-    SDL_Texture *t = SDL_CreateTextureFromSurface(REN, surf);
-    SDL_DestroySurface(surf);
-    if (t) {
-        SDL_SetTextureScaleMode(t, SDL_SCALEMODE_LINEAR);
-        SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
-    }
-    return t;
+    out.w = cv->w;
+    out.h = cv->h;
+    return out;
 }
 
 /* a rounded tile with the first letter, used when no icon is found */
-static SDL_Texture *icon_make_letter(const char *app_id, int want_px)
+static Icon icon_make_letter(const char *app_id, int want_px)
 {
     const char *nm = short_app_name(app_id);
     char letter[8] = {0};
-    /* copy one UTF-8 code point, upper-cased if ASCII */
     unsigned char c0 = (unsigned char)nm[0];
     int clen = (c0 < 0x80) ? 1 : (c0 < 0xe0) ? 2 : (c0 < 0xf0) ? 3 : 4;
+    Icon out = { NULL, 0, 0 };
+    Canvas *cv;
+    Font *f;
+    float gw, gh, sc;
+
     memcpy(letter, nm, (size_t)clen);
     if (clen == 1) letter[0] = (char)toupper(c0);
 
-    SDL_Texture *t = SDL_CreateTexture(REN, SDL_PIXELFORMAT_RGBA32,
-                                       SDL_TEXTUREACCESS_TARGET, want_px, want_px);
-    if (!t) return NULL;
-    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
-    SDL_SetTextureScaleMode(t, SDL_SCALEMODE_LINEAR);
+    cv = sw_canvas_new(want_px, want_px);
+    if (!cv) return out;
 
-    SDL_Texture *prev = SDL_GetRenderTarget(REN);
-    SDL_SetRenderTarget(REN, t);
-    SDL_SetRenderDrawBlendMode(REN, SDL_BLENDMODE_NONE);
-    set_col((SDL_FColor){0, 0, 0, 0});
-    SDL_RenderClear(REN);
-    SDL_SetRenderDrawBlendMode(REN, SDL_BLENDMODE_BLEND);
+    sw_fill_round(cv, 0, 0, (float)want_px, (float)want_px,
+                  want_px * 0.24f, want_px * 0.24f, want_px * 0.24f, want_px * 0.24f,
+                  fcol(mix(C.hl, C.tile, 0.55f)));
+    sw_stroke_round(cv, 0, 0, (float)want_px, (float)want_px,
+                    want_px * 0.24f, want_px * 0.24f, want_px * 0.24f, want_px * 0.24f,
+                    SW_MAX(1.0f, want_px * 0.05f), fcol(with_alpha(C.hl, 0.85f)));
 
-    SDL_FRect box = { 0, 0, (float)want_px, (float)want_px };
-    fill_round_rect(box, want_px * 0.24f, mix(C.hl, C.tile, 0.55f));
-    stroke_round_rect(box, want_px * 0.24f, SDL_max(1.0f, want_px * 0.05f),
-                      with_alpha(C.hl, 0.85f));
+    /* one glyph at whatever size fills the tile; the label font decides the
+       shape, sw_font the size, so it stays sharp at any icon_px */
+    f = F_LABEL ? F_LABEL : sw_font(SW_MAX(8, (int)(want_px * 0.5f)));
+    gh = f->lineh > 0.0f ? f->lineh : (float)want_px;
+    sc = SW_MIN((float)want_px * 0.62f / gh, 1.6f);
+    f = sw_font_bold(SW_MAX(6, (int)(f->px * sc + 0.5f)));
+    gw = sw_text_width(f, letter);
+    sw_text(cv, f, ((float)want_px - gw) * 0.5f,
+            ((float)want_px - f->lineh) * 0.5f + f->ascent, fcol(C.text), letter);
 
-    Tex g = text_make(F_LABEL, letter);
-    if (g.t) {
-        float s = SDL_min((float)want_px * 0.62f / SDL_max(1, g.h), 1.6f);
-        SDL_FRect dst = { (want_px - g.w * s) * 0.5f, (want_px - g.h * s) * 0.5f,
-                          g.w * s, g.h * s };
-        SDL_SetTextureColorModFloat(g.t, C.text.r, C.text.g, C.text.b);
-        SDL_RenderTexture(REN, g.t, NULL, &dst);
-        tex_free(&g);
-    }
-
-    SDL_SetRenderTarget(REN, prev);
-    return t;
+    out = icon_from_canvas(cv);
+    sw_canvas_free(cv);
+    return out;
 }
 
-typedef struct { char key[192]; SDL_Texture *tex; } IconCacheEntry;
+typedef struct { char key[192]; Icon ic; } IconCacheEntry;
 static IconCacheEntry g_icons[256];
 static int g_icon_count = 0;
 
-static SDL_Texture *icon_for_app(const char *app_id, int want_px)
+static const Icon *icon_for_app(const char *app_id, int want_px)
 {
+    const char *key;
+    const DesktopEntry *de;
+    Icon ic = { NULL, 0, 0 };
+    int i;
+
     if (!C.icons) return NULL;
-    const char *key = (app_id && *app_id) ? app_id : "unknown";
+    key = (app_id && *app_id) ? app_id : "unknown";
 
-    for (int i = 0; i < g_icon_count; ++i)
-        if (strcmp(g_icons[i].key, key) == 0) return g_icons[i].tex;
+    for (i = 0; i < g_icon_count; ++i)
+        if (strcmp(g_icons[i].key, key) == 0)
+            return g_icons[i].ic.px ? &g_icons[i].ic : NULL;
 
-    SDL_Texture *tex = NULL;
-    const DesktopEntry *de = desktop_find(key);
+    de = desktop_find(key);
     if (de && de->icon) {
         char *path = icon_lookup(de->icon, want_px);
-        if (path) { tex = icon_load_file(path, want_px); free(path); }
+        if (path) { ic = icon_load_file(path, want_px); free(path); }
     }
-    if (!tex) {                                   /* app_id often *is* the icon */
+    if (!ic.px) {                                 /* app_id often *is* the icon */
         char *path = icon_lookup(key, want_px);
         if (!path) path = icon_lookup(short_app_name(key), want_px);
-        if (path) { tex = icon_load_file(path, want_px); free(path); }
+        if (path) { ic = icon_load_file(path, want_px); free(path); }
     }
-    if (!tex) tex = icon_make_letter(key, want_px);
+    if (!ic.px) ic = icon_make_letter(key, want_px);
 
-    if (g_icon_count < (int)SDL_arraysize(g_icons)) {
+    if (g_icon_count < SW_ARRSZ(g_icons)) {
         str_set(g_icons[g_icon_count].key, sizeof(g_icons[0].key), key);
-        g_icons[g_icon_count].tex = tex;
+        g_icons[g_icon_count].ic = ic;
         g_icon_count++;
+        return g_icons[g_icon_count - 1].ic.px ? &g_icons[g_icon_count - 1].ic : NULL;
     }
-    return tex;
+    icon_free(&ic);                               /* cache full: no leak */
+    return NULL;
 }
 
 static void icons_free(void)
 {
-    for (int i = 0; i < g_icon_count; ++i)
-        if (g_icons[i].tex) SDL_DestroyTexture(g_icons[i].tex);
+    for (int i = 0; i < g_icon_count; ++i) icon_free(&g_icons[i].ic);
     g_icon_count = 0;
 
     for (int i = 0; i < g_desktop_count; ++i) {
@@ -2408,12 +2441,12 @@ typedef struct {
     bool  marked;              /* multi-selection */
     bool  match;               /* passes the current filter */
     bool  visible;             /* the one on top of its tabbed container */
-    SDL_FRect tab;             /* its slot in the container's tab strip   */
+    Rect tab;             /* its slot in the container's tab strip   */
     bool  has_tab;
 
     int   ws;                  /* index into WSS */
-    SDL_FRect card;            /* where it is drawn (render pixels) */
-    SDL_FRect hit;             /* what the mouse acts on: the whole card, or
+    Rect card;            /* where it is drawn (render pixels) */
+    Rect hit;             /* what the mouse acts on: the whole card, or
                                 * just the name plate of a floating window   */
     int   group;               /* head index of a tabbed/stacked group, or -1 */
 
@@ -2421,7 +2454,7 @@ typedef struct {
     float lay_icon;            /* icon edge length on this card */
     bool  lay_sub;             /* is there room for the title */
 
-    SDL_Texture *icon;         /* borrowed from the icon cache */
+    const Icon *icon;          /* borrowed from the icon cache */
     Tex   label, subtitle, pidtex;
 } Win;
 
@@ -2440,13 +2473,13 @@ typedef struct {
     int   top[64];             /* top level containers, in order           */
     int   ntop;
 
-    SDL_FRect tile, screen;    /* layout (render pixels) */
+    Rect tile, screen;    /* layout (render pixels) */
     bool  marked;              /* the workspace itself, not its windows     */
-    SDL_FRect title_box;       /* where the name is drawn in the header      */
-    SDL_FRect title_hit;       /* clicking there renames: the pencil at the
+    Rect title_box;       /* where the name is drawn in the header      */
+    Rect title_hit;       /* clicking there renames: the pencil at the
                                 * right end of the name, or with
                                 * rename_icon=0 the middle half of it */
-    SDL_FRect tile_from;       /* where this tile animates from */
+    Rect tile_from;       /* where this tile animates from */
     Tex   badge, sub, title;
 } Ws;
 
@@ -2466,13 +2499,13 @@ typedef struct {
     char name[64];
     int  x, y, w, h;
     bool focused;
-    SDL_FRect box;                      /* where it sits in the map */
+    Rect box;                      /* where it sits in the map */
 } Out;
 static Out  OUTS[8];
 static int  NOUTS;
 static bool dirty   = true;      /* a frame is only drawn when this is set */
-static SDL_FRect MAP_RECT;              /* the corner it is drawn in */
-static SDL_FRect CANCEL_RECT;           /* and the ✕ beside it, while dragging */
+static Rect MAP_RECT;              /* the corner it is drawn in */
+static Rect CANCEL_RECT;           /* and the ✕ beside it, while dragging */
 
 /* Holding an app over another monitor for a moment steps the overview onto
  * it, so a drag that started on one screen can finish on another. It is a
@@ -2498,7 +2531,7 @@ static void outputs_reload(void)
     JV *outs = sway_query(IPC_GET_OUTPUTS);
     if (!outs || outs->type != J_ARR) { jfree(outs); return; }
 
-    for (int i = 0; i < outs->count && NOUTS < (int)SDL_arraysize(OUTS); ++i) {
+    for (int i = 0; i < outs->count && NOUTS < (int)SW_ARRSZ(OUTS); ++i) {
         const JV *o = outs->items[i];
         if (!jbool(o, "active", true)) continue;
         const JV *r = jget(o, "rect");
@@ -2508,7 +2541,7 @@ static void outputs_reload(void)
         d->w = jint(r, "width", 0);  d->h = jint(r, "height", 0);
         d->focused = jbool(o, "focused", false);
         if (d->focused) str_set(HOME_OUTPUT, sizeof(HOME_OUTPUT), d->name);
-        d->box = (SDL_FRect){ 0, 0, 0, 0 };
+        d->box = (Rect){ 0, 0, 0, 0 };
     }
     jfree(outs);
 }
@@ -2776,7 +2809,7 @@ static bool model_reload(void)
 
 /* ---------------------------------------------------------------- layout */
 
-typedef struct { int ws; int num; SDL_FRect tile, from; } Slot;  /* ws < 0 = ghost */
+typedef struct { int ws; int num; Rect tile, from; } Slot;  /* ws < 0 = ghost */
 static Slot SLOTS[MAX_WORKSPACES + 16];
 static int  NSLOTS;
 static bool drag_ws_mode;         /* a workspace is being dragged right now  */
@@ -2784,7 +2817,7 @@ static int  ghost_lo = -1, ghost_hi = -1;   /* free numbers currently offered */
 
 static Slot   DYING[16];          /* ghosts on their way out                 */
 static int    NDYING;
-static Uint64 dying_start;
+static uint64_t dying_start;
 static bool   laid_out_once;
 static bool   shown_once;    /* a frame has been presented */
 
@@ -2799,22 +2832,22 @@ static bool   shown_once;    /* a frame has been presented */
 #define SETTLE_MS 500
 static bool settled(void)
 {
-    return shown_once && SDL_GetTicks() > SETTLE_MS;
+    return shown_once && now_ms_() > SETTLE_MS;
 }
 
-static Uint64 anim_start;         /* tiles glide when the grid changes       */
+static uint64_t anim_start;         /* tiles glide when the grid changes       */
 
 static bool anim_running(void)
 {
     if (C.anim_ms <= 0.0f) return false;
-    if (anim_start && (float)(SDL_GetTicks() - anim_start) < C.anim_ms) return true;
-    return NDYING > 0 && (float)(SDL_GetTicks() - dying_start) < C.anim_ms;
+    if (anim_start && (float)(now_ms_() - anim_start) < C.anim_ms) return true;
+    return NDYING > 0 && (float)(now_ms_() - dying_start) < C.anim_ms;
 }
 
-static float phase_since(Uint64 start)
+static float phase_since(uint64_t start)
 {
     if (!start || C.anim_ms <= 0.0f) return 1.0f;
-    float t = (float)(SDL_GetTicks() - start) / C.anim_ms;
+    float t = (float)(now_ms_() - start) / C.anim_ms;
     if (t >= 1.0f) return 1.0f;
     if (t <= 0.0f) return 0.0f;
     float inv = 1.0f - t;
@@ -2825,23 +2858,23 @@ static float phase_since(Uint64 start)
 static float anim_phase(void)
 {
     if (!anim_start || C.anim_ms <= 0.0f) return 1.0f;
-    float t = (float)(SDL_GetTicks() - anim_start) / C.anim_ms;
+    float t = (float)(now_ms_() - anim_start) / C.anim_ms;
     if (t >= 1.0f) return 1.0f;
     if (t <= 0.0f) return 0.0f;
     float inv = 1.0f - t;
     return 1.0f - inv * inv * inv;
 }
 
-static SDL_FRect rect_lerp(SDL_FRect a, SDL_FRect b, float t)
+static Rect rect_lerp(Rect a, Rect b, float t)
 {
-    return (SDL_FRect){ a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
+    return (Rect){ a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
                         a.w + (b.w - a.w) * t, a.h + (b.h - a.h) * t };
 }
 
-static SDL_FRect rect_shrink(SDL_FRect r, float f)
+static Rect rect_shrink(Rect r, float f)
 {
     float w = r.w * f, h = r.h * f;
-    return (SDL_FRect){ r.x + (r.w - w) * 0.5f, r.y + (r.h - h) * 0.5f, w, h };
+    return (Rect){ r.x + (r.w - w) * 0.5f, r.y + (r.h - h) * 0.5f, w, h };
 }
 
 static int   GRID_COLS = 1;       /* columns the tiles are arranged in       */
@@ -2889,7 +2922,7 @@ static bool  mouse_seen;         /* we have a position to compare against */
 static bool sel_shown(void) { return sel_active && (sel_by_key || mouse_moved); }
 static int  hov_ws = -1, hov_win = -1;
 static bool pencil_hot;          /* the pointer is on a rename pencil */
-static void draw_pencil(SDL_FRect r, SDL_FColor c);
+static void draw_pencil(Rect r, FCol c);
 
 /* A floating window is see-through and answers the pointer only through its
  * name plate, so the windows underneath stay reachable. Once you are on that
@@ -2902,10 +2935,10 @@ static int  LIFT_WIN = -1;
 
 static bool lift_holds(const Win *w, const Ws *ws, float x, float y)
 {
-    SDL_FRect c = w->card;
+    Rect c = w->card;
     if (x < c.x || x >= c.x + c.w || y < c.y || y >= c.y + c.h) return false;
 
-    float band = SDL_clamp(SDL_min(ws->tile.w, ws->tile.h) * 0.06f,
+    float band = SW_CLAMP(SW_MIN(ws->tile.w, ws->tile.h) * 0.06f,
                            8.0f * SC, 40.0f * SC);
     bool fills = c.w >= ws->screen.w - band && c.h >= ws->screen.h - band;
     if (!fills) return true;
@@ -2960,8 +2993,8 @@ static Win *ws_sel_win(Ws *w)
 static bool rect_overlap_same(const Win *a, const Win *b)
 {
     int tol = 6;
-    return SDL_abs(a->x - b->x) <= tol && SDL_abs(a->y - b->y) <= tol &&
-           SDL_abs(a->w - b->w) <= tol && SDL_abs(a->h - b->h) <= tol;
+    return abs(a->x - b->x) <= tol && abs(a->y - b->y) <= tol &&
+           abs(a->w - b->w) <= tol && abs(a->h - b->h) <= tol;
 }
 
 static void layout_cards(Ws *ws)
@@ -2971,20 +3004,20 @@ static void layout_cards(Ws *ws)
     /* the windows live in an area that keeps an equal border on all four
      * sides of the mini screen, so nothing ever touches the tile frame */
     float sp = C.screen_pad * SC;
-    SDL_FRect area = { ws->screen.x + sp, ws->screen.y + sp,
+    Rect area = { ws->screen.x + sp, ws->screen.y + sp,
                        ws->screen.w - 2.0f * sp, ws->screen.h - 2.0f * sp };
     if (area.w < 8.0f || area.h < 8.0f) area = ws->screen;
 
-    float sx = area.w / (float)SDL_max(1, ws->rw);
-    float sy = area.h / (float)SDL_max(1, ws->rh);
+    float sx = area.w / (float)SW_MAX(1, ws->rw);
+    float sy = area.h / (float)SW_MAX(1, ws->rh);
     float inset = C.win_gap * SC * 0.5f;
     float min_w = 74.0f * SC, min_h = 52.0f * SC;
-    min_w = SDL_min(min_w, area.w);
-    min_h = SDL_min(min_h, area.h);
+    min_w = SW_MIN(min_w, area.w);
+    min_h = SW_MIN(min_h, area.h);
 
     for (int i = 0; i < ws->count; ++i) {
         Win *w = &WINS[ws->first + i];
-        SDL_FRect r = {
+        Rect r = {
             area.x + (float)(w->x - ws->rx) * sx + inset,
             area.y + (float)(w->y - ws->ry) * sy + inset,
             (float)w->w * sx - 2.0f * inset,
@@ -3022,7 +3055,7 @@ static void layout_cards(Ws *ws)
         if (n < 2) continue;
 
         float ge = 3.0f * SC;                    /* room for the group outline */
-        SDL_FRect base = WINS[ws->first + i].card;
+        Rect base = WINS[ws->first + i].card;
         base.x += ge; base.y += ge; base.w -= 2.0f * ge; base.h -= 2.0f * ge;
         if (base.w < 4.0f || base.h < 4.0f) base = WINS[ws->first + i].card;
         for (int k = 0; k < n; ++k) WINS[ws->first + group[k]].group = i;
@@ -3036,7 +3069,7 @@ static void layout_cards(Ws *ws)
             if (cw->visible) active = k;
         }
 
-        float strip = SDL_min(32.0f * SC, base.h * 0.36f);
+        float strip = SW_MIN(32.0f * SC, base.h * 0.36f);
         bool  tabs_fit = strip >= 16.0f * SC && base.w / (float)n >= 26.0f * SC;
 
         if (tabs_fit) {
@@ -3045,23 +3078,23 @@ static void layout_cards(Ws *ws)
              * inset from the group's own edge, so a tab never sits against
              * the border and the first and last are not clipped by its
              * rounded corners. */
-            float pad = SDL_clamp(base.w * 0.02f, 2.0f * SC, 8.0f * SC);
+            float pad = SW_CLAMP(base.w * 0.02f, 2.0f * SC, 8.0f * SC);
             float inner = base.w - 2.0f * pad;
             float tw = inner / (float)n;
             for (int k = 0; k < n; ++k) {
                 Win *cw = &WINS[ws->first + group[k]];
-                cw->tab = (SDL_FRect){ base.x + pad + (float)k * tw + inset * 0.5f,
+                cw->tab = (Rect){ base.x + pad + (float)k * tw + inset * 0.5f,
                                        base.y + pad, tw - inset, strip };
                 cw->has_tab = true;
                 cw->card = (k == active)
-                    ? (SDL_FRect){ base.x + pad, base.y + pad + strip + inset * 0.5f,
+                    ? (Rect){ base.x + pad, base.y + pad + strip + inset * 0.5f,
                                    inner, base.h - 2.0f * pad - strip - inset * 0.5f }
                     : cw->tab;
             }
         } else {
             bool horiz = base.w >= base.h;          /* too small: plain slices */
             for (int k = 0; k < n; ++k) {
-                SDL_FRect r = base;
+                Rect r = base;
                 if (horiz) {
                     r.w = (base.w - (float)(n - 1) * inset * 2.0f) / (float)n;
                     r.x = base.x + (float)k * (r.w + inset * 2.0f);
@@ -3077,7 +3110,7 @@ static void layout_cards(Ws *ws)
 
     /* keep everything inside the tile */
     for (int i = 0; i < ws->count; ++i) {
-        SDL_FRect *r = &WINS[ws->first + i].card;
+        Rect *r = &WINS[ws->first + i].card;
         if (r->w > area.w) r->w = area.w;
         if (r->h > area.h) r->h = area.h;
         if (r->x < area.x) r->x = area.x;
@@ -3090,7 +3123,7 @@ static void layout_cards(Ws *ws)
 /* shallow cards (a tab, say) cannot spare 7px top and bottom */
 static float card_pad(const Win *w)
 {
-    return SDL_min(7.0f * SC, w->card.h * 0.13f);
+    return SW_MIN(7.0f * SC, w->card.h * 0.13f);
 }
 
 enum { CL_ICON, CL_STACK, CL_ROW, CL_TEXT };
@@ -3102,11 +3135,11 @@ static void compute_card_layout(Win *w)
     float pad    = card_pad(w);
     float availw = w->card.w - 2.0f * pad;
     float availh = w->card.h - 2.0f * pad;
-    float lab_h  = (float)TTF_GetFontHeight(F_LABEL);
-    float sub_h  = (float)TTF_GetFontHeight(F_TITLE);
+    float lab_h  = F_LABEL->lineh;
+    float sub_h  = F_TITLE->lineh;
     float g1 = 4.0f * SC, g2 = 1.0f * SC;
-    float icon_max = C.icons ? SDL_min((float)C.icon_px * SC,
-                                       SDL_min(availw * 0.72f, availh * 0.72f)) : 0.0f;
+    float icon_max = C.icons ? SW_MIN((float)C.icon_px * SC,
+                                       SW_MIN(availw * 0.72f, availh * 0.72f)) : 0.0f;
     float icon_min = 16.0f * SC;
 
     w->lay_mode = CL_ICON;
@@ -3124,7 +3157,7 @@ static void compute_card_layout(Win *w)
     if (availw >= availh * 1.15f && availw >= lab_h * 5.0f &&
         availh >= lab_h + g2 + sub_h) {                          /* wide and flat */
         w->lay_mode = CL_ROW;
-        w->lay_icon = C.icons ? SDL_min(icon_max, SDL_min(availh * 0.9f, availw * 0.3f)) : 0.0f;
+        w->lay_icon = C.icons ? SW_MIN(icon_max, SW_MIN(availh * 0.9f, availw * 0.3f)) : 0.0f;
         if (w->lay_icon < icon_min) w->lay_icon = 0.0f;
         w->lay_sub  = true;
         return;
@@ -3137,7 +3170,7 @@ static void compute_card_layout(Win *w)
     }
     if (availh >= icon_min + g1 + lab_h) {                       /* icon + name */
         w->lay_mode = CL_STACK;
-        w->lay_icon = SDL_min(icon_max, availh - lab_h - g1);
+        w->lay_icon = SW_MIN(icon_max, availh - lab_h - g1);
         w->lay_sub  = false;
         return;
     }
@@ -3147,7 +3180,7 @@ static void compute_card_layout(Win *w)
         w->lay_sub  = false;
         return;
     }
-    w->lay_icon = SDL_min(availw, availh);                       /* icon only */
+    w->lay_icon = SW_MIN(availw, availh);                       /* icon only */
 }
 
 /* Floating and fullscreen windows are drawn as see-through frames with a name
@@ -3155,16 +3188,16 @@ static void compute_card_layout(Win *w)
  * windows underneath stay clickable. */
 static bool card_is_overlay(const Win *w) { return w->floating || w->fullscreen; }
 
-static bool overlay_plate(const Win *w, SDL_FRect r, SDL_FRect *plate, float *icon_w)
+static bool overlay_plate(const Win *w, Rect r, Rect *plate, float *icon_w)
 {
     if (!w->label.t) return false;
 
     float ip = 6.0f * SC;
-    float ih = SDL_min(22.0f * SC, (float)C.icon_px * SC * 0.6f);
+    float ih = SW_MIN(22.0f * SC, (float)C.icon_px * SC * 0.6f);
     bool  has_icon = C.icons && w->icon && w->lay_icon >= 10.0f * SC && ih >= 10.0f * SC;
     float iw = has_icon ? ih + 5.0f * SC : 0.0f;
     float pw = iw + (float)w->label.w + 2.0f * ip;
-    float ph = SDL_max((float)w->label.h, ih) + ip;
+    float ph = SW_MAX((float)w->label.h, ih) + ip;
 
     if (pw > r.w - 4.0f * SC) {                 /* tight: drop the icon first */
         iw = 0.0f;
@@ -3173,7 +3206,7 @@ static bool overlay_plate(const Win *w, SDL_FRect r, SDL_FRect *plate, float *ic
     }
     if (pw > r.w - 4.0f * SC || ph > r.h * 0.6f) return false;
 
-    *plate = (SDL_FRect){ r.x + (r.w - pw) * 0.5f, r.y + 7.0f * SC, pw, ph };
+    *plate = (Rect){ r.x + (r.w - pw) * 0.5f, r.y + 7.0f * SC, pw, ph };
     if (icon_w) *icon_w = iw;
     return true;
 }
@@ -3285,7 +3318,7 @@ static void build_texts(void)
             w->pidtex = text_make_fit(F_PID ? F_PID : F_HINT, p, maxw);
         }
 
-        SDL_FRect plate;
+        Rect plate;
         if (card_is_overlay(w) && overlay_plate(w, w->card, &plate, NULL))
             w->hit = plate;
     }
@@ -3316,8 +3349,8 @@ static void layout(void)
      * same one whichever screen is being shown. Handing it whatever cell the
      * grid happened to leave over meant it moved about, and vanished
      * entirely when the grid came out full. The tiles get what is left. */
-    MAP_RECT = (SDL_FRect){ 0, 0, 0, 0 };
-    CANCEL_RECT = (SDL_FRect){ 0, 0, 0, 0 };
+    MAP_RECT = (Rect){ 0, 0, 0, 0 };
+    CANCEL_RECT = (Rect){ 0, 0, 0, 0 };
     if (C.outputs_map && NOUTS > 1) {
         int minx = OUTS[0].x, miny = OUTS[0].y;
         int maxx = OUTS[0].x + OUTS[0].w, maxy = OUTS[0].y + OUTS[0].h;
@@ -3329,21 +3362,21 @@ static void layout(void)
         }
         float dw = (float)(maxx - minx), dh = (float)(maxy - miny);
         if (dw > 1.0f && dh > 1.0f) {
-            float mw = aw * SDL_clamp(C.outputs_map_w, 0.05f, 0.45f);
+            float mw = aw * SW_CLAMP(C.outputs_map_w, 0.05f, 0.45f);
             float mh = mw * dh / dw;
             float cap = ah * 0.30f;
             if (mh > cap) { mh = cap; mw = mh * dw / dh; }
-            MAP_RECT = (SDL_FRect){ ax, ay + ah - mh, mw, mh };
+            MAP_RECT = (Rect){ ax, ay + ah - mh, mw, mh };
 
             /* Somewhere to put a drag down and have nothing happen. It runs
                from the monitors to the right edge and fills the band, so
                dragging downwards is enough — no aiming, no corner to find. */
             float cx0 = ax + mw + gap * 2.0f;
-            CANCEL_RECT = (SDL_FRect){ cx0, ay + ah - mh,
-                                       SDL_max(mh, ax + aw - cx0), mh };
+            CANCEL_RECT = (Rect){ cx0, ay + ah - mh,
+                                       SW_MAX(mh, ax + aw - cx0), mh };
 
             ah -= mh + gap;
-            if (ah < 60.0f) { MAP_RECT = (SDL_FRect){ 0, 0, 0, 0 }; ah = (float)RH - HEADER_H - FOOTER_H - m; }
+            if (ah < 60.0f) { MAP_RECT = (Rect){ 0, 0, 0, 0 }; ah = (float)RH - HEADER_H - FOOTER_H - m; }
         }
     }
 
@@ -3383,7 +3416,7 @@ static void layout(void)
      * an animation has to continue from what the eye sees, otherwise the
      * movement snaps. */
     Slot old[MAX_WORKSPACES + 16];
-    int  nold = SDL_min(NSLOTS, (int)SDL_arraysize(SLOTS));
+    int  nold = SW_MIN(NSLOTS, (int)SW_ARRSZ(SLOTS));
     float ph_now = anim_phase();
     for (int i = 0; i < nold; ++i) {
         old[i] = SLOTS[i];
@@ -3391,14 +3424,14 @@ static void layout(void)
     }
 
     NSLOTS = 0;
-    for (int i = 0; i < NWS && NSLOTS < (int)SDL_arraysize(SLOTS); ++i) {
+    for (int i = 0; i < NWS && NSLOTS < (int)SW_ARRSZ(SLOTS); ++i) {
         if (WSS[i].num < 0) continue;
         SLOTS[NSLOTS].ws  = i;
         SLOTS[NSLOTS].num = WSS[i].num;
         NSLOTS++;
     }
     for (int n = ghost_lo; ghost_lo >= 0 && n <= ghost_hi &&
-                           NSLOTS < (int)SDL_arraysize(SLOTS); ++n) {
+                           NSLOTS < (int)SW_ARRSZ(SLOTS); ++n) {
         bool taken = false;
         for (int i = 0; i < NWS; ++i) if (WSS[i].num == n) { taken = true; break; }
         if (taken) continue;
@@ -3411,7 +3444,7 @@ static void layout(void)
             if (SLOTS[j].num < SLOTS[i].num) {
                 Slot t = SLOTS[i]; SLOTS[i] = SLOTS[j]; SLOTS[j] = t;
             }
-    for (int i = 0; i < NWS && NSLOTS < (int)SDL_arraysize(SLOTS); ++i)
+    for (int i = 0; i < NWS && NSLOTS < (int)SW_ARRSZ(SLOTS); ++i)
         if (WSS[i].num < 0) {                         /* named workspaces last */
             SLOTS[NSLOTS].ws  = i;
             SLOTS[NSLOTS].num = -1;
@@ -3435,7 +3468,7 @@ static void layout(void)
 
     int cols = best_cols, rows = best_rows;
     if (cols * rows < n_tiles) cols = (n_tiles + rows - 1) / rows;
-    GRID_COLS = SDL_max(1, cols);
+    GRID_COLS = SW_MAX(1, cols);
     float tw = (aw - gap * (float)(cols - 1)) / (float)cols;
     float th = (ah - gap * (float)(rows - 1)) / (float)rows;
     float head_h = (float)C.ws_px * SC * 1.55f;
@@ -3449,7 +3482,7 @@ static void layout(void)
 
     for (int sidx = 0; sidx < NSLOTS; ++sidx) {
         int r = sidx / cols, c = sidx % cols;
-        SLOTS[sidx].tile = (SDL_FRect){ ox + (float)c * (tw + gap),
+        SLOTS[sidx].tile = (Rect){ ox + (float)c * (tw + gap),
                                         oy + (float)r * (th + gap), tw, th };
         if (SLOTS[sidx].ws < 0) continue;                 /* ghost: nothing to lay out */
 
@@ -3458,7 +3491,7 @@ static void layout(void)
 
         float p = C.pad * SC;
         float gutter = C.usage_dots ? C.dot_px * SC * 2.0f : 0.0f;
-        SDL_FRect body = { ws->tile.x + p + gutter,
+        Rect body = { ws->tile.x + p + gutter,
                            ws->tile.y + head_h,
                            ws->tile.w - 2.0f * p - gutter,
                            ws->tile.h - head_h - p };
@@ -3469,7 +3502,7 @@ static void layout(void)
         float wa = (ws->rw > 0 && ws->rh > 0) ? (float)ws->rw / (float)ws->rh : aspect;
         float sw = body.w, sh = body.w / wa;
         if (sh > body.h) { sh = body.h; sw = body.h * wa; }
-        ws->screen = (SDL_FRect){ body.x + (body.w - sw) * 0.5f,
+        ws->screen = (Rect){ body.x + (body.w - sw) * 0.5f,
                                   body.y + (body.h - sh) * 0.5f, sw, sh };
         layout_cards(ws);
     }
@@ -3491,9 +3524,9 @@ static void layout(void)
             }
         }
         if (!settled()) SLOTS[i].from = SLOTS[i].tile;       /* no intro */
-        if (!matched || SDL_fabsf(SLOTS[i].from.x - SLOTS[i].tile.x) > 0.5f ||
-                        SDL_fabsf(SLOTS[i].from.y - SLOTS[i].tile.y) > 0.5f ||
-                        SDL_fabsf(SLOTS[i].from.w - SLOTS[i].tile.w) > 0.5f)
+        if (!matched || fabsf(SLOTS[i].from.x - SLOTS[i].tile.x) > 0.5f ||
+                        fabsf(SLOTS[i].from.y - SLOTS[i].tile.y) > 0.5f ||
+                        fabsf(SLOTS[i].from.w - SLOTS[i].tile.w) > 0.5f)
             moved = true;
         if (SLOTS[i].ws >= 0) WSS[SLOTS[i].ws].tile_from = SLOTS[i].from;
     }
@@ -3501,7 +3534,7 @@ static void layout(void)
     /* ghosts that are no longer part of the grid shrink away instead of
      * blinking out; they are drawn from this list until they are done */
     int dying = 0;
-    for (int j = 0; j < nold && dying < (int)SDL_arraysize(DYING); ++j) {
+    for (int j = 0; j < nold && dying < (int)SW_ARRSZ(DYING); ++j) {
         if (old[j].ws >= 0) continue;
         bool still_there = false;
         for (int i = 0; i < NSLOTS; ++i)
@@ -3516,11 +3549,11 @@ static void layout(void)
     }
     if (dying > 0) {                       /* a later relayout must not eat them */
         NDYING = dying;
-        dying_start = SDL_GetTicks();
+        dying_start = now_ms_();
         moved = true;
     }
 
-    if (moved && settled()) anim_start = SDL_GetTicks();
+    if (moved && settled()) anim_start = now_ms_();
     laid_out_once = true;
 
     build_texts();
@@ -3533,20 +3566,20 @@ static void layout(void)
         float left  = ws->tile.x + p + (ws->sub.t ? (float)ws->sub.w : 0.0f) + p;
         float right = ws->tile.x + ws->tile.w - p -
                       (ws->badge.t ? (float)ws->badge.w : 0.0f) - p;
-        float w = SDL_max(right - left, 0.0f);
+        float w = SW_MAX(right - left, 0.0f);
         if (C.rename_icon) {
             /* The middle of the name used to be an invisible button, and
              * clicking a header to grab the workspace opened the editor by
              * accident. Now it is a pencil you can see, at the right end of
              * the name, and the name itself is part of the header like
              * everywhere else. The name is centred in what is left. */
-            float icon = SDL_min(head_h * 0.72f, SDL_max(w, 0.0f));
-            ws->title_box = (SDL_FRect){ left, ws->tile.y, SDL_max(w - icon, 0.0f), head_h };
-            ws->title_hit = (SDL_FRect){ left + w - icon, ws->tile.y + (head_h - icon) * 0.5f,
+            float icon = SW_MIN(head_h * 0.72f, SW_MAX(w, 0.0f));
+            ws->title_box = (Rect){ left, ws->tile.y, SW_MAX(w - icon, 0.0f), head_h };
+            ws->title_hit = (Rect){ left + w - icon, ws->tile.y + (head_h - icon) * 0.5f,
                                          icon, icon };
         } else {
-            ws->title_box = (SDL_FRect){ left, ws->tile.y, w, head_h };
-            ws->title_hit = (SDL_FRect){ left + w * 0.25f, ws->tile.y, w * 0.5f, head_h };
+            ws->title_box = (Rect){ left, ws->tile.y, w, head_h };
+            ws->title_hit = (Rect){ left + w * 0.25f, ws->tile.y, w * 0.5f, head_h };
         }
     }
 }
@@ -3612,7 +3645,7 @@ static void focus_load(void)
     FILE *f = fopen(path, "r");
     if (!f) return;
     char line[64];
-    while (NFOCUS < (int)SDL_arraysize(FOCUS) && fgets(line, sizeof(line), f)) {
+    while (NFOCUS < (int)SW_ARRSZ(FOCUS) && fgets(line, sizeof(line), f)) {
         int id = atoi(line);
         if (id > 0) FOCUS[NFOCUS++] = id;
     }
@@ -3637,7 +3670,7 @@ static bool step_recent(int dir)
 
     /* every window we can see, in the order they were last focused */
     int order[MAX_WINDOWS], n = 0;
-    for (int i = 0; i < NWIN && n < (int)SDL_arraysize(order); ++i)
+    for (int i = 0; i < NWIN && n < (int)SW_ARRSZ(order); ++i)
         if (win_visible(&WINS[i]) && !WINS[i].is_self) order[n++] = i;
     if (n == 0) return false;
 
@@ -3677,13 +3710,13 @@ static void step_ws(int dir)
 static void step_ws_row(int dir)
 {
     if (NWS == 0) return;
-    int step = SDL_max(1, GRID_COLS) * dir;
+    int step = SW_MAX(1, GRID_COLS) * dir;
     int cand = ((sel_ws + step) % NWS + NWS) % NWS;
     select_ws(cand, false);
 }
 
-static float rect_cx(SDL_FRect r) { return r.x + r.w * 0.5f; }
-static float rect_cy(SDL_FRect r) { return r.y + r.h * 0.5f; }
+static float rect_cx(Rect r) { return r.x + r.w * 0.5f; }
+static float rect_cy(Rect r) { return r.y + r.h * 0.5f; }
 
 /* move the selection one step into direction (dx, dy); crosses tiles */
 static void navigate(int dx, int dy)
@@ -3708,7 +3741,7 @@ static void navigate(int dx, int dy)
         if (w == cur || !win_visible(w)) continue;
         float cx = rect_cx(w->card) - fx, cy = rect_cy(w->card) - fy;
         float along = cx * (float)dx + cy * (float)dy;
-        float perp  = SDL_fabsf(cx * (float)dy - cy * (float)dx);
+        float perp  = fabsf(cx * (float)dy - cy * (float)dx);
         if (along <= 4.0f * SC) continue;
         float score = along + perp * 2.0f;
         if (score < best_score) { best_score = score; best = i; }
@@ -3723,7 +3756,7 @@ static void navigate(int dx, int dy)
         float cx = rect_cx(WSS[i].tile) - rect_cx(ws->tile);
         float cy = rect_cy(WSS[i].tile) - rect_cy(ws->tile);
         float along = cx * (float)dx + cy * (float)dy;
-        float perp  = SDL_fabsf(cx * (float)dy - cy * (float)dx);
+        float perp  = fabsf(cx * (float)dy - cy * (float)dx);
         if (along <= 1.0f) continue;
         float score = along + perp * 3.0f;
         if (score < best_score) { best_score = score; best_ws = i; }
@@ -3736,7 +3769,7 @@ static void navigate(int dx, int dy)
             if (i == sel_ws) continue;
             float cx = rect_cx(WSS[i].tile), cy = rect_cy(WSS[i].tile);
             float along = cx * (float)dx + cy * (float)dy;          /* far side */
-            float perp  = SDL_fabsf((cx - rect_cx(ws->tile)) * (float)dy -
+            float perp  = fabsf((cx - rect_cx(ws->tile)) * (float)dy -
                                     (cy - rect_cy(ws->tile)) * (float)dx);
             float score = along + perp * 3.0f;
             if (score < bs) { bs = score; best_ws = i; }
@@ -3752,7 +3785,7 @@ static void navigate(int dx, int dy)
             for (int i = 0; i < nw->count; ++i) {
                 Win *w = &WINS[nw->first + i];
                 if (!win_visible(w)) continue;
-                float d = SDL_fabsf(rect_cx(w->card) - fx) + SDL_fabsf(rect_cy(w->card) - fy);
+                float d = fabsf(rect_cx(w->card) - fx) + fabsf(rect_cy(w->card) - fy);
                 if (d < bs) { bs = d; bi = i; }
             }
             if (bi >= 0) nw->sel = bi;
@@ -3863,7 +3896,7 @@ static int hit_test(float mx, float my, int *out_ws)
         for (int j = ws->count - 1; j >= 0; --j) {      /* floats are last = on top */
             Win *w = &WINS[ws->first + j];
             if (w->is_self) continue;              /* scenery, not a target */
-            SDL_FRect r = (ws->first + j == LIFT_WIN)
+            Rect r = (ws->first + j == LIFT_WIN)
                         ? w->card                          /* lifted: all of it */
                         : ((w->hit.w > 0.0f) ? w->hit : w->card);
             if (mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h)
@@ -3931,7 +3964,7 @@ static float press_x, press_y;
 static int   press_win = -1, press_ws = -1;
 static bool  drag_active;
 static float drag_x, drag_y;
-static SDL_FRect drag_src_tile;   /* where the dragged window's workspace was
+static Rect drag_src_tile;   /* where the dragged window's workspace was
                                    * when the drag began — a fixed rectangle,
                                    * so the reflow cannot move the threshold */
 
@@ -3955,22 +3988,22 @@ static void reload_model(void);
 static int slot_at(float x, float y)
 {
     for (int i = 0; i < NSLOTS; ++i) {
-        SDL_FRect t = SLOTS[i].tile;
+        Rect t = SLOTS[i].tile;
         if (x >= t.x && x < t.x + t.w && y >= t.y && y < t.y + t.h) return i;
     }
     return -1;
 }
 
 /* which side of a card the pointer is closest to */
-static int edge_at(SDL_FRect r, float x, float y)
+static int edge_at(Rect r, float x, float y)
 {
-    float dx = (x - (r.x + r.w * 0.5f)) / SDL_max(1.0f, r.w);
-    float dy = (y - (r.y + r.h * 0.5f)) / SDL_max(1.0f, r.h);
-    if (SDL_fabsf(dx) >= SDL_fabsf(dy)) return dx < 0.0f ? EDGE_LEFT : EDGE_RIGHT;
+    float dx = (x - (r.x + r.w * 0.5f)) / SW_MAX(1.0f, r.w);
+    float dy = (y - (r.y + r.h * 0.5f)) / SW_MAX(1.0f, r.h);
+    if (fabsf(dx) >= fabsf(dy)) return dx < 0.0f ? EDGE_LEFT : EDGE_RIGHT;
     return dy < 0.0f ? EDGE_TOP : EDGE_BOTTOM;
 }
 
-static bool point_in(SDL_FRect r, float x, float y)
+static bool point_in(Rect r, float x, float y)
 {
     return x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h;
 }
@@ -4062,7 +4095,7 @@ static bool map_dwell_hover(float x, float y)
 
     int on = -1;
     for (int i = 0; i < NOUTS; ++i) {
-        SDL_FRect r = OUTS[i].box;
+        Rect r = OUTS[i].box;
         if (r.w > 0.0f && x >= r.x && x < r.x + r.w &&
             y >= r.y && y < r.y + r.h) { on = i; break; }
     }
@@ -4071,7 +4104,7 @@ static bool map_dwell_hover(float x, float y)
     if (on >= 0) { drop_kind = DROP_OUTPUT; drop_out = on; }
     else if (drop_kind == DROP_OUTPUT) { drop_kind = DROP_NONE; drop_out = -1; }
 
-    float moved = SDL_fabsf(x - MAP_HOVER_X) + SDL_fabsf(y - MAP_HOVER_Y);
+    float moved = fabsf(x - MAP_HOVER_X) + fabsf(y - MAP_HOVER_Y);
     if (on != MAP_HOVER || moved > 4.0f * SC) {
         MAP_HOVER = on;
         MAP_HOVER_SINCE = now_secs();
@@ -4113,8 +4146,8 @@ static void drag_update_target(float x, float y)
         if (si < 0) return;
         if (SLOTS[si].ws == press_ws) return;         /* itself */
 
-        SDL_FRect t = SLOTS[si].tile;
-        float rel = (x - t.x) / SDL_max(1.0f, t.w);
+        Rect t = SLOTS[si].tile;
+        float rel = (x - t.x) / SW_MAX(1.0f, t.w);
         drop_ws  = SLOTS[si].ws;
         drop_num = SLOTS[si].num;
         if (rel < 0.22f || rel > 0.78f) {             /* the edges insert */
@@ -4133,9 +4166,9 @@ static void drag_update_target(float x, float y)
 
     /* a band along the inside of the tile: beside everything on it */
     {
-        SDL_FRect t = WSS[ws_idx].screen;
-        float bx = SDL_clamp(t.w * 0.09f, 6.0f * SC, t.w * 0.18f);
-        float by = SDL_clamp(t.h * 0.09f, 6.0f * SC, t.h * 0.18f);
+        Rect t = WSS[ws_idx].screen;
+        float bx = SW_CLAMP(t.w * 0.09f, 6.0f * SC, t.w * 0.18f);
+        float by = SW_CLAMP(t.h * 0.09f, 6.0f * SC, t.h * 0.18f);
         int e = -1;
         if      (x - t.x < bx)         e = EDGE_LEFT;
         else if (t.x + t.w - x < bx)   e = EDGE_RIGHT;
@@ -4162,7 +4195,7 @@ static void drag_update_target(float x, float y)
                 SNAP_WIN = win_idx; SNAP_AT = now_secs();
                 SNAP_X = x; SNAP_Y = y; SNAP_DONE = false;
             } else if (!SNAP_DONE &&
-                       SDL_fabsf(x - SNAP_X) + SDL_fabsf(y - SNAP_Y) > 4.0f * SC) {
+                       fabsf(x - SNAP_X) + fabsf(y - SNAP_Y) > 4.0f * SC) {
                 SNAP_AT = now_secs();          /* still moving: not deliberate */
                 SNAP_X = x; SNAP_Y = y;
             }
@@ -4237,7 +4270,7 @@ static int ws_edge_ref(const Ws *ws, int edge, bool *pop)
         const Win *w = &WINS[ws->first + i];
         if (!win_visible(w)) continue;
         float v = horiz ? w->card.x : w->card.y;
-        if (SDL_fabsf(v - ref) <= tol) aligned++;
+        if (fabsf(v - ref) <= tol) aligned++;
     }
     *pop = aligned > 1;
     return best;
@@ -4614,7 +4647,7 @@ static void rebuild_chrome(void)
 static float XF_SX = 1.0f, XF_SY = 1.0f, XF_X0, XF_Y0, XF_DX, XF_DY;
 static bool  XF_ON;
 
-static void xf_set(SDL_FRect from, SDL_FRect to)
+static void xf_set(Rect from, Rect to)
 {
     XF_ON = true;
     XF_SX = (from.w > 0.0f) ? to.w / from.w : 1.0f;
@@ -4627,43 +4660,41 @@ static void xf_set(SDL_FRect from, SDL_FRect to)
 
 static void xf_off(void) { XF_ON = false; XF_SX = XF_SY = 1.0f; }
 
-static SDL_FRect xf(SDL_FRect r)
+static Rect xf(Rect r)
 {
     if (!XF_ON) return r;
-    return (SDL_FRect){ XF_DX + (r.x - XF_X0) * XF_SX, XF_DY + (r.y - XF_Y0) * XF_SY,
+    return (Rect){ XF_DX + (r.x - XF_X0) * XF_SX, XF_DY + (r.y - XF_Y0) * XF_SY,
                         r.w * XF_SX, r.h * XF_SY };
 }
 
 /* how solid an icon is drawn: a workspace on another screen is faded */
 static float ICON_FADE = 1.0f;
 
-static void draw_icon(SDL_Texture *icon, float cx, float top, float size)
+static void draw_icon(const Icon *icon, float cx, float top, float size)
 {
-    if (!icon) return;
-    float w = size, h = size;
-    float tw = 0.0f, th = 0.0f;
-    if (SDL_GetTextureSize(icon, &tw, &th) && tw > 0.0f && th > 0.0f) {
+    float w = size, h = size, tw, th;
+    if (!icon || !icon->px) return;
+    tw = (float)icon->w;
+    th = (float)icon->h;
+    if (tw > 0.0f && th > 0.0f) {
         if (tw > th) h = size * (th / tw);
         else if (th > tw) w = size * (tw / th);
     }
-    SDL_FRect dst = { cx - w * 0.5f, top + (size - h) * 0.5f, w, h };
-    SDL_SetTextureAlphaModFloat(icon, ICON_FADE);
-    SDL_RenderTexture(REN, icon, NULL, &dst);
-    SDL_SetTextureAlphaModFloat(icon, 1.0f);
+    sw_blit(REN, icon_img(icon), cx - w * 0.5f, top + (size - h) * 0.5f, w, h, ICON_FADE);
 }
 
 static void draw_card(Win *w, bool tile_selected)
 {
-    SDL_FRect r = xf(w->card);
+    Rect r = xf(w->card);
     if (r.w < 4.0f || r.h < 4.0f) return;
 
     bool selected = tile_selected && sel_shown() && ws_sel_win(&WSS[w->ws]) == w;
     bool is_hovered = selected;          /* pointer and keyboard share a cursor */
     bool dimmed   = filtering && !w->match;
     bool is_hit   = searching && qlen > 0 && w->match;
-    float rad     = SDL_min(C.radius * SC * 0.62f, SDL_min(r.w, r.h) * 0.32f);
+    float rad     = SW_MIN(C.radius * SC * 0.62f, SW_MIN(r.w, r.h) * 0.32f);
 
-    SDL_FColor fill = w->focused ? C.card_focus : C.card;
+    FCol fill = w->focused ? C.card_focus : C.card;
     if (is_hovered) fill = C.card_hover;
     if (is_hit)     fill = mix(fill, C.match, 0.22f);
     if (confirm_kill && (w->marked || selected)) fill = mix(fill, C.urgent, 0.25f);
@@ -4706,7 +4737,7 @@ static void draw_card(Win *w, bool tile_selected)
         const Ws *ws = &WSS[w->ws];
         float screen_area = ws->screen.w * ws->screen.h;
         cover = (screen_area > 1.0f) ? (w->card.w * w->card.h) / screen_area : 1.0f;
-        cover = SDL_clamp(cover, 0.0f, 1.0f);
+        cover = SW_CLAMP(cover, 0.0f, 1.0f);
         over = C.float_alpha * (1.0f - 0.55f * cover) * away;
         fill = with_alpha(fill, fill.a * over);
     }
@@ -4726,11 +4757,11 @@ static void draw_card(Win *w, bool tile_selected)
      * from one window with a title. It gets a tab like the others, filled
      * rather than outlined because it is the one you are looking at. */
     if (is_panel) {
-        SDL_FRect tb = xf(w->tab);
-        float trad = SDL_min(rad, SDL_min(tb.w, tb.h) * 0.4f);
+        Rect tb = xf(w->tab);
+        float trad = SW_MIN(rad, SW_MIN(tb.w, tb.h) * 0.4f);
         fill_round_side(tb, trad, true, false,
                         w->focused ? C.card_focus : mix(C.card, C.bg, 0.10f));
-        stroke_round_rect(tb, trad, SDL_max(1.0f, C.border * SC * 0.5f),
+        stroke_round_rect(tb, trad, SW_MAX(1.0f, C.border * SC * 0.5f),
                           with_alpha(C.accent, 0.45f));
         if (w->label.t) {
             float lx = tb.x + (tb.w - (float)w->label.w) * 0.5f;
@@ -4749,16 +4780,16 @@ static void draw_card(Win *w, bool tile_selected)
 
     /* border: what is being dragged beats everything, then selection, hover,
        mark, plain */
-    float bw = SDL_max(1.0f, C.border * SC * 0.75f);
+    float bw = SW_MAX(1.0f, C.border * SC * 0.75f);
     /* the hold that turns a move into a snap, filling from the bottom */
     if (drag_active && !SNAP_DONE && SNAP_WIN >= 0 && SNAP_WIN < NWIN &&
         &WINS[SNAP_WIN] == w && C.snap_ms > 0) {
         float k = (float)((now_secs() - SNAP_AT) * 1000.0 / (double)C.snap_ms);
-        k = SDL_clamp(k, 0.0f, 1.0f);
+        k = SW_CLAMP(k, 0.0f, 1.0f);
         if (k < 1.0f) {
-            SDL_FRect fillr = { r.x, r.y + r.h * (1.0f - k), r.w, r.h * k };
+            Rect fillr = { r.x, r.y + r.h * (1.0f - k), r.w, r.h * k };
             fill_round_rect(fillr, rad * 0.5f, with_alpha(C.accent, 0.22f));
-            stroke_round_rect(r, rad, SDL_max(1.0f, 2.0f * SC),
+            stroke_round_rect(r, rad, SW_MAX(1.0f, 2.0f * SC),
                               with_alpha(C.accent, 0.35f + 0.5f * k));
         }
     }
@@ -4766,9 +4797,9 @@ static void draw_card(Win *w, bool tile_selected)
     if (lifted && !being_dragged) {
         /* it has come forward: a heavier accent frame, and a soft one just
            outside it so it reads as raised rather than merely outlined */
-        SDL_FRect glow = { r.x - 3.0f * SC, r.y - 3.0f * SC,
+        Rect glow = { r.x - 3.0f * SC, r.y - 3.0f * SC,
                            r.w + 6.0f * SC, r.h + 6.0f * SC };
-        stroke_round_rect(glow, rad + 3.0f * SC, SDL_max(1.0f, 3.0f * SC),
+        stroke_round_rect(glow, rad + 3.0f * SC, SW_MAX(1.0f, 3.0f * SC),
                           with_alpha(C.accent, 0.25f));
     }
 
@@ -4781,37 +4812,38 @@ static void draw_card(Win *w, bool tile_selected)
     else if (is_hovered)   stroke_round_rect(r, rad, bw, C.accent);
     else if (w->marked)    stroke_round_rect(r, rad, bw, with_alpha(C.hl, 0.85f));
     else if (w->urgent)    stroke_round_rect(r, rad, bw, C.urgent);
-    else if (on_top)       stroke_round_rect(r, rad, SDL_max(1.0f, bw * 0.7f),
+    else if (on_top)       stroke_round_rect(r, rad, SW_MAX(1.0f, bw * 0.7f),
                                              with_alpha(C.accent, dimmed ? 0.25f : 0.5f));
-    else                   stroke_round_rect(r, rad, SDL_max(1.0f, bw * 0.4f),
+    else                   stroke_round_rect(r, rad, SW_MAX(1.0f, bw * 0.4f),
                                              with_alpha(C.outline, dimmed ? 0.3f : 0.7f));
 
     /* the window sway has focused: marked as current, not as selected */
     if (w->focused && !dimmed) {
-        SDL_FRect bar = { r.x + bw * 0.6f, r.y + rad * 0.7f,
-                          SDL_max(2.0f, 3.0f * SC), r.h - rad * 1.4f };
+        Rect bar = { r.x + bw * 0.6f, r.y + rad * 0.7f,
+                          SW_MAX(2.0f, 3.0f * SC), r.h - rad * 1.4f };
         fill_round_rect(bar, bar.w * 0.5f, C.current);
     }
 
     /* multi selection marker */
     if (w->marked) {
-        float d = SDL_max(6.0f, 9.0f * SC);
-        SDL_FRect dot = { r.x + r.w - d - 5.0f * SC, r.y + 5.0f * SC, d, d };
+        float d = SW_MAX(6.0f, 9.0f * SC);
+        Rect dot = { r.x + r.w - d - 5.0f * SC, r.y + 5.0f * SC, d, d };
         fill_round_rect(dot, d * 0.5f, C.hl);
     }
 
     float pad = card_pad(w);
     float a   = dimmed ? 0.45f : 1.0f;
-    SDL_FColor lab_col = (selected || is_hovered) ? C.text : C.subtext;
+    FCol lab_col = (selected || is_hovered) ? C.text : C.subtext;
     if (w->urgent) lab_col = C.urgent;
-    SDL_FColor sub_col = mix(C.dim, C.text, (selected || is_hovered) ? 0.55f : 0.32f);
+    FCol sub_col = mix(C.dim, C.text, (selected || is_hovered) ? 0.55f : 0.32f);
     lab_col = with_alpha(lab_col, lab_col.a * a * away);
     sub_col = with_alpha(sub_col, sub_col.a * a * away);
 
     bool has_icon = C.icons && w->icon && w->lay_icon >= 10.0f * SC;
-    if (has_icon) SDL_SetTextureAlphaModFloat(w->icon, a);
+    float icon_fade0 = ICON_FADE;
+    if (has_icon) ICON_FADE = icon_fade0 * a;
 
-    SDL_FRect plate;
+    Rect plate;
     float plate_iw = 0.0f;
     if (as_overlay && overlay_plate(w, r, &plate, &plate_iw)) {
         /* Centre would land on top of the cards showing through, so the name
@@ -4819,7 +4851,7 @@ static void draw_card(Win *w, bool tile_selected)
          * the only part of this window the mouse can grab. */
         float ip = 6.0f * SC;
         fill_round_rect(plate, plate.h * 0.32f, with_alpha(mix(C.card, C.bg, 0.25f), 0.94f));
-        stroke_round_rect(plate, plate.h * 0.32f, SDL_max(1.0f, 1.4f * SC),
+        stroke_round_rect(plate, plate.h * 0.32f, SW_MAX(1.0f, 1.4f * SC),
                           is_hovered ? C.accent : with_alpha(C.accent, 0.55f));
 
         float tx = plate.x + ip;
@@ -4832,7 +4864,7 @@ static void draw_card(Win *w, bool tile_selected)
             draw_match_run(w->label, tx, plate.y + (plate.h - (float)w->label.h) * 0.5f);
         tex_draw(w->label, tx, plate.y + (plate.h - (float)w->label.h) * 0.5f,
                  with_alpha(C.text, a));
-        if (has_icon) SDL_SetTextureAlphaModFloat(w->icon, 1.0f);
+        ICON_FADE = icon_fade0;
         return;
     }
 
@@ -4890,34 +4922,45 @@ static void draw_card(Win *w, bool tile_selected)
          * sitting on the label of whatever shows through beneath it */
         float y  = as_overlay ? r.y + pad : r.y + (r.h - block) * 0.5f;
         if (has_icon) { draw_icon(w->icon, cx, y, icon); y += icon; }
-        if (lab_h > 0.0f) { y += g1; tex_draw_center(w->label, cx, y, lab_col); y += lab_h; }
-        if (sub_h > 0.0f) { y += g2; tex_draw_center(w->subtitle, cx, y, sub_col); }
+        if (lab_h > 0.0f) {
+            y += g1;
+            if (w->match && qlen > 0)
+                draw_match_run(w->label, cx - (float)w->label.w * 0.5f, y);
+            tex_draw_center(w->label, cx, y, lab_col);
+            y += lab_h;
+        }
+        if (sub_h > 0.0f) {
+            y += g2;
+            if (w->match && qlen > 0)
+                draw_match_run(w->subtitle, cx - (float)w->subtitle.w * 0.5f, y);
+            tex_draw_center(w->subtitle, cx, y, sub_col);
+        }
         break;
     }
     }
 
-    if (has_icon) SDL_SetTextureAlphaModFloat(w->icon, 1.0f);
+    ICON_FADE = icon_fade0;
 }
 
-static void rgb_to_hsv(SDL_FColor c, float *h, float *s, float *v)
+static void rgb_to_hsv(FCol c, float *h, float *s, float *v)
 {
-    float mx = SDL_max(c.r, SDL_max(c.g, c.b));
-    float mn = SDL_min(c.r, SDL_min(c.g, c.b));
+    float mx = SW_MAX(c.r, SW_MAX(c.g, c.b));
+    float mn = SW_MIN(c.r, SW_MIN(c.g, c.b));
     float d = mx - mn;
     *v = mx;
     *s = mx > 0.0001f ? d / mx : 0.0f;
     if (d < 0.0001f) { *h = 0.0f; return; }
-    if      (mx == c.r) *h = 60.0f * SDL_fmodf((c.g - c.b) / d, 6.0f);
+    if      (mx == c.r) *h = 60.0f * fmodf((c.g - c.b) / d, 6.0f);
     else if (mx == c.g) *h = 60.0f * ((c.b - c.r) / d + 2.0f);
     else                *h = 60.0f * ((c.r - c.g) / d + 4.0f);
     if (*h < 0.0f) *h += 360.0f;
 }
 
-static SDL_FColor hsv_to_rgb(float h, float s, float v, float a)
+static FCol hsv_to_rgb(float h, float s, float v, float a)
 {
-    h = SDL_fmodf(h, 360.0f);
+    h = fmodf(h, 360.0f);
     if (h < 0.0f) h += 360.0f;
-    float c = v * s, x = c * (1.0f - SDL_fabsf(SDL_fmodf(h / 60.0f, 2.0f) - 1.0f));
+    float c = v * s, x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
     float m = v - c, r = 0, g = 0, b = 0;
     if      (h <  60) { r = c; g = x; }
     else if (h < 120) { r = x; g = c; }
@@ -4925,7 +4968,7 @@ static SDL_FColor hsv_to_rgb(float h, float s, float v, float a)
     else if (h < 240) { g = x; b = c; }
     else if (h < 300) { r = x; b = c; }
     else              { r = c; b = x; }
-    return (SDL_FColor){ r + m, g + m, b + m, a };
+    return (FCol){ r + m, g + m, b + m, a };
 }
 
 /* One colour per monitor: the accent, turned around the wheel by the golden
@@ -4933,7 +4976,7 @@ static SDL_FColor hsv_to_rgb(float h, float s, float v, float a)
  * palette's weight, and none of them lands on `hl` — that one already means
  * "this is the one you are on", and having a whole screen's worth of
  * workspaces wear it said the opposite of what it meant. */
-static SDL_FColor output_colour(const char *name)
+static FCol output_colour(const char *name)
 {
     int at = 0;
     for (int i = 0; i < NOUTS; ++i)
@@ -4948,14 +4991,14 @@ static SDL_FColor output_colour(const char *name)
     if (val < 0.55f) val = 0.75f;
 
     for (int guard = 0; guard < 4; ++guard) {   /* keep clear of hl */
-        float d = SDL_fabsf(SDL_fmodf(h - hl_h + 540.0f, 360.0f) - 180.0f);
+        float d = fabsf(fmodf(h - hl_h + 540.0f, 360.0f) - 180.0f);
         if (d > 35.0f) break;
         h += 50.0f;
     }
     return hsv_to_rgb(h, sat, val, 1.0f);
 }
 
-static SDL_FColor output_colour(const char *name);
+static FCol output_colour(const char *name);
 
 static void draw_workspace(int idx)
 {
@@ -4968,7 +5011,7 @@ static void draw_workspace(int idx)
     if (t < 1.0f && ws->tile_from.w > 0.0f) xf_set(ws->tile, rect_lerp(ws->tile_from, ws->tile, t));
     else xf_off();
 
-    SDL_FRect tile = xf(ws->tile);
+    Rect tile = xf(ws->tile);
 
     bool has_hit = qlen == 0 || ws->count == 0 || ws_first_visible(ws) >= 0;
 
@@ -4979,16 +5022,16 @@ static void draw_workspace(int idx)
      * it, and the name sits in a badge of it. */
     bool elsewhere = ws->output[0] && FOCUSED_OUTPUT[0] &&
                      strcmp(ws->output, FOCUSED_OUTPUT) != 0;
-    SDL_FColor ocol = output_colour(ws->output);
+    FCol ocol = output_colour(ws->output);
 
-    SDL_FColor fill = selected ? C.tile_sel : (hovered ? C.tile_hover : C.tile);
+    FCol fill = selected ? C.tile_sel : (hovered ? C.tile_hover : C.tile);
     if (!has_hit) fill = with_alpha(mix(fill, C.bg, 0.35f), fill.a * 0.75f);
     if (elsewhere) fill = mix(fill, ocol, 0.16f);
 
     drop_shadow(tile, rad, 7.0f * SC, C.shadow_col);
     fill_round_rect(tile, rad, fill);
 
-    SDL_FColor bc = C.outline;
+    FCol bc = C.outline;
     float bw = C.border * SC;
     if (selected)          bc = C.hl;
     else if (hovered)      bc = with_alpha(C.accent, 0.9f);
@@ -4996,14 +5039,14 @@ static void draw_workspace(int idx)
     else if (searching && qlen > 0 && ws_first_visible_match(ws) >= 0)
                            bc = with_alpha(C.match, 0.8f);
     else if (ws->visible)  bc = with_alpha(C.current, 0.75f);
-    else                   bw = SDL_max(1.0f, C.border * SC * 0.45f);
+    else                   bw = SW_MAX(1.0f, C.border * SC * 0.45f);
     if (elsewhere && !selected) {
         bc = with_alpha(ocol, 0.95f);
-        bw = SDL_max(1.5f, C.border * SC * 1.3f);
+        bw = SW_MAX(1.5f, C.border * SC * 1.3f);
     }
     if (ws->marked) {                    /* picked out to be moved together */
         bc = C.hl;
-        bw = SDL_max(2.0f, C.border * SC * 1.8f);
+        bw = SW_MAX(2.0f, C.border * SC * 1.8f);
     }
     stroke_round_rect(tile, rad, bw, bc);
 
@@ -5012,7 +5055,7 @@ static void draw_workspace(int idx)
     float top = tile.y + C.badge_top * SC;
 
     bool live = ws->visible || ws->focused;
-    SDL_FColor num_col = selected ? C.hl
+    FCol num_col = selected ? C.hl
                        : live     ? C.current
                                   : mix(C.subtext, C.tile, 0.25f);
     if (ws->urgent && !selected) num_col = C.urgent;
@@ -5023,7 +5066,7 @@ static void draw_workspace(int idx)
     float count_right = tile.x + p;
     if (ws->sub.t) {
         float base = top + ((float)ws->badge.h - (float)ws->sub.h) * 0.62f;
-        SDL_FColor col = ws->count ? mix(C.dim, C.text, selected ? 0.45f : 0.25f)
+        FCol col = ws->count ? mix(C.dim, C.text, selected ? 0.45f : 0.25f)
                                    : with_alpha(C.dim, 0.85f);
         tex_draw(ws->sub, tile.x + p, base, col);
         count_right += (float)ws->sub.w;
@@ -5031,15 +5074,15 @@ static void draw_workspace(int idx)
 
     /* the name sits between the two; clicking it starts a rename */
     (void)count_right;
-    SDL_FRect tb = xf(ws->title_box);
+    Rect tb = xf(ws->title_box);
     float tb_x = tb.x, tb_w = tb.w;
 
     bool editing_this = editing && edit_ws == idx;
     if (editing_this) {
-        SDL_FRect box = { tb_x, top - p * 0.35f, SDL_max(tb_w, 40.0f * SC),
+        Rect box = { tb_x, top - p * 0.35f, SW_MAX(tb_w, 40.0f * SC),
                           (float)ws->badge.h + p * 0.7f };
         fill_round_rect(box, box.h * 0.3f, mix(C.tile, C.bg, 0.2f));
-        stroke_round_rect(box, box.h * 0.3f, SDL_max(1.0f, 1.5f * SC), C.hl);
+        stroke_round_rect(box, box.h * 0.3f, SW_MAX(1.0f, 1.5f * SC), C.hl);
 
         char buf[80];
         snprintf(buf, sizeof(buf), "%.63s\xe2\x96\x8f", edit_buf);
@@ -5050,7 +5093,7 @@ static void draw_workspace(int idx)
         /* the monitor first, in its own colour, then the workspace */
         Tex on = text_make_fit(F_LABEL, ws->output, (int)(tb_w * 0.55f));
         float bh = (float)on.h + p * 0.5f;
-        SDL_FRect pill = { tb_x, top - p * 0.2f, (float)on.w + p, bh };
+        Rect pill = { tb_x, top - p * 0.2f, (float)on.w + p, bh };
         fill_round_rect(pill, bh * 0.35f, ocol);
         tex_draw(on, pill.x + p * 0.5f, pill.y + (bh - (float)on.h) * 0.5f, C.bg);
         tex_free(&on);
@@ -5066,14 +5109,14 @@ static void draw_workspace(int idx)
         Tex t = ws->title;
         float x = tb_x + (tb_w - (float)t.w) * 0.5f;
         if ((float)t.w > tb_w) x = tb_x;
-        SDL_FColor col = selected ? C.text : mix(C.subtext, C.tile, 0.15f);
+        FCol col = selected ? C.text : mix(C.subtext, C.tile, 0.15f);
         tex_draw(t, x, top + ((float)ws->badge.h - (float)t.h) * 0.55f, col);
     }
 
     /* The rename pencil: faint until the pointer is on it, so it says "this
      * can be named" without competing with the name. */
     if (C.rename_icon && !editing_this && ws->title_hit.w > 6.0f * SC) {
-        SDL_FRect ir = xf(ws->title_hit);
+        Rect ir = xf(ws->title_hit);
         bool hot = hov_ws == idx && pencil_hot;
         draw_pencil(ir, hot ? C.hl : with_alpha(C.subtext, selected ? 0.55f : 0.32f));
     }
@@ -5085,22 +5128,22 @@ static void draw_workspace(int idx)
         float d = C.dot_px * SC;
         float gap = d * 0.62f;
 
-        SDL_FRect screen_now = xf(ws->screen);
+        Rect screen_now = xf(ws->screen);
         int fits = (int)((screen_now.h + gap) / (d + gap));
-        int n = SDL_clamp(SDL_min(C.dot_count, fits), 0, 40);
+        int n = SW_CLAMP(SW_MIN(C.dot_count, fits), 0, 40);
         if (n < 2) n = 0;
         float total = (float)n * d + (float)(n - 1) * gap;
         float cx = tile.x + C.pad * SC + d * 0.55f;
         float y0 = screen_now.y + (screen_now.h - total) * 0.5f;
 
         float frac = (USAGE_MAX > 0.0) ? (float)(ws->usage / USAGE_MAX) : 0.0f;
-        int lit = (ws->usage > 0.0) ? (int)SDL_ceilf(frac * (float)n) : 0;
-        lit = SDL_clamp(lit, 0, n);
+        int lit = (ws->usage > 0.0) ? (int)ceilf(frac * (float)n) : 0;
+        lit = SW_CLAMP(lit, 0, n);
 
         for (int i = 0; i < n; ++i) {
             /* fills from the bottom like a level gauge */
             bool on = (n - i) <= lit;
-            SDL_FRect dot = { cx - d * 0.5f, y0 + (float)i * (d + gap), d, d };
+            Rect dot = { cx - d * 0.5f, y0 + (float)i * (d + gap), d, d };
             fill_round_rect(dot, d * 0.5f,
                             on ? C.current : with_alpha(C.dim, 0.38f));
         }
@@ -5111,14 +5154,14 @@ static void draw_workspace(int idx)
         float cpu = cpu_frac(ws->name);
         if (cpu >= 0.0f) {
             float cxr = tile.x + tile.w - C.pad * SC - d * 0.55f;
-            int   cl  = SDL_clamp((int)SDL_ceilf(cpu * (float)n), 1, n);
-            SDL_FColor hot = cpu < 0.85f ? C.accent
+            int   cl  = SW_CLAMP((int)ceilf(cpu * (float)n), 1, n);
+            FCol hot = cpu < 0.85f ? C.accent
                                          : mix(C.accent, C.urgent, (cpu - 0.85f) / 0.15f);
             /* below the scale but not asleep: one dot, faint */
             if (cpu <= 0.0f) hot = with_alpha(mix(C.dim, C.accent, 0.4f), 0.55f);
             for (int i = 0; i < n; ++i) {
                 bool on = (n - i) <= cl;
-                SDL_FRect dot = { cxr - d * 0.5f, y0 + (float)i * (d + gap), d, d };
+                Rect dot = { cxr - d * 0.5f, y0 + (float)i * (d + gap), d, d };
                 fill_round_rect(dot, d * 0.5f,
                                 on ? hot : with_alpha(C.dim, 0.30f));
             }
@@ -5126,10 +5169,10 @@ static void draw_workspace(int idx)
     }
 
     /* ---- the mini screen ---- */
-    SDL_FRect screen = xf(ws->screen);
-    float srad = SDL_min(rad * 0.7f, SDL_min(screen.w, screen.h) * 0.5f);
+    Rect screen = xf(ws->screen);
+    float srad = SW_MIN(rad * 0.7f, SW_MIN(screen.w, screen.h) * 0.5f);
     fill_round_rect(screen, srad, C.mini_bg);
-    stroke_round_rect(screen, srad, SDL_max(1.0f, 1.2f * SC), with_alpha(C.outline, 0.55f));
+    stroke_round_rect(screen, srad, SW_MAX(1.0f, 1.2f * SC), with_alpha(C.outline, 0.55f));
 
     if (ws->count == 0) {
         /* nothing here: keep the tile obviously "a screen, but empty" */
@@ -5141,20 +5184,20 @@ static void draw_workspace(int idx)
      * drawn as slices; a shared outline shows that they belong together */
     for (int i = 0; i < ws->count; ++i) {
         if (WINS[ws->first + i].group != i) continue;
-        SDL_FRect u = WINS[ws->first + i].card;
+        Rect u = WINS[ws->first + i].card;
         for (int j = i + 1; j < ws->count; ++j) {
             if (WINS[ws->first + j].group != i) continue;
-            SDL_FRect c = WINS[ws->first + j].card;
-            float x1 = SDL_max(u.x + u.w, c.x + c.w), y1 = SDL_max(u.y + u.h, c.y + c.h);
-            u.x = SDL_min(u.x, c.x);
-            u.y = SDL_min(u.y, c.y);
+            Rect c = WINS[ws->first + j].card;
+            float x1 = SW_MAX(u.x + u.w, c.x + c.w), y1 = SW_MAX(u.y + u.h, c.y + c.h);
+            u.x = SW_MIN(u.x, c.x);
+            u.y = SW_MIN(u.y, c.y);
             u.w = x1 - u.x;
             u.h = y1 - u.y;
         }
         u = xf(u);
         float e = 3.0f * SC;
-        SDL_FRect box = { u.x - e, u.y - e, u.w + 2.0f * e, u.h + 2.0f * e };
-        stroke_round_rect(box, C.radius * SC * 0.7f, SDL_max(1.0f, 1.6f * SC),
+        Rect box = { u.x - e, u.y - e, u.w + 2.0f * e, u.h + 2.0f * e };
+        stroke_round_rect(box, C.radius * SC * 0.7f, SW_MAX(1.0f, 1.6f * SC),
                           with_alpha(C.accent, 0.5f));
 
         if (WINS[ws->first + i].has_tab) {
@@ -5166,13 +5209,13 @@ static void draw_workspace(int idx)
             for (int j = 0; j < ws->count; ++j) {
                 Win *tw = &WINS[ws->first + j];
                 if (tw->group != i || !tw->has_tab) continue;
-                SDL_FRect t = xf(tw->tab);
+                Rect t = xf(tw->tab);
                 if (t.x < x0) x0 = t.x;
                 if (t.x + t.w > x1) x1 = t.x + t.w;
                 ty = t.y; th = t.h;
             }
             if (x1 > x0) {
-                SDL_FRect strip = { x0 - e * 0.5f, ty - e * 0.5f,
+                Rect strip = { x0 - e * 0.5f, ty - e * 0.5f,
                                     x1 - x0 + e, th + e };
                 fill_round_rect(strip, C.radius * SC * 0.5f,
                                 with_alpha(C.mini_bg, 0.8f));
@@ -5191,12 +5234,12 @@ static void draw_workspace(int idx)
 /* ---- what the drop would do, shown while the button is still held ---- */
 static void draw_drop_indicator(void)
 {
-    float thick = SDL_max(2.0f, C.border * SC * 1.2f);
+    float thick = SW_MAX(2.0f, C.border * SC * 1.2f);
 
     switch (drop_kind) {
     case DROP_WIN_WS:
         if (drop_ws >= 0) {
-            SDL_FRect r = WSS[drop_ws].screen;
+            Rect r = WSS[drop_ws].screen;
             fill_round_rect(r, C.radius * SC * 0.7f, with_alpha(C.hl, 0.13f));
             stroke_round_rect(r, C.radius * SC * 0.7f, thick, C.hl);
         }
@@ -5204,44 +5247,44 @@ static void draw_drop_indicator(void)
 
     case DROP_WIN_NEAR:
         if (drop_win >= 0) {
-            SDL_FRect r = WINS[drop_win].card;
-            stroke_round_rect(r, C.radius * SC * 0.6f, SDL_max(1.0f, thick * 0.6f),
+            Rect r = WINS[drop_win].card;
+            stroke_round_rect(r, C.radius * SC * 0.6f, SW_MAX(1.0f, thick * 0.6f),
                               with_alpha(C.accent, 0.8f));
 
             /* the bar shows which side the window lands on, and therefore
              * whether the container ends up split horizontally or vertically */
             float b = thick * 1.6f;
-            SDL_FRect bar = r;
-            if (drop_edge == EDGE_LEFT)        bar = (SDL_FRect){ r.x - b * 0.5f, r.y, b, r.h };
-            else if (drop_edge == EDGE_RIGHT)  bar = (SDL_FRect){ r.x + r.w - b * 0.5f, r.y, b, r.h };
-            else if (drop_edge == EDGE_TOP)    bar = (SDL_FRect){ r.x, r.y - b * 0.5f, r.w, b };
-            else                               bar = (SDL_FRect){ r.x, r.y + r.h - b * 0.5f, r.w, b };
+            Rect bar = r;
+            if (drop_edge == EDGE_LEFT)        bar = (Rect){ r.x - b * 0.5f, r.y, b, r.h };
+            else if (drop_edge == EDGE_RIGHT)  bar = (Rect){ r.x + r.w - b * 0.5f, r.y, b, r.h };
+            else if (drop_edge == EDGE_TOP)    bar = (Rect){ r.x, r.y - b * 0.5f, r.w, b };
+            else                               bar = (Rect){ r.x, r.y + r.h - b * 0.5f, r.w, b };
             fill_round_rect(bar, b * 0.5f, C.hl);
         }
         break;
 
     case DROP_WS_EDGE:
         if (drop_ws >= 0) {
-            SDL_FRect r = WSS[drop_ws].screen;
-            stroke_round_rect(r, C.radius * SC * 0.7f, SDL_max(1.0f, thick * 0.6f),
+            Rect r = WSS[drop_ws].screen;
+            stroke_round_rect(r, C.radius * SC * 0.7f, SW_MAX(1.0f, thick * 0.6f),
                               with_alpha(C.accent, 0.8f));
             float b = thick * 1.8f;
-            SDL_FRect bar;
-            if (drop_edge == EDGE_LEFT)        bar = (SDL_FRect){ r.x, r.y, b, r.h };
-            else if (drop_edge == EDGE_RIGHT)  bar = (SDL_FRect){ r.x + r.w - b, r.y, b, r.h };
-            else if (drop_edge == EDGE_TOP)    bar = (SDL_FRect){ r.x, r.y, r.w, b };
-            else                               bar = (SDL_FRect){ r.x, r.y + r.h - b, r.w, b };
+            Rect bar;
+            if (drop_edge == EDGE_LEFT)        bar = (Rect){ r.x, r.y, b, r.h };
+            else if (drop_edge == EDGE_RIGHT)  bar = (Rect){ r.x + r.w - b, r.y, b, r.h };
+            else if (drop_edge == EDGE_TOP)    bar = (Rect){ r.x, r.y, r.w, b };
+            else                               bar = (Rect){ r.x, r.y + r.h - b, r.w, b };
             fill_round_rect(bar, b * 0.5f, C.hl);
         }
         break;
 
     case DROP_WS_SWAP:
         if (drop_ws >= 0) {
-            SDL_FRect t = WSS[drop_ws].tile;
+            Rect t = WSS[drop_ws].tile;
             if (drop_insert) {
                 float b = thick * 1.8f;
                 float x = (drop_edge == EDGE_LEFT) ? t.x - b : t.x + t.w;
-                SDL_FRect bar = { x, t.y, b, t.h };
+                Rect bar = { x, t.y, b, t.h };
                 fill_round_rect(bar, b * 0.5f, C.hl);
             } else {
                 fill_round_rect(t, C.radius * SC, with_alpha(C.hl, 0.16f));
@@ -5256,20 +5299,20 @@ static void draw_drop_indicator(void)
 
     /* the thing being dragged, held under the pointer */
     if (drag_ws_mode && press_ws >= 0) {
-        SDL_FRect t = WSS[press_ws].tile;
+        Rect t = WSS[press_ws].tile;
         float w = t.w * 0.34f, h = t.h * 0.34f;
-        SDL_FRect g = { drag_x - w * 0.5f, drag_y - h * 0.5f, w, h };
+        Rect g = { drag_x - w * 0.5f, drag_y - h * 0.5f, w, h };
         fill_round_rect(g, C.radius * SC * 0.7f, with_alpha(C.tile_sel, 0.92f));
         stroke_round_rect(g, C.radius * SC * 0.7f, thick, C.hl);
         tex_draw_in_box(WSS[press_ws].badge, g, F_BADGE, C.text);
     } else if (press_win >= 0) {
         Win *w = &WINS[press_win];
-        SDL_FRect r = w->card;
-        SDL_FRect g = { drag_x - r.w * 0.5f, drag_y - r.h * 0.5f, r.w, r.h };
+        Rect r = w->card;
+        Rect g = { drag_x - r.w * 0.5f, drag_y - r.h * 0.5f, r.w, r.h };
         fill_round_rect(g, C.radius * SC * 0.6f, with_alpha(C.card_hover, 0.9f));
         stroke_round_rect(g, C.radius * SC * 0.6f, thick, C.hl);
         if (w->icon && C.icons) {
-            float sz = SDL_min(SDL_min(g.w, g.h) * 0.5f, (float)C.icon_px * SC);
+            float sz = SW_MIN(SW_MIN(g.w, g.h) * 0.5f, (float)C.icon_px * SC);
             draw_icon(w->icon, g.x + g.w * 0.5f, g.y + (g.h - sz) * 0.5f, sz);
         }
     }
@@ -5296,15 +5339,15 @@ static void draw_outputs_map(void)
     /* fit the whole desk inside its box, aspect kept */
     float pad = C.pad * SC * 0.5f;
     float aw = MAP_RECT.w - 2.0f * pad, ah = MAP_RECT.h - 2.0f * pad;
-    float sc = SDL_min(aw / dw, ah / dh);
+    float sc = SW_MIN(aw / dw, ah / dh);
     float bw = dw * sc, bh = dh * sc;
     float bx = MAP_RECT.x + (MAP_RECT.w - bw) * 0.5f;
     float by = MAP_RECT.y + (MAP_RECT.h - bh) * 0.5f;
 
-    float rad = SDL_max(2.0f, 4.0f * SC);
+    float rad = SW_MAX(2.0f, 4.0f * SC);
     for (int i = 0; i < NOUTS; ++i) {
         Out *d = &OUTS[i];
-        SDL_FRect r = { bx + (float)(d->x - minx) * sc + 1.0f * SC,
+        Rect r = { bx + (float)(d->x - minx) * sc + 1.0f * SC,
                         by + (float)(d->y - miny) * sc + 1.0f * SC,
                         (float)d->w * sc - 2.0f * SC,
                         (float)d->h * sc - 2.0f * SC };
@@ -5317,10 +5360,10 @@ static void draw_outputs_map(void)
          * so the wait reads as a button going down rather than a pause. */
         float held = 0.0f;
         if (i == MAP_HOVER && C.map_dwell_ms > 0 && !drag_active)
-            held = SDL_clamp((float)((now_secs() - MAP_HOVER_SINCE) /
+            held = SW_CLAMP((float)((now_secs() - MAP_HOVER_SINCE) /
                                      (C.map_dwell_ms / 1000.0)), 0.0f, 1.0f);
         if (held > 0.0f) {
-            float in = held * SDL_min(r.w, r.h) * 0.06f;   /* pressed in */
+            float in = held * SW_MIN(r.w, r.h) * 0.06f;   /* pressed in */
             r.x += in; r.y += in; r.w -= 2.0f * in; r.h -= 2.0f * in;
         }
 
@@ -5328,44 +5371,42 @@ static void draw_outputs_map(void)
            Two rings and two fills competing for the same plate was what made
            this look muddled: which screen is being shown is said by how
            strongly it is filled, and which one sway is on by a dot. */
-        SDL_FColor oc = output_colour(d->name);
+        FCol oc = output_colour(d->name);
         fill_round_rect(r, rad, with_alpha(oc, showing ? 0.55f : 0.18f));
-        stroke_round_rect(r, rad, SDL_max(1.0f, (showing ? 2.0f : 1.2f) * SC),
+        stroke_round_rect(r, rad, SW_MAX(1.0f, (showing ? 2.0f : 1.2f) * SC),
                           with_alpha(oc, showing ? 1.0f : 0.55f));
 
         if (held > 0.0f) {
-            SDL_FRect fillr = { r.x, r.y, r.w * held, r.h };
-            SDL_Rect clip = { (int)r.x, (int)r.y, (int)SDL_ceilf(fillr.w), (int)SDL_ceilf(r.h) };
-            SDL_Rect prev;
-            bool had = SDL_GetRenderClipRect(REN, &prev) && SDL_RenderClipEnabled(REN);
-            SDL_SetRenderClipRect(REN, &clip);
+            int px0 = REN->cx0, py0 = REN->cy0, px1 = REN->cx1, py1 = REN->cy1;
+            sw_canvas_clip(REN, (int)r.x, (int)r.y,
+                           (int)ceilf(r.x + r.w * held), (int)ceilf(r.y + r.h));
             fill_round_rect(r, rad, with_alpha(C.hl, 0.55f + 0.35f * held));
-            SDL_SetRenderClipRect(REN, had ? &prev : NULL);
-            stroke_round_rect(r, rad, SDL_max(1.0f, 2.0f * SC), with_alpha(C.hl, 0.95f));
+            sw_canvas_clip(REN, px0, py0, px1, py1);
+            stroke_round_rect(r, rad, SW_MAX(1.0f, 2.0f * SC), with_alpha(C.hl, 0.95f));
         }
 
         if (OUT_PRESS == i) {                 /* the one on the pointer */
-            stroke_round_rect(r, rad, SDL_max(2.0f, 2.5f * SC),
+            stroke_round_rect(r, rad, SW_MAX(2.0f, 2.5f * SC),
                               with_alpha(C.hl, 0.9f));
         }
         if (OUT_TARGET == i) {                /* and where it will go */
-            float b2 = SDL_max(3.0f, 4.0f * SC);
-            SDL_FRect bar;
-            if (OUT_EDGE == EDGE_LEFT)        bar = (SDL_FRect){ r.x - b2 * 0.5f, r.y, b2, r.h };
-            else if (OUT_EDGE == EDGE_RIGHT)  bar = (SDL_FRect){ r.x + r.w - b2 * 0.5f, r.y, b2, r.h };
-            else if (OUT_EDGE == EDGE_TOP)    bar = (SDL_FRect){ r.x, r.y - b2 * 0.5f, r.w, b2 };
-            else                              bar = (SDL_FRect){ r.x, r.y + r.h - b2 * 0.5f, r.w, b2 };
+            float b2 = SW_MAX(3.0f, 4.0f * SC);
+            Rect bar;
+            if (OUT_EDGE == EDGE_LEFT)        bar = (Rect){ r.x - b2 * 0.5f, r.y, b2, r.h };
+            else if (OUT_EDGE == EDGE_RIGHT)  bar = (Rect){ r.x + r.w - b2 * 0.5f, r.y, b2, r.h };
+            else if (OUT_EDGE == EDGE_TOP)    bar = (Rect){ r.x, r.y - b2 * 0.5f, r.w, b2 };
+            else                              bar = (Rect){ r.x, r.y + r.h - b2 * 0.5f, r.w, b2 };
             fill_round_rect(bar, b2 * 0.5f, C.hl);
         }
 
         if (drag_active && drop_kind == DROP_OUTPUT && drop_out == i) {
             fill_round_rect(r, rad, with_alpha(oc, 0.75f));
-            stroke_round_rect(r, rad, SDL_max(2.0f, 3.0f * SC), C.hl);
+            stroke_round_rect(r, rad, SW_MAX(2.0f, 3.0f * SC), C.hl);
         }
 
         if (d->focused) {                     /* where sway actually is */
-            float dot = SDL_min(6.0f * SC, SDL_min(r.w, r.h) * 0.22f);
-            SDL_FRect p = { r.x + dot * 0.7f, r.y + dot * 0.7f, dot, dot };
+            float dot = SW_MIN(6.0f * SC, SW_MIN(r.w, r.h) * 0.22f);
+            Rect p = { r.x + dot * 0.7f, r.y + dot * 0.7f, dot, dot };
             fill_round_rect(p, dot * 0.5f, C.current);
         }
 
@@ -5387,15 +5428,15 @@ static void draw_pinned_frame(void)
 {
     if (!PINNED_OUTPUT || !FOCUSED_OUTPUT[0]) return;
 
-    SDL_FColor oc = output_colour(FOCUSED_OUTPUT);
-    float w = SDL_max(3.0f, 5.0f * SC);
-    SDL_FRect r = { w * 0.5f, w * 0.5f, (float)RW - w, (float)RH - w };
+    FCol oc = output_colour(FOCUSED_OUTPUT);
+    float w = SW_MAX(3.0f, 5.0f * SC);
+    Rect r = { w * 0.5f, w * 0.5f, (float)RW - w, (float)RH - w };
     stroke_round_rect(r, C.radius * SC, w, with_alpha(oc, 0.9f));
 
     /* and a second, softer one just inside it, so it reads as a frame rather
        than a window border the compositor drew */
-    SDL_FRect inner = { r.x + w, r.y + w, r.w - 2.0f * w, r.h - 2.0f * w };
-    stroke_round_rect(inner, C.radius * SC, SDL_max(1.0f, 1.5f * SC),
+    Rect inner = { r.x + w, r.y + w, r.w - 2.0f * w, r.h - 2.0f * w };
+    stroke_round_rect(inner, C.radius * SC, SW_MAX(1.0f, 1.5f * SC),
                       with_alpha(oc, 0.28f));
 }
 
@@ -5403,35 +5444,42 @@ static void draw_cancel_target(void)
 {
     if (CANCEL_RECT.w < 8.0f || !drag_active) return;
 
-    SDL_FRect r = CANCEL_RECT;
+    Rect r = CANCEL_RECT;
     bool hot = drop_kind == DROP_CANCEL;
     float rad = C.radius * SC;                 /* the same corner as a tile */
 
     fill_round_rect(r, rad, hot ? with_alpha(C.urgent, 0.18f)
                                 : with_alpha(C.tile, 0.28f));
     if (hot)
-        stroke_round_rect(r, rad, SDL_max(1.0f, 1.5f * SC),
+        stroke_round_rect(r, rad, SW_MAX(1.0f, 1.5f * SC),
                           with_alpha(C.urgent, 0.85f));
 
     /* A small ✕ in the middle, two strokes rather than a line of dots — the
      * dots were what made it look chewed. */
-    float box = r.h * 0.20f, th = SDL_max(1.0f, 1.6f * SC);
-    SDL_FColor c = with_alpha(hot ? C.urgent : C.subtext, hot ? 0.95f : 0.45f);
+    float box = r.h * 0.20f, th = SW_MAX(1.0f, 1.6f * SC);
+    FCol c = with_alpha(hot ? C.urgent : C.subtext, hot ? 0.95f : 0.45f);
     float cx = r.x + r.w * 0.5f, cy = r.y + r.h * 0.5f;
 
-    set_col(c);
-    for (float o = -th * 0.5f; o <= th * 0.5f; o += 0.7f) {
-        SDL_RenderLine(REN, cx - box + o, cy - box, cx + box + o, cy + box);
-        SDL_RenderLine(REN, cx - box + o, cy + box, cx + box + o, cy - box);
+    {   /* two strokes, each a thin quad so the ends stay square */
+        Col cc = fcol(c);
+        float h = th * 0.5f;
+        sw_fill_tri(REN, cx - box - h, cy - box + h, cx - box + h, cy - box - h,
+                    cx + box + h, cy + box - h, cc);
+        sw_fill_tri(REN, cx - box - h, cy - box + h, cx + box + h, cy + box - h,
+                    cx + box - h, cy + box + h, cc);
+        sw_fill_tri(REN, cx - box - h, cy + box - h, cx - box + h, cy + box + h,
+                    cx + box + h, cy - box + h, cc);
+        sw_fill_tri(REN, cx - box - h, cy + box - h, cx + box + h, cy - box + h,
+                    cx + box - h, cy - box - h, cc);
     }
 }
 
 /* A pencil at 45 degrees, point down-left: a body, a band where the wood
  * starts, and the tip. Drawn as geometry so it stays crisp at any scale and
  * does not depend on the font having a glyph for it. */
-static void draw_pencil(SDL_FRect r, SDL_FColor c)
+static void draw_pencil(Rect r, FCol c)
 {
-    float s = SDL_min(r.w, r.h) * 0.70f;
+    float s = SW_MIN(r.w, r.h) * 0.70f;
     float cx = r.x + r.w * 0.5f, cy = r.y + r.h * 0.5f;
     const float k = 0.70710678f;
     float dx = -k, dy = k, nx = k, ny = k;       /* along it, and across it */
@@ -5441,26 +5489,23 @@ static void draw_pencil(SDL_FRect r, SDL_FColor c)
     float bx = cx + dx * (L - cone), by = cy + dy * (L - cone);     /* wood */
     float ex = cx - dx * L, ey = cy - dy * L;                       /* end  */
 
-    SDL_FColor wood = { c.r, c.g, c.b, c.a * 0.55f };
-    SDL_Vertex v[9] = {
-        { { ex + nx * W, ey + ny * W }, c, { 0, 0 } },
-        { { ex - nx * W, ey - ny * W }, c, { 0, 0 } },
-        { { bx + nx * W, by + ny * W }, c, { 0, 0 } },
-        { { bx - nx * W, by - ny * W }, c, { 0, 0 } },
-        { { bx + nx * W, by + ny * W }, wood, { 0, 0 } },
-        { { bx - nx * W, by - ny * W }, wood, { 0, 0 } },
-        { { tx, ty }, c, { 0, 0 } },
-    };
-    int idx[9] = { 0, 1, 2,  1, 3, 2,  4, 5, 6 };
-    SDL_RenderGeometry(REN, NULL, v, 7, idx, 9);
+    FCol wood = { c.r, c.g, c.b, c.a * 0.55f };
+    Col  body = fcol(c), tipc = fcol(wood);
+
+    /* the body, as two triangles, and the cone at the tip */
+    sw_fill_tri(REN, ex + nx * W, ey + ny * W, ex - nx * W, ey - ny * W,
+                bx + nx * W, by + ny * W, body);
+    sw_fill_tri(REN, ex - nx * W, ey - ny * W, bx - nx * W, by - ny * W,
+                bx + nx * W, by + ny * W, body);
+    sw_fill_tri(REN, bx + nx * W, by + ny * W, bx - nx * W, by - ny * W,
+                tx, ty, tipc);
 }
 
 static void render(void)
 {
-    SDL_SetRenderDrawBlendMode(REN, SDL_BLENDMODE_NONE);
-    set_col(C.bg);
-    SDL_RenderClear(REN);
-    SDL_SetRenderDrawBlendMode(REN, SDL_BLENDMODE_BLEND);
+    sw_canvas_clip_all(REN);
+    sw_canvas_clear(REN);
+    sw_canvas_fill(REN, fcol(C.bg));
 
     if (NWS == 0) {
         Tex t = text_make(F_LABEL, "no windows found on this output");
@@ -5473,15 +5518,15 @@ static void render(void)
         for (int i = 0; i < NSLOTS; ++i) {
             if (SLOTS[i].ws >= 0) continue;
             float ph = anim_phase();
-            SDL_FRect t = rect_lerp(SLOTS[i].from, SLOTS[i].tile, ph);
+            Rect t = rect_lerp(SLOTS[i].from, SLOTS[i].tile, ph);
             float ix = t.w * 0.22f, iy = t.h * 0.22f;
-            SDL_FRect g = { t.x + ix, t.y + iy, t.w - 2.0f * ix, t.h - 2.0f * iy };
+            Rect g = { t.x + ix, t.y + iy, t.w - 2.0f * ix, t.h - 2.0f * iy };
             bool hot = (drop_kind == DROP_WS_NUM || drop_kind == DROP_WIN_NEWWS) &&
                        drop_num == SLOTS[i].num;
 
             fill_round_rect(g, C.radius * SC * 0.8f,
                             with_alpha(hot ? C.hl : C.tile, (hot ? 0.30f : 0.55f) * ph));
-            stroke_round_rect(g, C.radius * SC * 0.8f, SDL_max(1.0f, 2.0f * SC),
+            stroke_round_rect(g, C.radius * SC * 0.8f, SW_MAX(1.0f, 2.0f * SC),
                               with_alpha(hot ? C.hl : C.accent, (hot ? 1.0f : 0.35f) * ph));
 
             char num[16];
@@ -5495,13 +5540,13 @@ static void render(void)
         float ph = phase_since(dying_start);
         if (ph >= 1.0f) NDYING = 0;
         for (int i = 0; i < NDYING; ++i) {
-            SDL_FRect t = rect_lerp(DYING[i].from, DYING[i].tile, ph);
+            Rect t = rect_lerp(DYING[i].from, DYING[i].tile, ph);
             float ix = t.w * 0.22f, iy = t.h * 0.22f;
-            SDL_FRect g = { t.x + ix, t.y + iy, t.w - 2.0f * ix, t.h - 2.0f * iy };
+            Rect g = { t.x + ix, t.y + iy, t.w - 2.0f * ix, t.h - 2.0f * iy };
             float a = 1.0f - ph;
 
             fill_round_rect(g, C.radius * SC * 0.8f, with_alpha(C.tile, 0.55f * a));
-            stroke_round_rect(g, C.radius * SC * 0.8f, SDL_max(1.0f, 2.0f * SC),
+            stroke_round_rect(g, C.radius * SC * 0.8f, SW_MAX(1.0f, 2.0f * SC),
                               with_alpha(C.accent, 0.35f * a));
 
             char num[16];
@@ -5531,10 +5576,10 @@ static void render(void)
                            : (float)RH - FOOTER_H * 0.5f - (float)T_HEADER.h * 0.5f;
         head_x0 = pos_x(C.header_pos, (float)T_HEADER.w, m);
         head_x1 = head_x0 + (float)T_HEADER.w;
-        SDL_FColor pin = output_colour(FOCUSED_OUTPUT);
+        FCol pin = output_colour(FOCUSED_OUTPUT);
         if (PINNED_OUTPUT) {                       /* not the screen you are on */
             float p = 8.0f * SC;
-            SDL_FRect box = { head_x0 - p, y - p * 0.5f,
+            Rect box = { head_x0 - p, y - p * 0.5f,
                               (float)T_HEADER.w + 2.0f * p, (float)T_HEADER.h + p };
             fill_round_rect(box, box.h * 0.35f, pin);
         }
@@ -5543,10 +5588,10 @@ static void render(void)
 
     if (T_QUERY.t) {
         float p = 10.0f * SC;
-        SDL_FRect box = { (float)RW * 0.5f - ((float)T_QUERY.w * 0.5f + p),
+        Rect box = { (float)RW * 0.5f - ((float)T_QUERY.w * 0.5f + p),
                           (HEADER_H - (float)T_QUERY.h) * 0.55f - p * 0.5f,
                           (float)T_QUERY.w + 2.0f * p, (float)T_QUERY.h + p };
-        SDL_FColor qc = confirm_kill ? C.urgent : (filtering ? C.accent : C.match);
+        FCol qc = confirm_kill ? C.urgent : (filtering ? C.accent : C.match);
 
         /* pressed enter on a query that matched nothing: the field answers */
         float flash = 0.0f;
@@ -5559,7 +5604,7 @@ static void render(void)
         fill_round_rect(box, box.h * 0.35f,
                         mix(mix(C.tile, C.bg, 0.15f), C.urgent, flash * 0.30f));
         stroke_round_rect(box, box.h * 0.35f,
-                          SDL_max(1.0f, (1.5f + 1.5f * flash) * SC),
+                          SW_MAX(1.0f, (1.5f + 1.5f * flash) * SC),
                           with_alpha(qc, 0.8f + 0.2f * flash));
         tex_draw(T_QUERY, box.x + p, box.y + p * 0.5f, qc);
     }
@@ -5572,9 +5617,9 @@ static void render(void)
 
         /* both lines in the same band: keep the hints clear of the header */
         if (T_HEADER.t && head_top == hint_top && x + (float)T_HINTS.w > head_x0 - m * 0.5f) {
-            if (head_x0 > (float)RW * 0.5f) x = SDL_min(x, head_x0 - m * 0.5f - (float)T_HINTS.w);
-            else                            x = SDL_max(x, head_x1 + m * 0.5f);
-            x = SDL_max(x, m * 0.5f);
+            if (head_x0 > (float)RW * 0.5f) x = SW_MIN(x, head_x0 - m * 0.5f - (float)T_HINTS.w);
+            else                            x = SW_MAX(x, head_x1 + m * 0.5f);
+            x = SW_MAX(x, m * 0.5f);
         }
         tex_draw(T_HINTS, x, y, with_alpha(C.hint, 0.8f));
     }
@@ -5592,8 +5637,8 @@ static void cpu_poll(void)
 {
     if (!C.cpu) return;
 
-    static Uint64 next;
-    Uint64 now = SDL_GetTicks();
+    static uint64_t next;
+    uint64_t now = now_ms_();
     if (now < next) return;
     next = now + 1000;
 
@@ -5874,58 +5919,56 @@ static char *pick_font(const char *spec, bool bold)
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/liberation/LiberationSans-Regular.ttf"
     };
-    for (size_t i = 0; i < SDL_arraysize(fallback); ++i)
+    for (size_t i = 0; i < SW_ARRSZ(fallback); ++i)
         if (file_readable(fallback[i])) return xstrdup(fallback[i]);
     return NULL;
 }
 
-static TTF_Font *open_font(const char *path, float size, bool bold, bool synth_bold)
-{
-    TTF_Font *f = TTF_OpenFont(path, size);
-    if (!f) return NULL;
-    if (bold && synth_bold) TTF_SetFontStyle(f, TTF_STYLE_BOLD);
-    TTF_SetFontHinting(f, TTF_HINTING_LIGHT);
-    return f;
-}
-
 static void load_fonts(void)
 {
+    char *regular, *bold;
+    float u;
+
     /* a configured path needs no fontconfig at all */
     bool have_paths = C.font[0] && strchr(C.font, '/') &&
                       (!C.font_bold[0] || strchr(C.font_bold, '/'));
     if (!have_paths) fontconfig_resolve(C.font);
     mark("font lookup");
 
-    char *regular = pick_font(C.font, false);
+    regular = pick_font(C.font, false);
     if (!regular) die("no usable font found (install fontconfig and a TTF font)");
-    char *bold = C.font_bold[0] ? pick_font(C.font_bold, true) : pick_font(C.font, true);
-    bool synth = false;
-    if (!bold) { bold = xstrdup(regular); synth = true; }
-    else if (strcmp(bold, regular) == 0) synth = true;
+    bold = C.font_bold[0] ? pick_font(C.font_bold, true) : pick_font(C.font, true);
 
-    float u = C.ui_scale * SC;
-    F_BADGE = open_font(bold,    (float)C.ws_px    * u, true, synth);
-    F_LABEL = open_font(bold,    (float)C.label_px * u, true, synth);
-    F_TITLE = open_font(regular, (float)C.title_px * u, false, false);
-    F_HINT  = open_font(regular, (float)C.hint_px  * u, false, false);
-    F_PID   = open_font(regular, (float)C.hint_px  * u * 0.82f, false, false);
+    sw_fonts_init(regular, NULL);
+    /* A bold face of its own, when the desktop has one. Without it sw_draw
+       emboldens the regular face itself, so the headings still read as bold. */
+    if (bold && strcmp(bold, regular) != 0) sw_fonts_bold(bold);
+
     free(regular);
     free(bold);
     free(FC_REGULAR);
     free(FC_BOLD);
     FC_REGULAR = FC_BOLD = NULL;
 
-    if (!F_BADGE || !F_LABEL || !F_TITLE || !F_HINT) die("could not open fonts: %s", SDL_GetError());
+    u = C.ui_scale * SC;
+    F_BADGE = sw_font_bold((int)((float)C.ws_px    * u + 0.5f));
+    F_LABEL = sw_font_bold((int)((float)C.label_px * u + 0.5f));
+    F_TITLE = sw_font((int)((float)C.title_px * u + 0.5f));
+    F_HINT  = sw_font((int)((float)C.hint_px  * u + 0.5f));
+    F_PID   = sw_font((int)((float)C.hint_px  * u * 0.82f + 0.5f));
+
+    if (!F_BADGE || !F_LABEL || !F_TITLE || !F_HINT) die("could not open fonts");
     mark("font open");
 }
 
 /* ------------------------------------------------------------------ main */
 
-static SDL_Window  *WIN_HANDLE;
+static SwWin       *WIN;
 static const char  *SHOT_PATH;
 static float        SHOT_MX = -1.0f, SHOT_MY = -1.0f;
-static SDL_Texture *TARGET;
-static SDL_Cursor  *CUR_ARROW, *CUR_HAND;
+static Canvas      *TARGET;
+static unsigned     CUR_NOW = SW_CURSOR_DEFAULT;
+static void set_cursor(unsigned shape);
 static float        MOUSE_SCALE = 1.0f;
 
 /* --- backdrop: swov drawn behind another program's window ---------------
@@ -5944,7 +5987,7 @@ static bool arg_is_known(const char *a)
         "--backdrop", "--backdrop-debug", "--timing", "--shot", "--mouse",
         "--go", "--set", "--back", "--config", "--no-config", "--",
     };
-    for (size_t i = 0; i < SDL_arraysize(KNOWN); ++i)
+    for (size_t i = 0; i < SW_ARRSZ(KNOWN); ++i)
         if (!strcmp(a, KNOWN[i])) return true;
     return false;
 }
@@ -5966,7 +6009,7 @@ static int   RAISE_LEFT;
 static double RAISE_AT;
 static float BLUR_NOW  = 1.0f;        /* 1 = as soft as `blur` says, 0 = sharp */
 static float BLUR_WANT = 1.0f;        /* a drag sharpens it, so you can aim    */
-static SDL_Texture *BLUR_HALF, *BLUR_SMALL;
+static Canvas      *BLUR_HALF, *BLUR_SMALL;
 static int   BLUR_W, BLUR_H;
 
 static void usage(void)
@@ -6003,7 +6046,7 @@ static void usage(void)
 "  -v, --version       print the version and exit\n"
 "\n"
 "Every config key is also a command line option, in three spellings:\n"
-"      swov --ui_scale=1.2 hl=ff8800 -s ssaa=1\n"
+"      swov --ui_scale=1.2 hl=ff8800 -s blur=2\n"
 "\n"
 "default config: ${XDG_CONFIG_HOME:-~/.config}/swov/config\n"
 "keys: ssaa icons icon_px shadow shadow_layers vsync ui_scale ws_px label_px\n"
@@ -6036,32 +6079,31 @@ static void usage(void)
 "  esc / q             quit\n");
 }
 
+/* The frame is drawn at the output's own pixel density. `ssaa` is accepted
+ * and ignored: every shape is antialiased as it is drawn, so there is
+ * nothing left for a supersampled target to fix. A target of our own is
+ * still wanted as the backdrop, where the whole frame is faded and blurred
+ * as one picture. */
 static bool create_target(void)
 {
-    if (TARGET) { SDL_DestroyTexture(TARGET); TARGET = NULL; }
+    int ww = sw_win_width(WIN), wh = sw_win_height(WIN);
+    float sc = sw_win_scale(WIN);
+    int pw, ph;
 
-    int pw = 0, ph = 0;
-    SDL_GetWindowSizeInPixels(WIN_HANDLE, &pw, &ph);
-    if (pw <= 0 || ph <= 0) return false;
+    if (ww <= 0 || wh <= 0) return false;
+    pw = (int)((float)ww * sc + 0.5f);
+    ph = (int)((float)wh * sc + 0.5f);
 
-    int ssaa = C.ssaa;
-    while (ssaa > 1 && (long long)pw * ph * ssaa * ssaa > 34000000LL) ssaa--;
-
-    if (ssaa > 1 || BACKDROP) {
-        TARGET = SDL_CreateTexture(REN, SDL_PIXELFORMAT_RGBA32,
-                                   SDL_TEXTUREACCESS_TARGET, pw * ssaa, ph * ssaa);
-        if (TARGET) {
-            SDL_SetTextureScaleMode(TARGET, SDL_SCALEMODE_LINEAR);
-            SDL_SetTextureBlendMode(TARGET, SDL_BLENDMODE_BLEND);
-        }
+    if (TARGET && (TARGET->w != pw || TARGET->h != ph)) {
+        sw_canvas_free(TARGET);
+        TARGET = NULL;
     }
-    SC = TARGET ? (float)ssaa : 1.0f;
-    RW = TARGET ? pw * ssaa : pw;
-    RH = TARGET ? ph * ssaa : ph;
+    if (BACKDROP && !TARGET) TARGET = sw_canvas_new(pw, ph);
 
-    int ww = 0, wh = 0;
-    SDL_GetWindowSize(WIN_HANDLE, &ww, &wh);
-    MOUSE_SCALE = (ww > 0) ? (float)RW / (float)ww : 1.0f;
+    SC = sc;
+    RW = pw;
+    RH = ph;
+    MOUSE_SCALE = sc;
     return true;
 }
 
@@ -6079,10 +6121,13 @@ static void goto_workspace_number(int num)
     running = false;
 }
 
-static int digit_from_scancode(SDL_Scancode sc)
+/* The number row by its place on the board, not by what it types: on a
+ * French or Czech layout the digits need shift, and 1..9 should still be
+ * 1..9. These are the evdev codes for that row. */
+static int digit_from_scancode(uint32_t code)
 {
-    if (sc >= SDL_SCANCODE_1 && sc <= SDL_SCANCODE_9) return (int)(sc - SDL_SCANCODE_1) + 1;
-    if (sc == SDL_SCANCODE_0) return 0;
+    if (code >= 2 && code <= 10) return (int)(code - 2) + 1;
+    if (code == 11) return 0;
     return -1;
 }
 
@@ -6151,19 +6196,19 @@ static void serve_launcher(const char *cmd)
     backdrop_reply("ready");
 }
 
-static void handle_key(const SDL_KeyboardEvent *k)
+static void handle_key(const KeyEv *k)
 {
-    bool shift = (k->mod & SDL_KMOD_SHIFT) != 0;
+    bool shift = (k->mod & SW_MOD_SHIFT) != 0;
     bool was_active = sel_active;
+    uint32_t key = k->key;
     sel_active = true;
-    SDL_Keycode key = k->key;
 
     if (editing) {
         switch (key) {
-        case SDLK_RETURN:
-        case SDLK_KP_ENTER: end_edit(true);  reload_model(); return;
-        case SDLK_ESCAPE:   end_edit(false); return;
-        case SDLK_BACKSPACE:
+        case K_RETURN:
+        case K_KP_ENTER: end_edit(true);  reload_model(); return;
+        case K_ESCAPE:   end_edit(false); return;
+        case K_BACKSPACE:
             while (edit_len > 0) {
                 unsigned char c = (unsigned char)edit_buf[--edit_len];
                 edit_buf[edit_len] = 0;
@@ -6176,10 +6221,10 @@ static void handle_key(const SDL_KeyboardEvent *k)
 
     if (editing) {
         switch (key) {
-        case SDLK_RETURN:
-        case SDLK_KP_ENTER: end_edit(true);  reload_model(); return;
-        case SDLK_ESCAPE:   end_edit(false); return;
-        case SDLK_BACKSPACE:
+        case K_RETURN:
+        case K_KP_ENTER: end_edit(true);  reload_model(); return;
+        case K_ESCAPE:   end_edit(false); return;
+        case K_BACKSPACE:
             while (edit_len > 0) {
                 unsigned char c = (unsigned char)edit_buf[--edit_len];
                 edit_buf[edit_len] = 0;
@@ -6193,14 +6238,14 @@ static void handle_key(const SDL_KeyboardEvent *k)
     if (confirm_kill) {                            /* enter confirms, anything
                                                     * else calls it off */
         confirm_kill = false;
-        if (key == SDLK_RETURN || key == SDLK_KP_ENTER) act_close();
+        if (key == K_RETURN || key == K_KP_ENTER) act_close();
         rebuild_chrome();
         return;
     }
 
     if (query_active()) {
         switch (key) {
-        case SDLK_ESCAPE:
+        case K_ESCAPE:
             filtering = searching = false;
             query[0] = 0;
             qlen = 0;
@@ -6208,8 +6253,8 @@ static void handle_key(const SDL_KeyboardEvent *k)
             query_restore_sel(true);       /* back where the search found you */
             rebuild_chrome();
             return;
-        case SDLK_RETURN:
-        case SDLK_KP_ENTER:
+        case K_RETURN:
+        case K_KP_ENTER:
             /* On a query, enter opens what the query found. The selection
              * alone could not be trusted for that: pointing at anything
              * selects it, so a pointer resting somewhere else — or merely
@@ -6247,7 +6292,7 @@ static void handle_key(const SDL_KeyboardEvent *k)
             if (ws_sel_win(&WSS[sel_ws])) act_focus_window(ws_sel_win(&WSS[sel_ws]));
             else                          act_goto_workspace(&WSS[sel_ws]);
             return;
-        case SDLK_BACKSPACE:
+        case K_BACKSPACE:
             while (qlen > 0) {                     /* drop one code point */
                 unsigned char c = (unsigned char)query[--qlen];
                 query[qlen] = 0;
@@ -6256,14 +6301,14 @@ static void handle_key(const SDL_KeyboardEvent *k)
             apply_filter();
             rebuild_chrome();
             return;
-        case SDLK_TAB:
-            if (k->mod & SDL_KMOD_CTRL) step_ws_row(shift ? -1 : 1);
+        case K_TAB:
+            if (k->mod & SW_MOD_CTRL) step_ws_row(shift ? -1 : 1);
             else                        step_ws(shift ? -1 : 1);
             return;
-        case SDLK_LEFT:  navigate(-1, 0); return;
-        case SDLK_RIGHT: navigate( 1, 0); return;
-        case SDLK_UP:    navigate(0, -1); return;
-        case SDLK_DOWN:  navigate(0,  1); return;
+        case K_LEFT:  navigate(-1, 0); return;
+        case K_RIGHT: navigate( 1, 0); return;
+        case K_UP:    navigate(0, -1); return;
+        case K_DOWN:  navigate(0,  1); return;
         default: return;
         }
     }
@@ -6271,9 +6316,9 @@ static void handle_key(const SDL_KeyboardEvent *k)
     /* A digit only counts when it is pressed bare, or with ctrl. With shift
      * held the layout may well be producing something else entirely — on a
      * German keyboard shift+7 is "/" — and that has to reach text input. */
-    int digit = digit_from_scancode(k->scancode);
-    if (digit >= 0 && !shift && !(k->mod & SDL_KMOD_ALT)) {
-        if (k->mod & SDL_KMOD_CTRL) {
+    int digit = digit_from_scancode(k->code);
+    if (digit >= 0 && !shift && !(k->mod & SW_MOD_ALT)) {
+        if (k->mod & SW_MOD_CTRL) {
             if (was_active) act_move_to_workspace(digit);   /* ctrl: take it there */
         } else {
             goto_workspace_number(digit);                   /* bare: go there */
@@ -6283,16 +6328,16 @@ static void handle_key(const SDL_KeyboardEvent *k)
     if (digit >= 0) return;                    /* shifted digit: let text input have it */
 
     switch (key) {
-    case SDLK_ESCAPE:
+    case K_ESCAPE:
         if (drag_active) { drag_cancel(); break; }
         running = false;
         break;
-    case SDLK_Q:
+    case K_Q:
         running = false;
         break;
 
-    case SDLK_RETURN:
-    case SDLK_KP_ENTER:
+    case K_RETURN:
+    case K_KP_ENTER:
         if (NWS == 0) { running = false; break; }
         /* A query that found nothing has no selection to act on. Leaving and
          * switching to whatever happened to be selected before is the worst
@@ -6302,17 +6347,17 @@ static void handle_key(const SDL_KeyboardEvent *k)
         else                          act_goto_workspace(&WSS[sel_ws]);
         break;
 
-    case SDLK_TAB:
-        if (k->mod & SDL_KMOD_CTRL)      step_ws_row(shift ? -1 : 1);
+    case K_TAB:
+        if (k->mod & SW_MOD_CTRL)      step_ws_row(shift ? -1 : 1);
         else if (!strcmp(C.tab, "recent") && step_recent(shift ? -1 : 1)) break;
         else                             step_ws(shift ? -1 : 1);
         break;
 
-    case SDLK_D:                                   /* the launcher, in front */
+    case K_D:                                   /* the launcher, in front */
         if (C.launcher[0] && !SERVING) serve_launcher(C.launcher);
         break;
 
-    case SDLK_W:                                   /* window level <-> workspace */
+    case K_W:                                   /* window level <-> workspace */
         if (NWS > 0) {
             Ws *ws = &WSS[sel_ws];
             if (ws->sel >= 0) ws->sel = -1;
@@ -6320,12 +6365,12 @@ static void handle_key(const SDL_KeyboardEvent *k)
         }
         break;
 
-    case SDLK_LEFT:  case SDLK_H: navigate(-1, 0); break;
-    case SDLK_RIGHT: case SDLK_L: navigate( 1, 0); break;
-    case SDLK_UP:    case SDLK_K: navigate(0, -1); break;
-    case SDLK_DOWN:  case SDLK_J: navigate(0,  1); break;
+    case K_LEFT:  case K_H: navigate(-1, 0); break;
+    case K_RIGHT: case K_L: navigate( 1, 0); break;
+    case K_UP:    case K_K: navigate(0, -1); break;
+    case K_DOWN:  case K_J: navigate(0,  1); break;
 
-    case SDLK_SPACE:
+    case K_SPACE:
         if (NWS > 0) {
             Ws *ws = &WSS[sel_ws];
             /* On a window, space marks that window. On a workspace with no
@@ -6338,17 +6383,17 @@ static void handle_key(const SDL_KeyboardEvent *k)
         }
         break;
 
-    case SDLK_A:
+    case K_A:
         if (NWS > 0) toggle_ws_marks(&WSS[sel_ws]);
         break;
 
-    case SDLK_C:
+    case K_C:
         for (int i = 0; i < NWIN; ++i) WINS[i].marked = false;
         for (int i = 0; i < NWS;  ++i) WSS[i].marked  = false;
         break;
 
-    case SDLK_X:
-    case SDLK_DELETE:
+    case K_X:
+    case K_DELETE:
         if (NWS > 0) {                             /* ask before killing */
             int ids[MAX_WINDOWS];
             if (gather_targets(ids, MAX_WINDOWS) > 0 ||
@@ -6359,11 +6404,11 @@ static void handle_key(const SDL_KeyboardEvent *k)
         }
         break;
 
-    case SDLK_R:
+    case K_R:
         reload_model();
         break;
 
-    case SDLK_SLASH:
+    case K_SLASH:
         query_save_sel();
         filtering = true;
         searching = false;
@@ -6373,7 +6418,7 @@ static void handle_key(const SDL_KeyboardEvent *k)
         rebuild_chrome();
         break;
 
-    case SDLK_F:                                   /* find, without hiding */
+    case K_F:                                   /* find, without hiding */
         query_save_sel();
         searching = true;
         filtering = false;
@@ -6423,7 +6468,7 @@ static void end_edit(bool commit)
     edit_len = 0;
 }
 
-static void handle_mouse_press(const SDL_MouseButtonEvent *b)
+static void handle_mouse_press(const MouseEv *b)
 {
     float mx = b->x * MOUSE_SCALE, my = b->y * MOUSE_SCALE;
     int ws_idx = -1;
@@ -6435,9 +6480,9 @@ static void handle_mouse_press(const SDL_MouseButtonEvent *b)
 
     /* a monitor picked up out of the map: it can be put down against
        another one to rearrange the desk */
-    if (b->button == SDL_BUTTON_LEFT && MAP_RECT.w > 0.0f) {
+    if (b->button == SW_BTN_LEFT && MAP_RECT.w > 0.0f) {
         for (int i = 0; i < NOUTS; ++i) {
-            SDL_FRect r = OUTS[i].box;
+            Rect r = OUTS[i].box;
             if (r.w <= 0.0f || mx < r.x || mx >= r.x + r.w ||
                 my < r.y || my >= r.y + r.h) continue;
             OUT_PRESS = i;
@@ -6448,9 +6493,9 @@ static void handle_mouse_press(const SDL_MouseButtonEvent *b)
     }
 
     /* the map of the monitors: step onto one and look at its workspaces */
-    if (b->button == SDL_BUTTON_LEFT && MAP_RECT.w > 0.0f) {
+    if (b->button == SW_BTN_LEFT && MAP_RECT.w > 0.0f) {
         for (int i = 0; i < NOUTS; ++i) {
-            SDL_FRect r = OUTS[i].box;
+            Rect r = OUTS[i].box;
             if (r.w <= 0.0f || mx < r.x || mx >= r.x + r.w ||
                 my < r.y || my >= r.y + r.h) continue;
             if (strcmp(OUTS[i].name, FOCUSED_OUTPUT) == 0) {
@@ -6472,8 +6517,8 @@ static void handle_mouse_press(const SDL_MouseButtonEvent *b)
         if (si >= 0 && SLOTS[si].ws < 0) press_slot = si;
     }
 
-    if (b->button == SDL_BUTTON_LEFT && ws_idx >= 0 && win_idx < 0) {
-        SDL_FRect tb = WSS[ws_idx].title_hit;
+    if (b->button == SW_BTN_LEFT && ws_idx >= 0 && win_idx < 0) {
+        Rect tb = WSS[ws_idx].title_hit;
         if (mx >= tb.x && mx < tb.x + tb.w && my >= tb.y && my < tb.y + tb.h) {
             sel_active = true;
             sel_ws = ws_idx;
@@ -6488,14 +6533,14 @@ static void handle_mouse_press(const SDL_MouseButtonEvent *b)
          * workspaces sway actually has, so a free slot looked like a click on
          * nothing and quit the overview before the release could ever act on
          * it — which is why clicking one never went anywhere. */
-        if (press_slot >= 0 && b->button == SDL_BUTTON_LEFT) {
+        if (press_slot >= 0 && b->button == SW_BTN_LEFT) {
             press_down = true;
             press_x = mx;
             press_y = my;
             press_win = press_ws = -1;
             return;
         }
-        if (b->button == SDL_BUTTON_LEFT) running = false;   /* the background */
+        if (b->button == SW_BTN_LEFT) running = false;   /* the background */
         return;
     }
 
@@ -6504,17 +6549,17 @@ static void handle_mouse_press(const SDL_MouseButtonEvent *b)
     WSS[ws_idx].sel = (win_idx >= 0) ? win_idx - WSS[ws_idx].first : -1;
 
     switch (b->button) {
-    case SDL_BUTTON_LEFT:                   /* arm a drag, act on release */
+    case SW_BTN_LEFT:                   /* arm a drag, act on release */
         press_down = true;
         press_x = mx;
         press_y = my;
         press_win = win_idx;
         press_ws  = ws_idx;
         break;
-    case SDL_BUTTON_RIGHT:
+    case SW_BTN_RIGHT:
         if (win_idx >= 0) act_toggle_mark(&WINS[win_idx]);
         break;
-    case SDL_BUTTON_MIDDLE:
+    case SW_BTN_MIDDLE:
         if (win_idx >= 0) {
             sway_cmd("[con_id=%d] kill", WINS[win_idx].con_id);
             reload_model();
@@ -6547,9 +6592,9 @@ static void outputs_rearrange(int moved, int anchor, int edge)
     reload_model();
 }
 
-static void handle_mouse_release(const SDL_MouseButtonEvent *b)
+static void handle_mouse_release(const MouseEv *b)
 {
-    if (b->button != SDL_BUTTON_LEFT) return;
+    if (b->button != SW_BTN_LEFT) return;
 
     float mx = b->x * MOUSE_SCALE, my = b->y * MOUSE_SCALE;
 
@@ -6595,9 +6640,13 @@ static void handle_mouse_release(const SDL_MouseButtonEvent *b)
     press_win = press_ws = -1;
 }
 
-static void handle_mouse_motion(const SDL_MouseMotionEvent *mo)
+static float LAST_MX, LAST_MY;      /* the pointer, in render pixels */
+
+static void handle_mouse_motion(const MouseEv *mo)
 {
     float mx = mo->x * MOUSE_SCALE, my = mo->y * MOUSE_SCALE;
+    LAST_MX = mx;
+    LAST_MY = my;
     drag_x = mx;
     drag_y = my;
 
@@ -6619,23 +6668,23 @@ static void handle_mouse_motion(const SDL_MouseMotionEvent *mo)
         if (dx * dx + dy * dy > (7.0f * SC) * (7.0f * SC)) {
             drag_active = true;
             hov_ws = hov_win = -1;               /* hover is meaningless now */
-            drag_src_tile = (SDL_FRect){ 0, 0, 0, 0 };
+            drag_src_tile = (Rect){ 0, 0, 0, 0 };
             if (press_win >= 0 && WINS[press_win].ws >= 0 && WINS[press_win].ws < NWS)
                 drag_src_tile = WSS[WINS[press_win].ws].tile;
             if (press_win < 0 && press_ws >= 0 && WSS[press_ws].num >= 0)
                 drag_ws_mode = true;         /* dragging the whole workspace */
             update_ghosts(mx, my);
-            SDL_SetCursor(CUR_HAND);
+            set_cursor(SW_CURSOR_POINTER);
         }
     }
 
     /* dragging a monitor about in the map */
     if (OUT_PRESS >= 0) {
         OUT_TARGET = -1;
-        if (SDL_fabsf(mx - OUT_PRESS_X) + SDL_fabsf(my - OUT_PRESS_Y) > 6.0f * SC)
+        if (fabsf(mx - OUT_PRESS_X) + fabsf(my - OUT_PRESS_Y) > 6.0f * SC)
             for (int i = 0; i < NOUTS; ++i) {
                 if (i == OUT_PRESS) continue;
-                SDL_FRect r = OUTS[i].box;
+                Rect r = OUTS[i].box;
                 if (r.w <= 0.0f || mx < r.x || mx >= r.x + r.w ||
                     my < r.y || my >= r.y + r.h) continue;
                 OUT_TARGET = i;
@@ -6660,7 +6709,7 @@ static void handle_mouse_motion(const SDL_MouseMotionEvent *mo)
 
     bool ph = false;
     if (C.rename_icon && ws_idx >= 0 && win_idx < 0) {
-        SDL_FRect tb = WSS[ws_idx].title_hit;
+        Rect tb = WSS[ws_idx].title_hit;
         ph = mx >= tb.x && mx < tb.x + tb.w && my >= tb.y && my < tb.y + tb.h;
     }
     if (ph != pencil_hot) { pencil_hot = ph; dirty = true; }
@@ -6668,7 +6717,7 @@ static void handle_mouse_motion(const SDL_MouseMotionEvent *mo)
     if (ws_idx != hov_ws || win_idx != hov_win) {
         hov_ws = ws_idx;
         hov_win = win_idx;
-        SDL_SetCursor(ws_idx >= 0 ? CUR_HAND : CUR_ARROW);
+        set_cursor(ws_idx >= 0 ? SW_CURSOR_POINTER : SW_CURSOR_DEFAULT);
         dirty = true;
     }
 
@@ -6693,21 +6742,20 @@ static void handle_mouse_motion(const SDL_MouseMotionEvent *mo)
     }
 }
 
-static void handle_event(const SDL_Event *e)
+static void handle_event(const SwEvent *e)
 {
     /* Mouse motion fires constantly; it only earns a redraw when it changes
      * what is under the cursor. Everything else is a real state change. */
-    if (e->type != SDL_EVENT_MOUSE_MOTION) dirty = true;
+    if (e->type != SW_EV_MOTION) dirty = true;
 
     if (BACKDROP) {
         /* the window in front owns the pointer and the keyboard; all we do is
          * follow the size of the screen and the commands on stdin */
         switch (e->type) {
-        case SDL_EVENT_QUIT:
+        case SW_EV_CLOSED:
             running = false;
             break;
-        case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-        case SDL_EVENT_WINDOW_RESIZED:
+        case SW_EV_CONFIGURE:
             if (create_target()) { layout(); rebuild_chrome(); }
             break;
         default:
@@ -6717,70 +6765,72 @@ static void handle_event(const SDL_Event *e)
     }
 
     switch (e->type) {
-    case SDL_EVENT_QUIT:
+    case SW_EV_CLOSED:
         running = false;
         break;
 
-    case SDL_EVENT_KEY_DOWN:
-        handle_key(&e->key);
-        break;
+    case SW_EV_KEY: {
+        KeyEv k;
+        if (!e->pressed) break;
+        k.key  = e->keysym;
+        k.mod  = e->mods;
+        k.code = e->code;
+        /* swov's bindings are written in lower case; shift is read from mods */
+        if (k.key >= 'A' && k.key <= 'Z') k.key += 32;
+        handle_key(&k);
+        if (!running) break;
 
-    case SDL_EVENT_TEXT_INPUT:
-        /* the key that opened a mode sends its own character right after */
+        /* What the key typed, where swov is taking text. One event carries
+         * both on Wayland, so this follows the binding rather than arriving
+         * as an event of its own. */
+        if (!e->text[0] || (unsigned char)e->text[0] < 0x20) break;
         if (swallow_next_text) { swallow_next_text = false; break; }
 
         if (editing) {                             /* renaming a workspace */
-            size_t add = strlen(e->text.text);
+            size_t add = strlen(e->text);
             if (edit_len + (int)add < (int)sizeof(edit_buf) - 1) {
-                memcpy(edit_buf + edit_len, e->text.text, add + 1);
+                memcpy(edit_buf + edit_len, e->text, add + 1);
                 edit_len += (int)add;
             }
             break;
         }
 
-        if (!query_active()) {                     /* "/" opens the filter */
-            if (strcmp(e->text.text, "/") == 0) {
-                filtering = true;
-                query[0] = 0;
-                qlen = 0;
-                rebuild_chrome();
-            }
-            break;
-        }
+        if (!query_active()) break;                /* "/" is a binding above */
 
         {
-            size_t add = strlen(e->text.text);
+            size_t add = strlen(e->text);
             if (qlen + (int)add < (int)sizeof(query) - 1) {
-                memcpy(query + qlen, e->text.text, add + 1);
+                memcpy(query + qlen, e->text, add + 1);
                 qlen += (int)add;
                 apply_filter();
                 rebuild_chrome();
             }
         }
         break;
+    }
 
-    case SDL_EVENT_MOUSE_MOTION:
-        handle_mouse_motion(&e->motion);
+    case SW_EV_MOTION: {
+        MouseEv m = { e->x, e->y, 0 };
+        handle_mouse_motion(&m);
+        break;
+    }
+
+    case SW_EV_BUTTON: {
+        MouseEv m = { e->x, e->y, e->button };
+        if (e->pressed) handle_mouse_press(&m);
+        else            handle_mouse_release(&m);
+        break;
+    }
+
+    case SW_EV_AXIS:
+        if (e->ay != 0.0f) step_ws(e->ay < 0.0f ? -1 : 1);
         break;
 
-    case SDL_EVENT_MOUSE_BUTTON_DOWN:
-        handle_mouse_press(&e->button);
-        break;
-
-    case SDL_EVENT_MOUSE_BUTTON_UP:
-        handle_mouse_release(&e->button);
-        break;
-
-    case SDL_EVENT_MOUSE_WHEEL:
-        if (e->wheel.y != 0.0f) step_ws(e->wheel.y > 0.0f ? -1 : 1);
-        break;
-
-    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-    case SDL_EVENT_WINDOW_RESIZED:
+    case SW_EV_CONFIGURE:
         if (create_target()) { layout(); rebuild_chrome(); }
         break;
 
-    case SDL_EVENT_WINDOW_FOCUS_LOST:
+    case SW_EV_KB_LEAVE:
         /* Losing the keyboard normally means the overview's moment has
          * passed. Not while we are the backdrop for a launcher we started:
          * that launcher taking the focus is the whole point, and quitting
@@ -6879,9 +6929,9 @@ static void backdrop_hover(float fx, float fy)
     static const char *EDGE_NAME[] = { "left", "right", "top", "bottom" };
     char place[80] = "";
 
-    SDL_FRect t = WSS[ws_idx].screen;
-    float bx = SDL_clamp(t.w * 0.09f, 6.0f * SC, t.w * 0.18f);
-    float by = SDL_clamp(t.h * 0.09f, 6.0f * SC, t.h * 0.18f);
+    Rect t = WSS[ws_idx].screen;
+    float bx = SW_CLAMP(t.w * 0.09f, 6.0f * SC, t.w * 0.18f);
+    float by = SW_CLAMP(t.h * 0.09f, 6.0f * SC, t.h * 0.18f);
     int edge = -1;
     if      (x - t.x < bx)       edge = EDGE_LEFT;
     else if (t.x + t.w - x < bx) edge = EDGE_RIGHT;
@@ -7121,143 +7171,100 @@ static void backdrop_step(float ms)
 }
 
 /* Two scaled copies of the frame we already rendered: full -> half -> small,
- * then that small one stretched back over the screen. The card does the
- * filtering, so it is three quad blits and no per-pixel work of our own. The
- * sharp frame is then drawn over it with whatever alpha is left, which is how
- * it sharpens while you drag. */
-static void backdrop_blur(float alpha)
+ * then that small one stretched back over the screen. Shrinking box-filters
+ * and growing picks the nearest pixel, which is what makes the blur: three
+ * blits and no kernel of our own. The sharp frame is then drawn over it with
+ * whatever alpha is left, which is how it sharpens while you drag. */
+static void backdrop_blur(Canvas *dst, float alpha)
 {
     static const int FACTOR[4] = { 0, 5, 9, 15 };
     int f  = FACTOR[C.blur < 0 ? 0 : (C.blur > 3 ? 3 : C.blur)];
-    int w1 = SDL_max(2, RW / 2), h1 = SDL_max(2, RH / 2);
-    int w2 = SDL_max(2, RW / f), h2 = SDL_max(2, RH / f);
+    int w1 = SW_MAX(2, RW / 2), h1 = SW_MAX(2, RH / 2);
+    int w2 = SW_MAX(2, RW / f), h2 = SW_MAX(2, RH / f);
 
-    if (!BLUR_HALF || BLUR_W != w2 || BLUR_H != h2) {
-        if (BLUR_HALF)  SDL_DestroyTexture(BLUR_HALF);
-        if (BLUR_SMALL) SDL_DestroyTexture(BLUR_SMALL);
-        BLUR_HALF = SDL_CreateTexture(REN, SDL_PIXELFORMAT_RGBA32,
-                                      SDL_TEXTUREACCESS_TARGET, w1, h1);
-        BLUR_SMALL = SDL_CreateTexture(REN, SDL_PIXELFORMAT_RGBA32,
-                                       SDL_TEXTUREACCESS_TARGET, w2, h2);
+    if (!TARGET) return;
+
+    if (!BLUR_HALF || BLUR_W != w2 || BLUR_H != h2 ||
+        BLUR_HALF->w != w1 || BLUR_HALF->h != h1) {
+        sw_canvas_free(BLUR_HALF);
+        sw_canvas_free(BLUR_SMALL);
+        BLUR_HALF  = sw_canvas_new(w1, h1);
+        BLUR_SMALL = sw_canvas_new(w2, h2);
         if (!BLUR_HALF || !BLUR_SMALL) { BLUR_W = BLUR_H = 0; return; }
-        SDL_SetTextureScaleMode(BLUR_HALF,  SDL_SCALEMODE_LINEAR);
-        SDL_SetTextureScaleMode(BLUR_SMALL, SDL_SCALEMODE_LINEAR);
         BLUR_W = w2;
         BLUR_H = h2;
     }
 
-    /* copy, do not blend: the alpha of the overlay has to survive the trip */
-    SDL_SetTextureBlendMode(TARGET, SDL_BLENDMODE_NONE);
-    SDL_SetTextureBlendMode(BLUR_HALF, SDL_BLENDMODE_NONE);
-
-    SDL_SetRenderTarget(REN, BLUR_HALF);
-    SDL_RenderTexture(REN, TARGET, NULL, NULL);
-    SDL_SetRenderTarget(REN, BLUR_SMALL);
-    SDL_RenderTexture(REN, BLUR_HALF, NULL, NULL);
-    SDL_SetRenderTarget(REN, NULL);
-
-    SDL_SetTextureBlendMode(TARGET, SDL_BLENDMODE_BLEND);
-    SDL_SetTextureBlendMode(BLUR_SMALL, SDL_BLENDMODE_BLEND);
-    SDL_SetTextureAlphaModFloat(BLUR_SMALL, alpha);
-    SDL_RenderTexture(REN, BLUR_SMALL, NULL, NULL);
+    sw_canvas_clear(BLUR_HALF);
+    sw_canvas_clear(BLUR_SMALL);
+    sw_blit_canvas(BLUR_HALF, TARGET, 0, 0, (float)w1, (float)h1, SW_WHITE, 1.0f);
+    sw_blit_canvas(BLUR_SMALL, BLUR_HALF, 0, 0, (float)w2, (float)h2, SW_WHITE, 1.0f);
+    sw_blit_canvas(dst, BLUR_SMALL, 0, 0, (float)RW, (float)RH, SW_WHITE, alpha);
 }
 
 static void present(void)
 {
-    if (TARGET) SDL_SetRenderTarget(REN, TARGET);
-    render();
-    if (TARGET) {
-        SDL_SetRenderTarget(REN, NULL);
-        SDL_SetRenderDrawBlendMode(REN, SDL_BLENDMODE_NONE);
-        SDL_SetRenderDrawColorFloat(REN, 0, 0, 0, 0);
-        SDL_RenderClear(REN);
-        SDL_SetRenderDrawBlendMode(REN, SDL_BLENDMODE_BLEND);
+    Canvas *win = sw_win_begin(WIN);
+    if (!win) return;                 /* both buffers still on screen */
 
+    sw_canvas_clip_all(win);
+    sw_canvas_clear(win);
+
+    REN = TARGET ? TARGET : win;
+    if (TARGET) sw_canvas_clear(TARGET);
+    render();
+
+    if (TARGET) {
         float sharp = 1.0f;
         if (BACKDROP && C.blur > 0 && BLUR_NOW > 0.0f) {
-            backdrop_blur(BACKDROP_A);
+            backdrop_blur(win, BACKDROP_A);
             sharp = 1.0f - BLUR_NOW;
         }
-        if (BACKDROP) SDL_SetTextureAlphaModFloat(TARGET, BACKDROP_A * sharp);
-        if (sharp > 0.0f) SDL_RenderTexture(REN, TARGET, NULL, NULL);
+        if (sharp > 0.0f)
+            sw_blit_canvas(win, TARGET, 0, 0, (float)RW, (float)RH, SW_WHITE,
+                           BACKDROP ? BACKDROP_A * sharp : sharp);
     }
+    REN = win;
 
     if (SHOT_PATH) {
-        SDL_Surface *shot = SDL_RenderReadPixels(REN, NULL);
-        if (shot) {
-            if (!IMG_SavePNG(shot, SHOT_PATH))
-                fprintf(stderr, "swov: cannot write %s: %s\n", SHOT_PATH, SDL_GetError());
-            SDL_DestroySurface(shot);
-        }
+        if (!sw_write_png(SHOT_PATH, win))
+            fprintf(stderr, "swov: cannot write %s\n", SHOT_PATH);
         running = false;
     }
-    SDL_RenderPresent(REN);
+    sw_win_end(WIN);
     shown_once = true;
 }
 
-/* Place the overlay on the output sway is using. Matching by name only works
- * when SDL reports the connector ("DP-1"); on wayland it often reports the
- * monitor model instead, which is why the geometry is the better key. */
-static void pick_bounds(SDL_Rect *out)
+/* Which output the overlay goes on. sway names its outputs by connector
+ * ("DP-1") and so does Wayland, so the name sway gives for the focused
+ * workspace is the name to hand the layer surface. NULL lets the
+ * compositor pick, which is what happens when it has nothing to say. */
+static const char *pick_output(void)
 {
-    *out = (SDL_Rect){ 0, 0, 1280, 720 };
+    static char name[64];
+    JV *outs;
 
-    int count = 0;
-    SDL_DisplayID *ids = SDL_GetDisplays(&count);
-    if (!ids || count <= 0) { SDL_free(ids); return; }
+    if (FOCUSED_OUTPUT[0]) return FOCUSED_OUTPUT;
 
-    SDL_DisplayID chosen = 0;
-
-    /* what sway says the focused output covers */
-    int ox = 0, oy = 0, ow = 0, oh = 0;
-    JV *outs = sway_query(IPC_GET_OUTPUTS);
+    name[0] = 0;
+    outs = sway_query(IPC_GET_OUTPUTS);
     if (outs && outs->type == J_ARR) {
         for (int i = 0; i < outs->count; ++i) {
             const JV *o = outs->items[i];
-            bool is_it = FOCUSED_OUTPUT[0]
-                           ? strcmp(jstr(o, "name", ""), FOCUSED_OUTPUT) == 0
-                           : jbool(o, "focused", false);
-            if (!is_it) continue;
-            const JV *r = jget(o, "rect");
-            ox = jint(r, "x", 0);
-            oy = jint(r, "y", 0);
-            ow = jint(r, "width", 0);
-            oh = jint(r, "height", 0);
+            if (!jbool(o, "focused", false)) continue;
+            str_set(name, sizeof(name), jstr(o, "name", ""));
             break;
         }
     }
     jfree(outs);
+    return name[0] ? name : NULL;
+}
 
-    if (ow > 0 && oh > 0) {                        /* the display holding it */
-        float cx = (float)ox + (float)ow * 0.5f;
-        float cy = (float)oy + (float)oh * 0.5f;
-        for (int i = 0; i < count; ++i) {
-            SDL_Rect b;
-            if (!SDL_GetDisplayBounds(ids[i], &b)) continue;
-            if (cx >= (float)b.x && cx < (float)(b.x + b.w) &&
-                cy >= (float)b.y && cy < (float)(b.y + b.h)) { chosen = ids[i]; break; }
-        }
-    }
-
-    if (!chosen && FOCUSED_OUTPUT[0]) {
-        for (int i = 0; i < count; ++i) {
-            const char *n = SDL_GetDisplayName(ids[i]);
-            if (n && strcmp(n, FOCUSED_OUTPUT) == 0) { chosen = ids[i]; break; }
-        }
-    }
-    if (!chosen) {
-        float mx = 0.0f, my = 0.0f;
-        SDL_GetGlobalMouseState(&mx, &my);
-        chosen = ids[0];
-        for (int i = 0; i < count; ++i) {
-            SDL_Rect b;
-            if (!SDL_GetDisplayBounds(ids[i], &b)) continue;
-            if (mx >= (float)b.x && mx < (float)(b.x + b.w) &&
-                my >= (float)b.y && my < (float)(b.y + b.h)) { chosen = ids[i]; break; }
-        }
-    }
-    SDL_GetDisplayBounds(chosen, out);
-    SDL_free(ids);
+static void set_cursor(unsigned shape)
+{
+    if (shape == CUR_NOW) return;
+    CUR_NOW = shape;
+    sw_win_cursor(WIN, shape);
 }
 
 int main(int argc, char **argv)
@@ -7411,7 +7418,7 @@ int main(int argc, char **argv)
                (double)C.anim_ms, C.shadow, (double)C.float_alpha, C.vsync);
 
         printf("\ncolours\n");
-        struct { const char *k; SDL_FColor c; } cols[] = {
+        struct { const char *k; FCol c; } cols[] = {
             { "bg", C.bg }, { "tile", C.tile }, { "tile_sel", C.tile_sel },
             { "mini_bg", C.mini_bg }, { "card", C.card }, { "card_hover", C.card_hover },
             { "card_focus", C.card_focus }, { "hl", C.hl }, { "current", C.current },
@@ -7419,7 +7426,7 @@ int main(int argc, char **argv)
             { "dim", C.dim }, { "accent", C.accent }, { "hint", C.hint },
             { "hltext", C.hltext }, { "urgent", C.urgent }, { "outline", C.outline }
         };
-        for (size_t i = 0; i < SDL_arraysize(cols); ++i)
+        for (size_t i = 0; i < SW_ARRSZ(cols); ++i)
             printf("  %-12s %02x%02x%02x%02x\n", cols[i].k,
                    (unsigned)(cols[i].c.r * 255.0f + 0.5f), (unsigned)(cols[i].c.g * 255.0f + 0.5f),
                    (unsigned)(cols[i].c.b * 255.0f + 0.5f), (unsigned)(cols[i].c.a * 255.0f + 0.5f));
@@ -7546,35 +7553,34 @@ int main(int argc, char **argv)
     /* A different app id, because a backdrop must not take the keyboard from
      * the window in front of it:
      *     for_window [app_id="swov-backdrop"] no_focus                     */
-    SDL_SetHint(SDL_HINT_APP_ID, BACKDROP ? APP_ID "-backdrop" : APP_ID);
-    SDL_SetAppMetadata(APP_ID, SWOV_VERSION, "org.swov.overview");
+    if (!sw_init()) die("no wayland display: %s", sw_error());
+    mark("wayland connect");
 
-    if (!SDL_Init(SDL_INIT_VIDEO)) die("SDL_Init: %s", SDL_GetError());
-    mark("SDL_Init");
-    if (!TTF_Init()) die("TTF_Init: %s", SDL_GetError());
+    {
+        /* A layer-shell overlay anchored to all four sides covers the output
+           without becoming a real window, so nothing underneath is resized
+           or unmapped. A backdrop takes no keyboard: the launcher in front
+           of it owns that, and a namespace of its own is what sway's
+           no_focus rule matches on. */
+        SwWinOpts o;
+        memset(&o, 0, sizeof o);
+        o.anchor = SW_ANCHOR_TOP | SW_ANCHOR_BOTTOM | SW_ANCHOR_LEFT | SW_ANCHOR_RIGHT;
+        o.layer = BACKDROP ? SW_LAYER_TOP : SW_LAYER_OVERLAY;
+        o.keyboard = BACKDROP ? SW_KBD_NONE : SW_KBD_EXCLUSIVE;
+        o.exclusive_zone = -1;
+        o.namespace_ = BACKDROP ? APP_ID "-backdrop" : APP_ID;
+        o.output = pick_output();
+        WIN = sw_win_create(&o, NULL);
+        if (!WIN) die("cannot create the overlay: %s", sw_error());
+    }
 
-    SDL_Rect bounds;
-    pick_bounds(&bounds);
-
-    SDL_WindowFlags flags = SDL_WINDOW_BORDERLESS | SDL_WINDOW_TRANSPARENT |
-                            SDL_WINDOW_ALWAYS_ON_TOP | SDL_WINDOW_HIGH_PIXEL_DENSITY;
-    WIN_HANDLE = SDL_CreateWindow(BACKDROP ? APP_ID "-backdrop" : APP_ID,
-                                  bounds.w, bounds.h, flags);
-    if (!WIN_HANDLE) die("SDL_CreateWindow: %s", SDL_GetError());
-    SDL_SetWindowPosition(WIN_HANDLE, bounds.x, bounds.y);
-
-    REN = SDL_CreateRenderer(WIN_HANDLE, NULL);
-    if (!REN) die("SDL_CreateRenderer: %s", SDL_GetError());
-    mark("window+renderer");
-    SDL_SetRenderDrawBlendMode(REN, SDL_BLENDMODE_BLEND);
-    SDL_SetRenderVSync(REN, C.vsync ? 1 : 0);
+    /* wait for the compositor to say how big the surface is */
+    for (int i = 0; i < 200 && sw_win_width(WIN) <= 0; ++i) sw_dispatch(10);
+    mark("surface");
 
     if (!create_target()) die("cannot size the window");
     mark("render target");
     load_fonts();
-
-    CUR_ARROW = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
-    CUR_HAND  = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
 
     usage_sync();
     sway_subscribe_events();
@@ -7606,13 +7612,12 @@ int main(int argc, char **argv)
         hov_win = hit_test(SHOT_MX * MOUSE_SCALE, SHOT_MY * MOUSE_SCALE, &hov_ws);
     }
 
-    Uint64 last_reload = 0;
+    uint64_t last_reload = 0;
     bool   pending_reload = false;
 
-    if (!BACKDROP) SDL_StartTextInput(WIN_HANDLE);
-    SDL_RaiseWindow(WIN_HANDLE);
     if (BACKDROP && SHOT_PATH) BACKDROP_A = 1.0f;   /* a still has nothing to fade */
     present();
+    sw_flush();
 
     if (BACKDROP) {
         /* the window is up; whoever spawned us can put itself back on top */
@@ -7620,18 +7625,16 @@ int main(int argc, char **argv)
         fflush(stdout);
     }
 
-    Uint64 last_tick = SDL_GetTicks();
+    uint64_t last_tick = now_ms_();
 
     while (running) {
-        SDL_Event e;
+        SwEvent e;
         if (anim_running()) dirty = true;
         cpu_poll();
         if (drag_active) {
             map_dwell_tick();
             if (SNAP_WIN >= 0) {          /* the hold is running: keep drawing */
-                float mx, my;
-                SDL_GetMouseState(&mx, &my);
-                drag_update_target(mx * MOUSE_SCALE, my * MOUSE_SCALE);
+                drag_update_target(LAST_MX, LAST_MY);
                 dirty = true;
             }
         }
@@ -7640,17 +7643,15 @@ int main(int argc, char **argv)
 
         if (BACKDROP || SERVING) {
             backdrop_poll();
-            Uint64 now = SDL_GetTicks();
+            uint64_t now = now_ms_();
             if (BACKDROP) backdrop_step((float)(now - last_tick));
             last_tick = now;
             if (!running) break;
         }
 
-        if (SDL_WaitEventTimeout(&e, (BACKDROP || SERVING) ? 8
-                                    : (anim_running() || pending_reload) ? 8 : 60)) {
-            handle_event(&e);
-            while (running && SDL_PollEvent(&e)) handle_event(&e);   /* coalesce */
-        }
+        sw_dispatch((BACKDROP || SERVING) ? 8
+                    : (anim_running() || pending_reload) ? 8 : 60);
+        while (running && sw_poll(&e)) handle_event(&e);
 
         /* Sway acknowledges a command before the layout transaction has
          * committed, so the tree is only trustworthy once the events for it
@@ -7660,7 +7661,7 @@ int main(int argc, char **argv)
         if (running && !drag_active && sway_events_pending()) pending_reload = true;
 
         if (running && pending_reload) {
-            Uint64 now = SDL_GetTicks();
+            uint64_t now = now_ms_();
             if (now - last_reload >= 120) {
                 pending_reload = false;
                 last_reload = now;
@@ -7678,20 +7679,13 @@ int main(int argc, char **argv)
     model_free();
     icons_free();
 
-    if (CUR_ARROW) SDL_DestroyCursor(CUR_ARROW);
-    if (CUR_HAND)  SDL_DestroyCursor(CUR_HAND);
-    if (BLUR_HALF)  SDL_DestroyTexture(BLUR_HALF);
-    if (BLUR_SMALL) SDL_DestroyTexture(BLUR_SMALL);
-    if (TARGET)    SDL_DestroyTexture(TARGET);
-    if (F_BADGE)   TTF_CloseFont(F_BADGE);
-    if (F_LABEL)   TTF_CloseFont(F_LABEL);
-    if (F_TITLE)   TTF_CloseFont(F_TITLE);
-    if (F_HINT)    TTF_CloseFont(F_HINT);
-    TTF_Quit();
-    SDL_DestroyRenderer(REN);
-    SDL_DestroyWindow(WIN_HANDLE);
+    sw_canvas_free(BLUR_HALF);
+    sw_canvas_free(BLUR_SMALL);
+    sw_canvas_free(TARGET);
+    sw_fonts_free();
+    sw_win_destroy(WIN);
     fullscreen_put_back();
-    SDL_Quit();
+    sw_shutdown();
     if (sway_fd >= 0) close(sway_fd);
     if (sway_evt_fd >= 0) close(sway_evt_fd);
     return 0;
