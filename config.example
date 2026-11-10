@@ -160,7 +160,8 @@ subtext=b3c0cdff   # application names
 dim=5a6b7aff       # counters and window titles
 hint=a7b5c4ff      # the header line and the key hints
 current=4fb3a5ff   # the workspace sway is showing, and the focused window
-match=b58ae0ff     # windows found by the search ("s")
+match=b58ae0ff     # windows found by the search: the card outline, and the
+                   # underline under the letters that matched
 accent=89afc4ff    # hover borders, filter box, tab groups
 hltext=141414ff    # text on an orange badge
 urgent=e0533cff    # urgent windows and workspaces

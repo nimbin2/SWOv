@@ -169,6 +169,23 @@ static bool ci_contains(const char *hay, const char *needle)
     return false;
 }
 
+/* Where in `hay` the needle sits, or NULL. The same walk as ci_contains,
+ * returning the position instead of a yes: a search that highlights the words
+ * it matched has to know where they are. */
+static const char *ci_find(const char *hay, const char *needle)
+{
+    if (!needle || !*needle) return NULL;
+    if (!hay) return NULL;
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; ++p) {
+        size_t i = 0;
+        while (i < nl && p[i] &&
+               tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == nl) return p;
+    }
+    return NULL;
+}
+
 static bool str_all_digits(const char *s)
 {
     if (!s || !*s) return false;
@@ -1566,15 +1583,25 @@ static float         SC = 1.0f; /* supersampling scale factor  */
 
 static int px(float logical) { return (int)(logical * SC + 0.5f); }
 
+/* The search query, declared here because the text helpers underline the part
+ * of a string it matched; it is filled in with the rest of the model below. */
+static char query[128];
+static int  qlen = 0;
+
 /* ----------------------------------------------------------------- text */
 
-typedef struct { SDL_Texture *t; int w, h; } Tex;
+/* The drawn string is kept with the texture: shortening happens here, so this
+ * is the only place that knows what the pixels actually say, and a search
+ * needs that to underline the part of it that matched. */
+typedef struct { SDL_Texture *t; int w, h; TTF_Font *f; char s[192]; } Tex;
 
 static void tex_free(Tex *x)
 {
     if (x->t) SDL_DestroyTexture(x->t);
     x->t = NULL;
     x->w = x->h = 0;
+    x->f = NULL;
+    x->s[0] = 0;
 }
 
 /* Text is always rendered white and tinted at draw time, so one texture can
@@ -1591,6 +1618,8 @@ static Tex text_make(TTF_Font *f, const char *s)
     out.h = surf->h;
     SDL_DestroySurface(surf);
     if (out.t) SDL_SetTextureScaleMode(out.t, SDL_SCALEMODE_LINEAR);
+    out.f = f;
+    snprintf(out.s, sizeof(out.s), "%s", s);
     return out;
 }
 
@@ -1622,6 +1651,42 @@ static Tex text_make_fit(TTF_Font *f, const char *s, int max_w)
     out = text_make(f, buf);
     free(buf);
     return out;
+}
+
+/* The part of a drawn string the query matched, as an x offset and a width
+ * inside the texture. A violet border around the whole card says something in
+ * it matched but not what — with a long title or an app id nobody can see,
+ * that reads as swov highlighting windows at random. This marks the letters. */
+static bool tex_match_run(Tex x, float *ox, float *ow)
+{
+    if (!x.t || !x.f || qlen == 0) return false;
+
+    /* The whole query first. Failing that, the longest prefix of it that is
+     * still in the string: a title shortened with an ellipsis holds only part
+     * of what matched, and the card is outlined in violet either way, so
+     * marking "Fir" of "firefox" explains the outline where marking nothing
+     * leaves it looking arbitrary. */
+    char needle[sizeof(query)];
+    size_t nl = (size_t)qlen;
+    const char *at = ci_find(x.s, query);
+    while (!at && nl > 1) {
+        --nl;
+        memcpy(needle, query, nl);
+        needle[nl] = 0;
+        at = ci_find(x.s, needle);
+    }
+    if (!at) return false;
+
+    int pre = 0, run = 0, h = 0;
+    size_t off = (size_t)(at - x.s);
+    size_t len = nl;
+    if (off + len > strlen(x.s)) len = strlen(x.s) - off;   /* clipped by the … */
+    if (len == 0) return false;
+    if (off > 0 && !TTF_GetStringSize(x.f, x.s, off, &pre, &h)) return false;
+    if (!TTF_GetStringSize(x.f, at, len, &run, &h) || run <= 0) return false;
+    *ox = (float)pre;
+    *ow = (float)run;
+    return true;
 }
 
 static void tex_draw(Tex x, float dx, float dy, SDL_FColor col)
@@ -1678,6 +1743,20 @@ static void fill_round_rect(SDL_FRect r, float rad, SDL_FColor c)
         SDL_RenderFillRect(REN, &bot);
     }
 }
+
+/* Lay that run under the text, as a soft bar in the match colour. */
+static void draw_match_run(Tex x, float dx, float dy)
+{
+    float mx = 0, mw = 0;
+    if (!tex_match_run(x, &mx, &mw)) return;
+    float pad = 1.0f * SC;
+    SDL_FRect r = { dx + mx - pad, dy - pad * 0.5f,
+                    mw + 2.0f * pad, (float)x.h + pad };
+    fill_round_rect(r, 2.0f * SC, with_alpha(C.match, 0.30f));
+    SDL_FRect u = { dx + mx, dy + (float)x.h - 1.0f * SC, mw, SDL_max(1.0f, 1.5f * SC) };
+    fill_round_rect(u, 0.0f, with_alpha(C.match, 0.95f));
+}
+
 
 /* The same, with the top or the bottom left square.
  *
@@ -2846,12 +2925,18 @@ static void lift_update(float x, float y, int ws_idx, int win_idx)
         (WINS[win_idx].floating || WINS[win_idx].fullscreen))
         LIFT_WIN = win_idx;
 }
-static char query[128];
-static int  qlen = 0;
 static bool filtering = false;   /* "/" — hides everything that does not match */
 static bool searching = false;   /* "s" — highlights what matches, hides nothing */
 
 static bool query_active(void) { return filtering || searching; }
+
+/* Where the cursor was before the search started. A search moves it to the
+ * best hit, which is the point of it, but cancelling one should leave you
+ * where you were rather than wherever the last query happened to land. */
+static struct { int ws, sel; bool active, by_key, saved; } PRE_QUERY;
+
+static void query_save_sel(void);
+static void query_restore_sel(bool final);
 
 /* The key press that opens a mode is followed by its own text input event —
  * "s" would otherwise be the first character of the search. */
@@ -3734,9 +3819,37 @@ static void apply_filter(void)
          * it. Nothing is selected until the query matches again. */
         for (int i = 0; i < NWS; ++i) WSS[i].sel = -1;
         sel_active = false;
+    } else if (PRE_QUERY.saved) {
+        /* The query is empty again — backspaced away, or cancelled. Either way
+         * the cursor belongs where it was before any of this started, not on
+         * whatever the last keystroke of the query had found. */
+        query_restore_sel(false);
     } else {
         select_ws(sel_ws, true);
     }
+}
+
+static void query_save_sel(void)
+{
+    if (PRE_QUERY.saved) return;              /* f then / keeps the first one */
+    PRE_QUERY.ws = sel_ws;
+    PRE_QUERY.sel = (sel_ws >= 0 && sel_ws < NWS) ? WSS[sel_ws].sel : -1;
+    PRE_QUERY.active = sel_active;
+    PRE_QUERY.by_key = sel_by_key;
+    PRE_QUERY.saved = true;
+}
+
+static void query_restore_sel(bool final)
+{
+    if (!PRE_QUERY.saved) return;
+    if (final) PRE_QUERY.saved = false;       /* the search is closing for good */
+    if (PRE_QUERY.ws < 0 || PRE_QUERY.ws >= NWS) return;
+    /* The window may have closed while the search was open; the workspace is
+     * the part worth keeping either way. */
+    sel_ws = PRE_QUERY.ws;
+    WSS[sel_ws].sel = (PRE_QUERY.sel < WSS[sel_ws].count) ? PRE_QUERY.sel : -1;
+    sel_active = PRE_QUERY.active;
+    sel_by_key = PRE_QUERY.by_key;
 }
 
 static int hit_test(float mx, float my, int *out_ws)
@@ -4715,6 +4828,8 @@ static void draw_card(Win *w, bool tile_selected)
             draw_icon(w->icon, tx + ih * 0.5f, plate.y + (plate.h - ih) * 0.5f, ih);
             tx += plate_iw;
         }
+        if (w->match && qlen > 0)
+            draw_match_run(w->label, tx, plate.y + (plate.h - (float)w->label.h) * 0.5f);
         tex_draw(w->label, tx, plate.y + (plate.h - (float)w->label.h) * 0.5f,
                  with_alpha(C.text, a));
         if (has_icon) SDL_SetTextureAlphaModFloat(w->icon, 1.0f);
@@ -4745,12 +4860,18 @@ static void draw_card(Win *w, bool tile_selected)
         }
         float block = lab_h + (sub_h > 0.0f ? g2 + sub_h : 0.0f);
         float y = r.y + (r.h - block) * 0.5f;
+        if (w->match && qlen > 0) {
+            draw_match_run(w->label, tx, y);
+            if (sub_h > 0.0f) draw_match_run(w->subtitle, tx, y + lab_h + g2);
+        }
         tex_draw(w->label, tx, y, lab_col);
         if (sub_h > 0.0f) tex_draw(w->subtitle, tx, y + lab_h + g2, sub_col);
         break;
     }
     case CL_TEXT: {
         float y = r.y + (r.h - lab_h) * 0.5f;
+        if (w->match && qlen > 0)
+            draw_match_run(w->label, r.x + r.w * 0.5f - (float)w->label.w * 0.5f, y);
         tex_draw_center(w->label, r.x + r.w * 0.5f, y, lab_col);
         break;
     }
@@ -6084,6 +6205,7 @@ static void handle_key(const SDL_KeyboardEvent *k)
             query[0] = 0;
             qlen = 0;
             apply_filter();
+            query_restore_sel(true);       /* back where the search found you */
             rebuild_chrome();
             return;
         case SDLK_RETURN:
@@ -6242,6 +6364,7 @@ static void handle_key(const SDL_KeyboardEvent *k)
         break;
 
     case SDLK_SLASH:
+        query_save_sel();
         filtering = true;
         searching = false;
         query[0] = 0;
@@ -6251,6 +6374,7 @@ static void handle_key(const SDL_KeyboardEvent *k)
         break;
 
     case SDLK_F:                                   /* find, without hiding */
+        query_save_sel();
         searching = true;
         filtering = false;
         query[0] = 0;

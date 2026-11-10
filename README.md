@@ -54,7 +54,7 @@ does nothing at all — every key goes to whatever is underneath it.
 | `d` | open the launcher (`swas`) and step aside |
 | `x`, `del` | close marked or selected windows, `enter` confirms |
 | middle click | close that window straight away |
-| `f` | find windows by title, app id or workspace name; the best hit is selected, nothing is while nothing matches |
+| `f` | find windows by title, app id or workspace name; the matched letters are underlined and the best hit is selected, nothing is while nothing matches |
 | `/` | filter: same search, but hides everything else |
 | `tab` in a search | the next workspace with a hit; `enter` then goes there |
 | `r` | reload |
@@ -70,6 +70,13 @@ but the cursor is not drawn until you point or type. The pointer is already
 somewhere when the overview appears, and whatever it was left on top of is not
 a choice anyone made, so it selects nothing until it moves. A key, a click, or
 a query showing its hit brings the cursor out.
+
+A search underlines the letters it matched, in the `match` colour, inside the
+name and the title it drew. A violet outline alone said something in the card
+matched but not what, which with a long title or an app id nobody can see reads
+as windows being picked out at random. Where the title was shortened to fit,
+the part of the query that survived is underlined. Cancelling a search, or
+emptying it, puts the cursor back where it was before you started it.
 
 Orange is only ever the selection cursor; the workspace sway is showing and the
 window it has focused are marked in teal (`current`), search hits in violet

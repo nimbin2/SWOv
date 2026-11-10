@@ -1,34 +1,47 @@
-swov: enter follows the keyboard, and the cursor waits to be asked
+shared: the Wayland and drawing layer swas and swov will stand on
 
-Two faults with one cause: the selection could be set by a pointer that merely
-happened to be resting somewhere, and nothing told that apart from a choice
-someone made. Two flags now do.
+The first half of taking SDL out. swbr has never linked it — one surface on
+the layer shell, a shm buffer pool, and everything drawn by hand into ARGB —
+so the stack is proven; this lifts it out of swbr into three headers the other
+two can use. Nothing is ported yet: swas and swov still link SDL3 after this
+commit.
 
-sel_by_key — the keyboard put the selection there. Tab and the arrows pick
-exactly one thing, so enter acts on that and nothing else: a workspace when
-that is what was picked, which is how tabbing through hits and pressing enter
-is supposed to work. The previous release made enter re-ask the query whenever
-the selection was not itself a matching window, to stop a resting pointer from
-stealing the hit; tabbing to a workspace leaves no window picked and tripped
-exactly that condition, so enter threw away where you had tabbed to and jumped
-back to the first hit. Only an incidental selection goes back to the query now.
+sw_draw.h is a Canvas: a pixel buffer and a clip rectangle. Rounded
+rectangles and strokes come out of a signed distance field, text out of
+stb_truetype with a per-size glyph cache, images out of a box filter, plus the
+triangle, circle and annulus sector a radial menu is made of. It needs no
+compositor and no GPU, which is the point as much as the short link line: a
+whole frame can be drawn and then measured in a test.
 
-mouse_moved — the pointer has actually moved since the window opened. Until
-then it selects nothing and no cursor is drawn, so opening the overview no
-longer lights up whatever the mouse was left on top of. A key, a click, a
-relayed pointer from swas, or a query showing its hit all bring the cursor out;
-start_selection still decides where the keyboard starts from.
+sw_wl.h is a layer-shell window with that canvas in it — pointer, keyboard,
+cursor-shape, two buffers, one event loop. The protocol marshalling is
+swbr's hand-written glue, so there is still no wayland-scanner step.
 
-Hover had to stop keying off "what is under the pointer changed" for this. A
-new window is sent a motion event for wherever the pointer already is, so that
-position was recorded before movement counted, and moving inside the same tile
-afterwards changed nothing to notice — the cursor only appeared once the
-pointer crossed into a different workspace. Found by the test below, not by
-reading it.
+sw_keymap.h reads the keymap the compositor sends over wl_keyboard.keymap and
+answers what a key types. That is the piece that would otherwise be
+libxkbcommon. It handles the four shift levels, AltGr, caps lock and the
+keypad's NumLock; it does not handle dead keys, compose or layout groups,
+which a search box does not need.
 
-Checked against the real decision with a stand-in sway on a socketpair, ten
-cases: enter after typing a query, after tabbing once, twice and three times,
-onto an empty workspace, onto a workspace matched only by name, with a pointer
-resting somewhere nobody searched, with no query at all, and the cursor's
-visibility across a fresh open, a first motion event, a 1px jitter, a real
-move and a tab.
+Checked, not assumed:
+
+- Drawing, by rendering frames and counting pixels: a 20x20 rect covers 400
+  and half that when clipped; r=10 corners lose their pixels and the centre
+  stays solid; a stroke is a ring with an empty middle; a quarter annulus
+  covers a quarter of the ring and r0 leaves the hole; a 2x2 image fills its
+  box at the right colour, at half alpha, and a 64x64 checkerboard shrunk to
+  8x8 averages to 127 rather than picking a pixel.
+- The keymap, against libxkbcommon on the stock us, de, fr, es, gb, it, se,
+  no, dk, pl, cz and ru layouts — every keycode at every modifier
+  combination. The characters typed match exactly on all twelve. Two keysyms
+  differ, PrintScreen and Pause, whose second level is selected by Control
+  rather than Shift; neither types anything.
+- The window, by running a demo on it under a headless sway and looking at
+  the screenshot: rounded surface on the overlay layer, border, text at three
+  sizes, shapes, all correct.
+
+Three bugs the tests found rather than review: each key line in an xkb keymap
+ends in "};", so scanning for that as the end of the symbols block stopped
+after the first key; a key's symbol list is not the first bracket on the line,
+because type[Group1] comes first; and uint16_t silently truncated the XF86
+media keysyms.
