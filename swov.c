@@ -121,7 +121,7 @@ static uint64_t now_ms_(void)
 }
 
 #define APP_ID          "swov"
-#define SWOV_VERSION    "1.3"
+#define SWOV_VERSION    "1.3.1"
 #ifndef SWOV_BUILD                 /* set by the Makefile: md5 of this file */
 #define SWOV_BUILD "unknown"
 #endif
@@ -5504,8 +5504,7 @@ static void draw_pencil(Rect r, FCol c)
 static void render(void)
 {
     sw_canvas_clip_all(REN);
-    sw_canvas_clear(REN);
-    sw_canvas_fill(REN, fcol(C.bg));
+    sw_canvas_bg(REN, fcol(C.bg));
 
     if (NWS == 0) {
         Tex t = text_make(F_LABEL, "no windows found on this output");
@@ -7009,18 +7008,10 @@ static bool backdrop_command(char *line)
         return true;
     }
     if (!strncmp(line, "raise ", 6) && line[6]) {
-        str_set(RAISE_APP, sizeof(RAISE_APP), line + 6);
-        RAISE_LEFT = 3;                       /* now, and twice more */
-        RAISE_AT   = 0.0;
-        /* Our window mapped on top of the one that asked for us, and on
-         * Wayland that one cannot lift itself back. sway can.
-         *
-         * Focusing it directly is not enough: it usually still *is* the
-         * focused window, thanks to `no_focus`, so sway has nothing to do and
-         * the stacking never changes. Focusing us first and it second makes
-         * the second a real change, which restacks. That is also why this
-         * waits for our own window to exist in the tree — asking before sway
-         * knows about it is the other half of the race. */
+        /* Nothing to do any more. Both programs are layer surfaces now, and
+           the one that asked for us sits on the layer above the backdrop, so
+           it is already in front and already has the keyboard. Accepted and
+           ignored, so an older swas still talks to this one. */
         return true;
     }
     if (!strcmp(line, "fade in"))  { BACKDROP_WANT = 1.0f; return true; }
@@ -7064,12 +7055,10 @@ static void backdrop_poll(void)
  * raises it, so one command does the job — but only once sway knows our window
  * exists. Rather than guess when that is, say it three times over half a
  * second. Repeating is harmless: the wheel is already the focused window. */
+/* The overlay asks the compositor for the keyboard on the surface itself, so
+   there is nothing to ask sway for. `focus_self` is accepted and ignored. */
 static void focus_self_soon(void)
 {
-    if (BACKDROP || SERVING || !C.focus_self || RAISE_APP[0]) return;
-    str_set(RAISE_APP, sizeof(RAISE_APP), APP_ID);
-    RAISE_LEFT = 3;
-    RAISE_AT = 0.0;
 }
 
 static void backdrop_raise_tick(void)
@@ -7135,11 +7124,8 @@ static void map_dwell_tick(void)
         set_ghosts(C.drop_ghosts ? 0 : -1, C.drop_ghosts ? 10 : -1);
         backdrop_reply("target none");
 
-        /* The app on the pointer is drawn by the launcher, on its own
-         * surface. Redrawing everything here is enough for sway to put this
-         * window in front of it, and then the icon is behind the overview
-         * for the rest of the drag. Ask for it back. */
-        if (RAISE_APP[0]) { RAISE_LEFT = 3; RAISE_AT = 0.0; }
+        /* The app on the pointer is drawn by the launcher, on the layer
+         * above this one, so redrawing here never covers it. */
     }
     dirty = true;
 }
@@ -7202,13 +7188,15 @@ static void backdrop_blur(Canvas *dst, float alpha)
     sw_blit_canvas(dst, BLUR_SMALL, 0, 0, (float)RW, (float)RH, SW_WHITE, alpha);
 }
 
-static void present(void)
+/* false when the compositor still holds both buffers: the caller keeps the
+   frame pending rather than dropping it, which is what made the overview
+   feel like it was ignoring the keyboard. */
+static bool present(void)
 {
     Canvas *win = sw_win_begin(WIN);
-    if (!win) return;                 /* both buffers still on screen */
+    if (!win) return false;           /* both buffers still on screen */
 
-    sw_canvas_clip_all(win);
-    sw_canvas_clear(win);
+    sw_canvas_clip_all(win);          /* sw_win_begin already cleared it */
 
     REN = TARGET ? TARGET : win;
     if (TARGET) sw_canvas_clear(TARGET);
@@ -7233,6 +7221,7 @@ static void present(void)
     }
     sw_win_end(WIN);
     shown_once = true;
+    return true;
 }
 
 /* Which output the overlay goes on. sway names its outputs by connector
@@ -7616,7 +7605,7 @@ int main(int argc, char **argv)
     bool   pending_reload = false;
 
     if (BACKDROP && SHOT_PATH) BACKDROP_A = 1.0f;   /* a still has nothing to fade */
-    present();
+    if (!present()) dirty = true;
     sw_flush();
 
     if (BACKDROP) {
@@ -7649,7 +7638,7 @@ int main(int argc, char **argv)
             if (!running) break;
         }
 
-        sw_dispatch((BACKDROP || SERVING) ? 8
+        sw_dispatch((BACKDROP || SERVING || dirty) ? 8
                     : (anim_running() || pending_reload) ? 8 : 60);
         while (running && sw_poll(&e)) handle_event(&e);
 
@@ -7669,7 +7658,7 @@ int main(int argc, char **argv)
                 dirty = true;
             }
         }
-        if (running && dirty) { present(); dirty = false; }
+        if (running && dirty && present()) dirty = false;
     }
 
     /* cleanup */

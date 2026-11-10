@@ -31,13 +31,13 @@ Needs a running sway session (`$SWAYSOCK`) and any TTF font.
 
 ```
 bindsym $mod+Tab exec swov
-for_window [app_id="swov"] floating enable, border none
 ```
 
-Without that `for_window` line swov opens as an ordinary tile, which rearranges
-the layout it is meant to be showing you. It also asks sway for the keyboard
-itself once it is up (`focus_self=1`), since an overlay that is not focused
-does nothing at all — every key goes to whatever is underneath it.
+That is the whole config. swov is a layer-shell overlay, not a window, so
+sway neither tiles it nor touches the layout underneath, and it takes the
+keyboard by asking for it on the surface. The old
+`for_window [app_id="swov"] floating enable` rule does nothing now and can
+be deleted.
 
 | key | action |
 | --- | --- |
@@ -219,15 +219,9 @@ to read the workspace you are aiming at. It costs three scaled blits of a
 frame that is already drawn, and swov only repaints on change, so an idle
 backdrop costs nothing at all.
 
-It uses its own app id, so give it a rule or it steals the keyboard:
-
-```
-no_focus [app_id="swov-backdrop"]
-for_window [app_id="swov-backdrop"] floating enable, border none
-```
-
-`no_focus` takes the criteria itself. `for_window [...] no_focus` is not the
-same thing and does nothing at all.
+The backdrop takes no keyboard at all and sits on the layer below the
+program in front of it, so it needs no sway rule. The old
+`no_focus [app_id="swov-backdrop"]` line does nothing now and can be deleted.
 
 `--backdrop-debug` is the same mode with the conversation echoed to stderr.
 
