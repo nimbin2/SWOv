@@ -121,7 +121,7 @@ static uint64_t now_ms_(void)
 }
 
 #define APP_ID          "swov"
-#define SWOV_VERSION    "1.3.2"
+#define SWOV_VERSION    "1.3.3"
 #ifndef SWOV_BUILD                 /* set by the Makefile: md5 of this file */
 #define SWOV_BUILD "unknown"
 #endif
@@ -7587,6 +7587,10 @@ int main(int argc, char **argv)
     sel_active = BACKDROP ? false : (C.start_selection != 0);
     if (!BACKDROP && C.start_selection == 2 && NWS > 0)
         WSS[sel_ws].sel = ws_first_visible(&WSS[sel_ws]);
+    /* The numbers ws_slots asks for are there from the first frame, not only
+       after the first drag. Without this the grid opened with whatever sway
+       happened to have, which is not what `ws_slots=1-10` says. */
+    ghosts_default();
     layout();
     apply_filter();
     rebuild_chrome();
