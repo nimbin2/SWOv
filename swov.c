@@ -121,7 +121,7 @@ static uint64_t now_ms_(void)
 }
 
 #define APP_ID          "swov"
-#define SWOV_VERSION    "1.3.1"
+#define SWOV_VERSION    "1.3.2"
 #ifndef SWOV_BUILD                 /* set by the Makefile: md5 of this file */
 #define SWOV_BUILD "unknown"
 #endif

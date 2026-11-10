@@ -26,11 +26,14 @@ bindir      ?= $(PREFIX)/bin
 datadir     ?= $(PREFIX)/share/swov
 shdatadir   ?= $(PREFIX)/share/sw
 
-BUILD       := $(shell md5sum swov.c 2>/dev/null | cut -c1-8)
 SRC         := swov.c
 HDR         := sw_theme.h nanosvg.h nanosvgrast.h stb_image.h stb_truetype.h \
                sw_draw.h sw_wl.h sw_keymap.h
 BIN         := swov
+
+# the build id covers the headers too: a fix in the shared drawing layer is
+# a different build even when swov.c has not moved
+BUILD       := $(shell cat $(SRC) $(HDR) 2>/dev/null | md5sum | cut -c1-8)
 
 WL_CFLAGS   := $(shell $(PKG_CONFIG) --cflags wayland-client 2>/dev/null)
 WL_LIBS     := $(shell $(PKG_CONFIG) --libs wayland-client 2>/dev/null || echo -lwayland-client)
