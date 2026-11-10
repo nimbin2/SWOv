@@ -121,7 +121,7 @@ static uint64_t now_ms_(void)
 }
 
 #define APP_ID          "swov"
-#define SWOV_VERSION    "1.3.4"
+#define SWOV_VERSION    "1.3.5"
 #ifndef SWOV_BUILD                 /* set by the Makefile: md5 of this file */
 #define SWOV_BUILD "unknown"
 #endif
@@ -1764,6 +1764,24 @@ static void tex_draw(Tex x, float dx, float dy, FCol col)
 {
     if (!x.t || !x.f) return;
     sw_text(REN, x.f, dx, dy + x.f->ascent, fcol(col), x.s);
+}
+
+/* On a given baseline, whatever size the text is. Mixed sizes on one line —
+ * a big number beside a small count — look aligned when their baselines
+ * agree, not when their line boxes are centred against each other. */
+/* How far above the baseline the middle of a line of digits and capitals
+ * sits. Anything meant to look centred against the header — a pill, the
+ * pencil — is centred here rather than on the line box, which includes room
+ * for descenders the header never uses. */
+static float head_mid_off(Font *f)
+{
+    return f ? f->ascent * 0.36f : 0.0f;
+}
+
+static void tex_draw_base(Tex x, float dx, float baseline, FCol col)
+{
+    if (!x.t || !x.f) return;
+    sw_text(REN, x.f, dx, baseline, fcol(col), x.s);
 }
 
 static void tex_draw_center(Tex x, float cx, float dy, FCol col)
@@ -3582,9 +3600,12 @@ static void layout(void)
              * the name, and the name itself is part of the header like
              * everywhere else. The name is centred in what is left. */
             float icon = SW_MIN(head_h * 0.72f, SW_MAX(w, 0.0f));
+            /* on the header's own line, not centred in a box of its own */
+            float hbase = ws->tile.y + C.badge_top * SC +
+                          (F_BADGE ? F_BADGE->ascent : 0.0f);
+            float hmid  = hbase - head_mid_off(F_BADGE);
             ws->title_box = (Rect){ left, ws->tile.y, SW_MAX(w - icon, 0.0f), head_h };
-            ws->title_hit = (Rect){ left + w - icon, ws->tile.y + (head_h - icon) * 0.5f,
-                                         icon, icon };
+            ws->title_hit = (Rect){ left + w - icon, hmid - icon * 0.5f, icon, icon };
         } else {
             ws->title_box = (Rect){ left, ws->tile.y, w, head_h };
             ws->title_hit = (Rect){ left + w * 0.25f, ws->tile.y, w * 0.5f, head_h };
@@ -3803,19 +3824,22 @@ static void navigate(int dx, int dy)
 
 /* How good a hit is, lowest first.
  *
- * What you typed is nearly always the start of a window's title, so that wins
- * outright; then the title anywhere, then the application, then the workspace
- * it happens to sit on. Ties go alphabetically, so the same query always
- * lands on the same window. */
+ * You are nearly always naming the program, not the document it happens to
+ * have open — "fire" means the browser, not the one mail whose subject
+ * mentions a fire. So the application wins over the title: its name from the
+ * start, then anywhere in it, then the title from the start, then the title
+ * anywhere, then the workspace it happens to sit on. Ties go alphabetically,
+ * so the same query always lands on the same window. */
 static int match_score(const Win *w)
 {
     if (qlen == 0) return 100;
-    if (!strncasecmp(w->title, query, (size_t)qlen))   return 0;
-    if (ci_contains(w->title, query))                  return 1;
-    if (!strncasecmp(w->app_id, query, (size_t)qlen))  return 2;
-    if (ci_contains(w->app_id, query))                 return 3;
-    if (ci_contains(w->app_key, query))                return 4;
-    if (ci_contains(w->ws_name, query))                return 5;
+    if (!strncasecmp(w->app_id, query, (size_t)qlen))  return 0;
+    if (!strncasecmp(w->app_key, query, (size_t)qlen)) return 0;
+    if (ci_contains(w->app_id, query))                 return 1;
+    if (ci_contains(w->app_key, query))                return 1;
+    if (!strncasecmp(w->title, query, (size_t)qlen))   return 2;
+    if (ci_contains(w->title, query))                  return 3;
+    if (ci_contains(w->ws_name, query))                return 4;
     return 100;
 }
 
@@ -3829,7 +3853,7 @@ static int query_best_win(void)
         Win *w = &WINS[i];
         if (!w->match || w->is_self || !win_visible(w)) continue;
         int sc = match_score(w);
-        if (sc > 5) continue;
+        if (sc > 4) continue;
         if (best < 0 || sc < best_score ||
             (sc == best_score && strcasecmp(w->title, WINS[best].title) < 0)) {
             best = i; best_score = sc;
@@ -3957,6 +3981,7 @@ typedef enum {
     DROP_NONE,
     DROP_WIN_WS,     /* window onto a workspace tile                       */
     DROP_WIN_NEAR,   /* window next to another window, splitting h or v    */
+    DROP_WIN_SWAP,   /* window onto the middle of another: trade places     */
     DROP_WS_SWAP,    /* workspace onto another workspace                   */
     DROP_WS_NUM,     /* workspace onto a free number (a ghost slot)        */
     DROP_WIN_NEWWS,  /* window onto a free number: sway creates it          */
@@ -4009,6 +4034,15 @@ static int edge_at(Rect r, float x, float y)
     float dy = (y - (r.y + r.h * 0.5f)) / SW_MAX(1.0f, r.h);
     if (fabsf(dx) >= fabsf(dy)) return dx < 0.0f ? EDGE_LEFT : EDGE_RIGHT;
     return dy < 0.0f ? EDGE_TOP : EDGE_BOTTOM;
+}
+
+/* The middle half of a card, in both directions: close enough to the centre
+ * to mean "this one" rather than "beside this one". */
+static bool in_swap_zone(Rect r, float x, float y)
+{
+    float dx = fabsf(x - (r.x + r.w * 0.5f)) / SW_MAX(1.0f, r.w);
+    float dy = fabsf(y - (r.y + r.h * 0.5f)) / SW_MAX(1.0f, r.h);
+    return dx < 0.25f && dy < 0.25f;
 }
 
 static bool point_in(Rect r, float x, float y)
@@ -4221,10 +4255,17 @@ static void drag_update_target(float x, float y)
             SNAP_WIN = -1;
         }
 
-        drop_kind = DROP_WIN_NEAR;
+        /* The middle of a card trades the two windows, the way the middle of
+         * a workspace tile trades two workspaces. The edges still insert, so
+         * there is room for both: the swap zone is the middle half. */
         drop_win  = win_idx;
         drop_ws   = ws_idx;
-        drop_edge = edge_at(WINS[win_idx].card, x, y);
+        if (in_swap_zone(WINS[win_idx].card, x, y)) {
+            drop_kind = DROP_WIN_SWAP;
+        } else {
+            drop_kind = DROP_WIN_NEAR;
+            drop_edge = edge_at(WINS[win_idx].card, x, y);
+        }
         return;
     }
     SNAP_WIN = -1;
@@ -4514,6 +4555,15 @@ static void drag_finish(void)
     case DROP_WIN_NEAR:
         if (press_win >= 0 && drop_win >= 0)
             act_win_drop_near(&WINS[press_win], &WINS[drop_win], drop_edge);
+        break;
+
+    case DROP_WIN_SWAP:
+        /* sway trades the two containers in place, so both keep their size
+         * and their neighbours — which is the point of dropping on the
+         * middle rather than beside. */
+        if (press_win >= 0 && drop_win >= 0 && press_win != drop_win)
+            sway_cmd("[con_id=%d] swap container with con_id %d",
+                     WINS[press_win].con_id, WINS[drop_win].con_id);
         break;
 
     case DROP_WS_EDGE:
@@ -5068,15 +5118,18 @@ static void draw_workspace(int idx)
                                   : mix(C.subtext, C.tile, 0.25f);
     if (ws->urgent && !selected) num_col = C.urgent;
 
-    tex_draw(ws->badge, tile.x + tile.w - p - (float)ws->badge.w, top, num_col);
+    /* One baseline for the whole header — the number's — so the count on the
+     * left, the name in the middle and the number on the right sit on the
+     * same line however differently sized they are. */
+    float base = top + (F_BADGE ? F_BADGE->ascent : 0.0f);
 
+    tex_draw_base(ws->badge, tile.x + tile.w - p - (float)ws->badge.w, base, num_col);
 
     float count_right = tile.x + p;
     if (ws->sub.t) {
-        float base = top + ((float)ws->badge.h - (float)ws->sub.h) * 0.62f;
         FCol col = ws->count ? mix(C.dim, C.text, selected ? 0.45f : 0.25f)
                                    : with_alpha(C.dim, 0.85f);
-        tex_draw(ws->sub, tile.x + p, base, col);
+        tex_draw_base(ws->sub, tile.x + p, base, col);
         count_right += (float)ws->sub.w;
     }
 
@@ -5087,30 +5140,31 @@ static void draw_workspace(int idx)
 
     bool editing_this = editing && edit_ws == idx;
     if (editing_this) {
-        Rect box = { tb_x, top - p * 0.35f, SW_MAX(tb_w, 40.0f * SC),
-                          (float)ws->badge.h + p * 0.7f };
+        float bh = (float)ws->badge.h + p * 0.7f;
+        Rect box = { tb_x, base - head_mid_off(F_BADGE) - bh * 0.5f,
+                     SW_MAX(tb_w, 40.0f * SC), bh };
         fill_round_rect(box, box.h * 0.3f, mix(C.tile, C.bg, 0.2f));
         stroke_round_rect(box, box.h * 0.3f, SW_MAX(1.0f, 1.5f * SC), C.hl);
 
         char buf[80];
         snprintf(buf, sizeof(buf), "%.63s\xe2\x96\x8f", edit_buf);
         Tex t = text_make_fit(F_LABEL, buf[0] ? buf : "\xe2\x96\x8f", (int)(box.w - p));
-        tex_draw(t, box.x + p * 0.5f, box.y + (box.h - (float)t.h) * 0.5f, C.text);
+        tex_draw_base(t, box.x + p * 0.5f, base, C.text);
         tex_free(&t);
     } else if (elsewhere && tb_w > 20.0f * SC) {
         /* the monitor first, in its own colour, then the workspace */
         Tex on = text_make_fit(F_LABEL, ws->output, (int)(tb_w * 0.55f));
         float bh = (float)on.h + p * 0.5f;
-        Rect pill = { tb_x, top - p * 0.2f, (float)on.w + p, bh };
+        Rect pill = { tb_x, base - head_mid_off(F_BADGE) - bh * 0.5f,
+                      (float)on.w + p, bh };
         fill_round_rect(pill, bh * 0.35f, ocol);
-        tex_draw(on, pill.x + p * 0.5f, pill.y + (bh - (float)on.h) * 0.5f, C.bg);
+        tex_draw_base(on, pill.x + p * 0.5f, base, C.bg);
         tex_free(&on);
 
         if (ws->title.t) {
             float left = pill.x + pill.w + p * 0.6f;
             Tex t = text_make_fit(F_LABEL, ws->name, (int)(tb_x + tb_w - left));
-            tex_draw(t, left, top + (bh - (float)t.h) * 0.5f - p * 0.2f,
-                     with_alpha(C.text, 0.9f));
+            tex_draw_base(t, left, base, with_alpha(C.text, 0.9f));
             tex_free(&t);
         }
     } else if (ws->title.t && tb_w > 20.0f * SC) {
@@ -5118,7 +5172,7 @@ static void draw_workspace(int idx)
         float x = tb_x + (tb_w - (float)t.w) * 0.5f;
         if ((float)t.w > tb_w) x = tb_x;
         FCol col = selected ? C.text : mix(C.subtext, C.tile, 0.15f);
-        tex_draw(t, x, top + ((float)ws->badge.h - (float)t.h) * 0.55f, col);
+        tex_draw_base(t, x, base, col);
     }
 
     /* The rename pencil: faint until the pointer is on it, so it says "this
@@ -5250,6 +5304,14 @@ static void draw_drop_indicator(void)
             Rect r = WSS[drop_ws].screen;
             fill_round_rect(r, C.radius * SC * 0.7f, with_alpha(C.hl, 0.13f));
             stroke_round_rect(r, C.radius * SC * 0.7f, thick, C.hl);
+        }
+        break;
+
+    case DROP_WIN_SWAP:
+        if (drop_win >= 0) {
+            Rect r = WINS[drop_win].card;
+            fill_round_rect(r, C.radius * SC * 0.6f, with_alpha(C.hl, 0.16f));
+            stroke_round_rect(r, C.radius * SC * 0.6f, thick, C.hl);
         }
         break;
 

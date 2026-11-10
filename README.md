@@ -54,7 +54,7 @@ be deleted.
 | `d` | open the launcher (`swas`) and step aside |
 | `x`, `del` | close marked or selected windows, `enter` confirms |
 | middle click | close that window straight away |
-| `f` | find windows by title, app id or workspace name; the matched letters are underlined and the best hit is selected, nothing is while nothing matches |
+| `f` | find windows by app name, title or workspace name; the matched letters are underlined and the best hit is selected, nothing is while nothing matches |
 | `/` | filter: same search, but hides everything else |
 | `tab` in a search | the next workspace with a hit; `enter` then goes there |
 | `r` | reload |
@@ -71,6 +71,10 @@ somewhere when the overview appears, and whatever it was left on top of is not
 a choice anyone made, so it selects nothing until it moves. A key, a click, or
 a query showing its hit brings the cursor out.
 
+A search ranks the application above the document: an app name match beats a
+title match, so typing the start of a program's name lands on the program
+rather than on whichever window happens to mention it.
+
 A search underlines the letters it matched, in the `match` colour, inside the
 name and the title it drew. A violet outline alone said something in the card
 matched but not what, which with a long title or an app id nobody can see reads
@@ -85,6 +89,12 @@ window it has focused are marked in teal (`current`), search hits in violet
 ## Drag and drop
 
 Press, move, release. `Esc` cancels.
+
+Where you let go of a window decides what happens. Near an edge of another
+window it lands on that side, splitting the container that way. In the middle
+of one, the two trade places — both keep their size and their neighbours.
+Over the empty part of a tile it joins that workspace; over a free number,
+sway makes that workspace on the way.
 
 A floating or fullscreen window is grabbed by its name plate — the rest of it is
 click-through, so the windows underneath stay selectable.
